@@ -1,40 +1,54 @@
 # PikPak2DirectLink
 
-一个用 Go 写的服务端小工具，提供网页页面，让用户输入磁链或 PikPak 分享链接，借助 PikPak 会员的转存/离线下载能力拿到下载直链，或者走服务端代理中转。
+PikPak2DirectLink 是一个基于 Go 的网页工具，用于将磁力链接或 PikPak 分享链接解析为可下载链接。程序通过 PikPak 账号的离线下载、转存和文件下载能力获取直链，并提供服务端代理下载入口。
 
-## 现状
+## 功能
 
-- 已包含 Go 后端、任务轮询、网页界面、代理下载接口
-- 支持两类输入：
-  - `magnet:?xt=...`
-  - `https://mypikpak.com/s/...` 或 `https://mypikpak.com/s/...`
-- 分享链接如果包含多个文件，会先要求选择
-- 磁链或转存结果如果包含多个文件，也会要求选择最终要生成链接的文件
-- 支持添加多个 PikPak 账号，解析时会按账号顺序自动重试
-- 会把 PikPak 账号、密码和会话缓存到本地，session 失效时自动重新登录
+- 支持解析 `magnet:?xt=...` 磁力链接。
+- 支持解析 PikPak 分享链接。
+- 支持多个 PikPak 账号。
+- 当前账号解析失败时，会自动切换到下一个账号继续尝试。
+- 账号 session 失效时，会使用已保存的账号密码重新登录。
+- 解析失败的账号会被标记，可在账号管理页面重置。
+- 分享链接或解析结果包含多个文件时，可在页面中选择目标文件。
+- 解析完成后提供 PikPak 直链和服务端代理链接。
 
-## 注意
+## 运行
 
-PikPak 并没有稳定公开的官方开发接口文档，这个项目目前依赖的是社区常见的非官方接口调用方式。后续如果 PikPak 调整了登录、验证码或下载接口，这个服务也可能需要跟着改。
-
-## 环境变量
-
-默认不再强制要求环境变量。你可以直接启动服务，然后在网页的「账号管理」页面添加 PikPak 账号。服务端会把账号、密码、refresh token 和必要会话信息保存到本地。下次启动时自动恢复；如果 session 过期或失效，会尝试用保存的账号密码重新登录。
-
-如果你仍然想用环境变量作为启动时的备用账号，也可以设置：
+在项目目录执行：
 
 ```bash
-PIKPAK_USERNAME=your_account
-PIKPAK_PASSWORD=your_password
+go run ./cmd/server
 ```
 
-其他可选项：
+默认监听地址：
+
+```text
+http://localhost:51873
+```
+
+默认端口为 `51873`。如需修改端口，可通过环境变量 `ADDR` 和 `PUBLIC_BASE_URL` 指定。
+
+## 使用
+
+1. 打开网页。
+2. 进入账号管理页面。
+3. 添加一个或多个 PikPak 账号。
+4. 返回解析页面。
+5. 输入磁力链接或 PikPak 分享链接。
+6. 如分享链接需要提取码，填写提取码。
+7. 选择直链或代理方式。
+8. 提交解析任务。
+9. 等待任务完成后复制下载链接。
+
+## 配置项
+
+以下环境变量均为可选：
 
 ```bash
 ADDR=:51873
 PUBLIC_BASE_URL=http://localhost:51873
 PIKPAK_ROOT_FOLDER=Pikpak2DirectLink
-PIKPAK_SESSION_FILE=data/pikpak-session.json
 PIKPAK_ACCOUNTS_FILE=data/pikpak-accounts.json
 PIKPAK_ACCOUNT_SESSION_DIR=data/accounts
 PIKPAK_REQUEST_TIMEOUT=20s
@@ -42,35 +56,24 @@ RESOLVE_TIMEOUT=12m
 POLL_INTERVAL=5s
 ```
 
-## 运行
+也可以通过环境变量预置一个启动账号：
 
 ```bash
-go run ./cmd/server
+PIKPAK_USERNAME=your_account
+PIKPAK_PASSWORD=your_password
 ```
 
-打开：
+## 数据保存
+
+程序会在本地保存 PikPak 账号、密码和 session 信息。默认保存位置为：
 
 ```text
-http://localhost:51873
+data/pikpak-accounts.json
+data/accounts/
 ```
 
-默认端口使用高位端口 `51873`，避免和常见本地开发服务的 `8080` 冲突。你仍然可以通过 `ADDR` 和 `PUBLIC_BASE_URL` 覆盖成自己的端口或域名。
+请妥善保护服务器和数据目录权限。
 
-第一次打开时如果还没有本地 session，先在网页端登录一次。登录成功后就会自动持久化保存 refresh token。
+## 说明
 
-现在账号管理是单独页面。添加多个账号后，解析任务会从第一个账号开始尝试；如果当前账号调用失败，会标记该账号失败并自动切换到下一个账号，直到有账号成功或者全部账号失败。失败标记可以在账号管理页面手动重置。
-
-## 代理下载
-
-任务完成后页面会同时给出：
-
-- PikPak 直链
-- 服务端代理链接 `/proxy/{job_id}`
-
-代理模式下，请求会由你的服务端去拉取 PikPak 下载地址，再把文件流返回给客户端。
-
-## 开发
-
-```bash
-go test ./...
-```
+PikPak 没有稳定公开的官方开发接口文档。本程序依赖非官方接口调用方式。若 PikPak 调整登录、验证码、离线下载或下载链接接口，程序可能需要相应更新。
