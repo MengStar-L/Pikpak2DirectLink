@@ -17,21 +17,29 @@ PikPak2DirectLink 是一个基于 Go 的网页工具，用于将磁力链接或 
 
 默认安装目录为 `/opt/Pikpak2DirectLink`。
 
-服务器需要已安装 Git 和 Go。安装命令如下：
+本程序面向 Linux 服务器运行。以下命令以 Debian/Ubuntu x86_64 为例：
 
 ```bash
+sudo apt update
+sudo apt install -y git curl ca-certificates
+
+curl -LO https://go.dev/dl/go1.26.2.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go1.26.2.linux-amd64.tar.gz
+rm -f go1.26.2.linux-amd64.tar.gz
+
 sudo mkdir -p /opt/Pikpak2DirectLink
 sudo chown -R "$USER:$USER" /opt/Pikpak2DirectLink
 
 git clone https://github.com/MengStar-L/Pikpak2DirectLink.git /opt/Pikpak2DirectLink
 cd /opt/Pikpak2DirectLink
 
-go build -o Pikpak2DirectLink ./cmd/server
+/usr/local/go/bin/go build -o Pikpak2DirectLink ./cmd/server
 ```
 
 ## 运行
 
-在安装目录执行：
+直接运行：
 
 ```bash
 cd /opt/Pikpak2DirectLink
@@ -41,10 +49,58 @@ cd /opt/Pikpak2DirectLink
 默认监听地址：
 
 ```text
-http://localhost:51873
+http://your-server-ip:51873
 ```
 
-默认端口为 `51873`。如需修改端口，可通过环境变量 `ADDR` 和 `PUBLIC_BASE_URL` 指定。
+默认端口为 `51873`。如需修改端口，可通过环境变量 `ADDR` 指定。
+
+## 自启动
+
+使用 `systemd` 配置开机自启动：
+
+```bash
+sudo tee /etc/systemd/system/Pikpak2DirectLink.service > /dev/null <<EOF
+[Unit]
+Description=PikPak2DirectLink
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$(whoami)
+WorkingDirectory=/opt/Pikpak2DirectLink
+Environment=ADDR=:51873
+ExecStart=/opt/Pikpak2DirectLink/Pikpak2DirectLink
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now Pikpak2DirectLink
+sudo systemctl status Pikpak2DirectLink --no-pager
+```
+
+如需固定代理链接中的公开访问地址，可在服务文件的 `[Service]` 段增加：
+
+```ini
+Environment=PUBLIC_BASE_URL=http://your-server-ip:51873
+```
+
+查看运行日志：
+
+```bash
+sudo journalctl -u Pikpak2DirectLink -f
+```
+
+重启或停止服务：
+
+```bash
+sudo systemctl restart Pikpak2DirectLink
+sudo systemctl stop Pikpak2DirectLink
+```
 
 ## 使用
 
@@ -64,7 +120,7 @@ http://localhost:51873
 
 ```bash
 ADDR=:51873
-PUBLIC_BASE_URL=http://localhost:51873
+PUBLIC_BASE_URL=http://your-server-ip:51873
 PIKPAK_ROOT_FOLDER=Pikpak2DirectLink
 PIKPAK_ACCOUNTS_FILE=data/pikpak-accounts.json
 PIKPAK_ACCOUNT_SESSION_DIR=data/accounts
