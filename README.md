@@ -13,12 +13,29 @@ PikPak2DirectLink 是一个基于 Go 的网页工具，用于将磁力链接或 
 - 分享链接或解析结果包含多个文件时，可在页面中选择目标文件。
 - 解析完成后提供 PikPak 直链和服务端代理链接。
 
-## 运行
+## 安装
 
-在项目目录执行：
+默认安装目录为 `/opt/Pikpak2DirectLink`。
+
+服务器需要已安装 Git 和 Go。安装命令如下：
 
 ```bash
-go run ./cmd/server
+sudo mkdir -p /opt/Pikpak2DirectLink
+sudo chown -R "$USER:$USER" /opt/Pikpak2DirectLink
+
+git clone https://github.com/MengStar-L/Pikpak2DirectLink.git /opt/Pikpak2DirectLink
+cd /opt/Pikpak2DirectLink
+
+go build -o Pikpak2DirectLink ./cmd/server
+```
+
+## 运行
+
+在安装目录执行：
+
+```bash
+cd /opt/Pikpak2DirectLink
+./Pikpak2DirectLink
 ```
 
 默认监听地址：
