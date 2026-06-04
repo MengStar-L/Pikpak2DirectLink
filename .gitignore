@@ -1,0 +1,9 @@
+.ref/
+.openteams/
+.playwright-cli/
+data/
+logs/
+output/
+.env
+*.exe
+*.out

@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PikPak 直链工具</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand-mark" title="PikPak 直链工具" aria-hidden="true">
+        <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+          <path d="M12 3.5 5.8 7v6.9c0 3.6 2.6 6.8 6.2 7.6 3.6-.8 6.2-4 6.2-7.6V7L12 3.5Z"></path>
+          <path d="M9.5 12.1 11.3 14l3.4-4.2"></path>
+        </svg>
+      </div>
+      <nav class="nav-stack">
+        <button class="nav-button active" type="button" data-page="resolve" title="解析" aria-label="解析">
+          <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+            <path d="M9 17H7A5 5 0 0 1 7 7h2"></path>
+            <path d="M15 7h2a5 5 0 0 1 0 10h-2"></path>
+            <path d="M8 12h8"></path>
+          </svg>
+        </button>
+        <button class="nav-button" type="button" data-page="accounts" title="账号管理" aria-label="账号管理">
+          <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+            <path d="M14 19.5v-1.1c0-2.2-1.8-4-4-4H7.2c-2.2 0-4 1.8-4 4v1.1"></path>
+            <path d="M8.6 11.5a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"></path>
+            <path d="M18.5 8v7"></path>
+            <path d="M22 11.5h-7"></path>
+          </svg>
+        </button>
+      </nav>
+    </aside>
+
+    <main class="workspace">
+      <section class="metric-grid" aria-label="运行概览">
+        <article class="metric-card">
+          <span class="metric-icon blue" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+              <path d="M12 6v12"></path>
+              <path d="M7 10h10"></path>
+              <path d="M7 14h10"></path>
+            </svg>
+          </span>
+          <div>
+            <span class="metric-label">账号数量</span>
+            <strong id="metricAccountCount">0</strong>
+          </div>
+        </article>
+        <article class="metric-card">
+          <span class="metric-icon green" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+              <path d="m6 12 3.2 3.2L18 6.8"></path>
+            </svg>
+          </span>
+          <div>
+            <span class="metric-label">可用账号</span>
+            <strong id="metricAvailableCount">0</strong>
+          </div>
+        </article>
+        <article class="metric-card">
+          <span class="metric-icon red" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+              <path d="M12 8v5"></path>
+              <path d="M12 17h.01"></path>
+              <path d="M4.5 19.5 12 4l7.5 15.5H4.5Z"></path>
+            </svg>
+          </span>
+          <div>
+            <span class="metric-label">失败标记</span>
+            <strong id="metricFailedCount">0</strong>
+          </div>
+        </article>
+        <article class="metric-card">
+          <span class="metric-icon amber" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+              <path d="M4 6.5h6l2 2h8v9.5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6.5Z"></path>
+            </svg>
+          </span>
+          <div>
+            <span class="metric-label">根目录</span>
+            <strong id="metricRootFolder">-</strong>
+          </div>
+        </article>
+      </section>
+
+      <section id="resolvePage" class="page-view active">
+        <div class="content-grid">
+          <section class="panel form-panel">
+            <form id="resolveForm" class="form">
+              <label class="field resource-field">
+                <textarea id="resourceInput" name="input" rows="5" aria-label="磁链或 PikPak 分享链接" placeholder="magnet:?xt=... 或 https://mypikpak.com/s/..."></textarea>
+              </label>
+
+              <div class="resolve-controls">
+                <label class="field">
+                  <span>提取码</span>
+                  <input id="passCode" name="pass_code" type="text" autocomplete="off" placeholder="没有可留空">
+                </label>
+
+                <div class="mode-group" role="radiogroup" aria-label="链接方式">
+                  <span class="inline-label">链接方式</span>
+                  <label>
+                    <input type="radio" name="mode" value="direct" checked>
+                    <span>直链</span>
+                  </label>
+                  <label>
+                    <input type="radio" name="mode" value="proxy">
+                    <span>代理</span>
+                  </label>
+                </div>
+
+                <div class="actions resolve-submit">
+                  <button id="submitButton" type="submit" class="primary">开始解析</button>
+                </div>
+              </div>
+            </form>
+          </section>
+
+          <section class="panel status-panel">
+            <div class="task-toolbar">
+              <span id="resolveHint" class="status-pill neutral">等待账号</span>
+              <span id="jobBadge" class="status-pill neutral">空闲</span>
+              <span id="jobMessage" class="task-message hidden"></span>
+            </div>
+            <p id="jobError" class="status-error hidden"></p>
+
+            <div class="subsection attempt-section">
+              <div id="attemptList" class="attempt-list empty">暂无尝试记录</div>
+            </div>
+          </section>
+        </div>
+
+        <section id="selectionPanel" class="panel hidden">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Selection</p>
+              <h2>选择文件</h2>
+            </div>
+            <span id="selectionHint" class="muted"></span>
+          </div>
+          <div id="selectionList" class="selection-list"></div>
+        </section>
+
+        <section id="resultPanel" class="panel hidden">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Result</p>
+              <h2>解析结果</h2>
+            </div>
+            <span id="resultMode" class="status-pill neutral"></span>
+          </div>
+
+          <dl class="result-grid">
+            <div>
+              <dt>文件名</dt>
+              <dd id="resultName">-</dd>
+            </div>
+            <div>
+              <dt>路径</dt>
+              <dd id="resultPath">-</dd>
+            </div>
+            <div>
+              <dt>大小</dt>
+              <dd id="resultSize">-</dd>
+            </div>
+            <div>
+              <dt>过期时间</dt>
+              <dd id="resultExpire">-</dd>
+            </div>
+          </dl>
+
+          <div class="link-block">
+            <div class="link-row">
+              <span>直链</span>
+              <div class="link-actions">
+                <a id="directOpen" class="secondary-link" href="#" target="_blank" rel="noreferrer noopener">打开</a>
+                <button id="directCopy" type="button" class="secondary">复制</button>
+              </div>
+            </div>
+            <input id="directValue" class="link-input" type="text" readonly>
+          </div>
+
+          <div class="link-block">
+            <div class="link-row">
+              <span>代理链接</span>
+              <div class="link-actions">
+                <a id="proxyOpen" class="secondary-link" href="#" target="_blank" rel="noreferrer noopener">打开</a>
+                <button id="proxyCopy" type="button" class="secondary">复制</button>
+              </div>
+            </div>
+            <input id="proxyValue" class="link-input" type="text" readonly>
+          </div>
+        </section>
+      </section>
+
+      <section id="accountsPage" class="page-view">
+        <section class="panel account-add-panel">
+          <form id="accountForm" class="account-inline-form">
+            <label class="field">
+              <span>账号</span>
+              <input id="accountUsername" name="username" type="text" autocomplete="username" placeholder="邮箱、手机号或用户名">
+            </label>
+            <label class="field">
+              <span>密码</span>
+              <input id="accountPassword" name="password" type="password" autocomplete="current-password" placeholder="输入 PikPak 密码">
+            </label>
+            <div class="actions account-add-action">
+              <button id="accountSubmitButton" type="submit" class="primary">添加并登录</button>
+            </div>
+            <p id="accountFormError" class="status-error hidden"></p>
+          </form>
+        </section>
+
+        <div id="accountList" class="account-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>
