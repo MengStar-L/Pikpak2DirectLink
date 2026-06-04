@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ type Server struct {
 	config   Config
 	accounts *AccountPool
 	jobs     *jobStore
+	logs     *logStore
 	mux      *http.ServeMux
 }
 
@@ -76,6 +78,7 @@ func NewServer(cfg Config) (*Server, error) {
 		config:   cfg,
 		accounts: accounts,
 		jobs:     newJobStore(),
+		logs:     newLogStore(500),
 		mux:      http.NewServeMux(),
 	}
 
@@ -89,6 +92,8 @@ func NewServer(cfg Config) (*Server, error) {
 		serveEmbeddedFile(w, r, staticFiles, "index.html", "text/html; charset=utf-8")
 	}))
 	server.mux.HandleFunc("GET /api/config", server.handleConfig)
+	server.mux.HandleFunc("GET /api/logs", server.handleListLogs)
+	server.mux.HandleFunc("DELETE /api/logs", server.handleClearLogs)
 	server.mux.HandleFunc("GET /api/accounts", server.handleListAccounts)
 	server.mux.HandleFunc("POST /api/accounts", server.handleAddAccount)
 	server.mux.HandleFunc("DELETE /api/accounts/{id}", server.handleDeleteAccount)
@@ -111,7 +116,23 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.authStatusResponse())
 }
 
-func (s *Server) handleListAccounts(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleListLogs(w http.ResponseWriter, r *http.Request) {
+	after, _ := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("after")), 10, 64)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"logs": s.logs.list(after),
+	})
+}
+
+func (s *Server) handleClearLogs(w http.ResponseWriter, _ *http.Request) {
+	s.logs.clear()
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
+}
+
+func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	defer cancel()
+	s.accounts.RefreshPremiumInfo(ctx)
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts": s.accounts.List(),
 	})
@@ -130,6 +151,7 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 	account, err := s.accounts.Add(ctx, req.Username, req.Password)
 	if err != nil {
 		lowerErr := strings.ToLower(err.Error())
+		message := friendlyPikPakError(err)
 		status := http.StatusUnauthorized
 		switch {
 		case strings.Contains(lowerErr, "required"), strings.Contains(lowerErr, "empty"):
@@ -139,7 +161,7 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 		default:
 			status = http.StatusBadGateway
 		}
-		writeError(w, status, err.Error())
+		writeError(w, status, message)
 		return
 	}
 
@@ -218,6 +240,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.jobs.create(job)
+	s.logJob(LogInfo, job.ID, "解析任务已创建", "来源："+string(kind))
 	go s.processJob(job.ID)
 
 	writeJSON(w, http.StatusAccepted, job)
@@ -322,32 +345,40 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "job is not ready")
 		return
 	}
-	if job.AccountID == "" {
-		writeError(w, http.StatusConflict, "job account is missing")
-		return
-	}
-	account, ok := s.accounts.Get(job.AccountID)
-	if !ok {
-		writeError(w, http.StatusConflict, "job account is no longer available")
-		return
-	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
-	defer cancel()
+	sourceURL := strings.TrimSpace(job.Result.DirectURL)
+	if sourceURL == "" {
+		if job.AccountID == "" {
+			writeError(w, http.StatusConflict, "job account is missing")
+			return
+		}
+		account, ok := s.accounts.Get(job.AccountID)
+		if !ok {
+			writeError(w, http.StatusConflict, "job account is no longer available")
+			return
+		}
 
-	file, err := account.Client.GetFile(ctx, job.Result.File.ID)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
+		ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+		defer cancel()
+
+		file, err := account.Client.GetFile(ctx, job.Result.File.ID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		sourceURL = file.BestDownloadURL()
 	}
-
-	sourceURL := file.BestDownloadURL()
 	if sourceURL == "" {
 		writeError(w, http.StatusBadGateway, "download URL is empty")
 		return
 	}
 
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, sourceURL, nil)
+	upstreamMethod := r.Method
+	if upstreamMethod == http.MethodHead {
+		upstreamMethod = http.MethodGet
+	}
+
+	proxyReq, err := http.NewRequestWithContext(r.Context(), upstreamMethod, sourceURL, nil)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -390,6 +421,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 func (s *Server) processJob(jobID string) {
 	accounts := s.accounts.Snapshot()
 	if len(accounts) == 0 {
+		s.logJob(LogError, jobID, "没有可用的 PikPak 账号")
 		s.failJob(jobID, errors.New("no PikPak accounts are available"))
 		return
 	}
@@ -408,12 +440,15 @@ func (s *Server) processJob(jobID string) {
 			return
 		}
 
+		message := friendlyPikPakError(err)
 		s.accounts.MarkFailed(account.ID, err)
-		s.finishAccountAttempt(jobID, account.ID, "failed", err.Error())
-		failures = append(failures, account.Username+": "+err.Error())
+		s.finishAccountAttempt(jobID, account.ID, "failed", message)
+		failures = append(failures, account.Username+": "+message)
 	}
 
-	s.failJob(jobID, fmt.Errorf("all PikPak accounts failed: %s", strings.Join(failures, "; ")))
+	err := fmt.Errorf("all PikPak accounts failed: %s", strings.Join(failures, "; "))
+	s.logJob(LogError, jobID, "全部账号尝试失败", strings.Join(failures, "；"))
+	s.failJob(jobID, err)
 }
 
 func (s *Server) processJobWithAccount(ctx context.Context, jobID string, account AccountRuntime) error {
@@ -445,12 +480,14 @@ func (s *Server) processMagnet(ctx context.Context, jobID string, account Accoun
 	if err != nil {
 		return err
 	}
+	s.logJob(LogInfo, jobID, "PikPak 离线任务已创建，等待云端完成缓存 ...")
 
 	s.updateJobState(jobID, JobRunning, StageTransfer, "waiting for PikPak to finish the transfer", "")
 	items, err := s.waitForTransferredFiles(ctx, account, folderID, task.ID)
 	if err != nil {
 		return err
 	}
+	s.logJob(LogInfo, jobID, fmt.Sprintf("检测到 %d 个可用文件", len(items)), sampleItemDetail(items))
 	return s.finishWithItems(ctx, jobID, account, items)
 }
 
@@ -461,6 +498,7 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 	}
 
 	s.updateJobState(jobID, JobRunning, StageTransfer, "inspecting share link", "")
+	s.logJob(LogInfo, jobID, "开始读取 PikPak 分享链接 ...")
 	shareInfo, err := account.Client.GetShareInfo(ctx, job.Share.ShareID, job.PassCode, "")
 	if err != nil {
 		return err
@@ -488,6 +526,7 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 			return errors.New("share link did not return any file or folder")
 		}
 		if len(items) > 1 {
+			s.logJob(LogWarn, jobID, fmt.Sprintf("分享链接包含 %d 个项目，需要选择目标", len(items)), sampleItemDetail(items))
 			return s.requestSelection(jobID, StageSourceSelection, "pick a file or folder from the share first", items, account.ID)
 		}
 		selectedID = items[0].ID
@@ -499,6 +538,7 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 	}
 
 	s.updateJobState(jobID, JobRunning, StageTransfer, "restoring the selected share item into PikPak", "")
+	s.logJob(LogInfo, jobID, "分享文件正在转存到 PikPak 临时目录 ...")
 	if err := account.Client.RestoreShare(ctx, job.Share.ShareID, shareInfo.PassCodeToken, []string{selectedID}); err != nil {
 		return err
 	}
@@ -508,6 +548,7 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 	if err != nil {
 		return err
 	}
+	s.logJob(LogInfo, jobID, fmt.Sprintf("检测到 %d 个可用文件", len(items)), sampleItemDetail(items))
 	return s.finishWithItems(ctx, jobID, account, items)
 }
 
@@ -516,6 +557,7 @@ func (s *Server) finishWithItems(ctx context.Context, jobID string, account Acco
 		return errors.New("no downloadable file was produced")
 	}
 	if len(items) > 1 {
+		s.logJob(LogWarn, jobID, fmt.Sprintf("检测到 %d 个可用文件，需要选择目标文件", len(items)), sampleItemDetail(items))
 		return s.requestSelection(jobID, StageResultSelection, "choose which file should become the final link", items, account.ID)
 	}
 	return s.completeJob(ctx, jobID, account, items[0])
@@ -556,6 +598,7 @@ func (s *Server) resolveExistingFile(jobID string, item DownloadItem) {
 
 func (s *Server) completeJob(ctx context.Context, jobID string, account AccountRuntime, item DownloadItem) error {
 	s.updateJobState(jobID, JobRunning, StageTransfer, "requesting a fresh direct link", "")
+	s.logJob(LogInfo, jobID, "开始解析所选文件的下载链接 ...", itemLogDetails(item)...)
 	file, err := account.Client.GetFile(ctx, item.ID)
 	if err != nil {
 		return err
@@ -565,6 +608,7 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 	if directURL == "" {
 		return errors.New("PikPak returned an empty download URL")
 	}
+	s.logJob(LogSuccess, jobID, "直链获取成功", itemLogDetails(item)...)
 
 	item.MimeType = firstNonEmpty(item.MimeType, file.MimeType)
 	item.Size = firstNonEmpty(item.Size, file.Size)
@@ -578,6 +622,13 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 		result.ExpiresAt = expiresAt.Format(time.RFC3339)
 	}
 
+	s.updateJobState(jobID, JobRunning, StageTransfer, "cleaning temporary PikPak files", "")
+	s.logJob(LogInfo, jobID, "开始清理 PikPak 临时文件 ...")
+	if err := s.cleanupJobFiles(ctx, jobID, account, item.ID); err != nil {
+		return fmt.Errorf("direct link was created, but cleanup failed: %w", err)
+	}
+	s.logJob(LogSuccess, jobID, "PikPak 临时文件已清理")
+
 	_, err = s.jobs.update(jobID, func(job *Job) error {
 		job.Status = JobCompleted
 		job.Stage = StageComplete
@@ -588,7 +639,26 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 		job.Result = result
 		return nil
 	})
+	if err == nil {
+		s.logJob(LogSuccess, jobID, "解析任务完成", "文件："+firstNonEmpty(item.Name, item.Path))
+	}
 	return err
+}
+
+func (s *Server) cleanupJobFiles(ctx context.Context, jobID string, account AccountRuntime, fallbackFileID string) error {
+	job, ok := s.jobs.get(jobID)
+	if !ok {
+		return errors.New("job not found")
+	}
+
+	cleanupID := strings.TrimSpace(job.FolderID)
+	if cleanupID == "" {
+		cleanupID = strings.TrimSpace(fallbackFileID)
+	}
+	if cleanupID == "" {
+		return nil
+	}
+	return account.Client.DeleteFiles(ctx, []string{cleanupID})
 }
 
 func (s *Server) ensureJobFolder(ctx context.Context, jobID string, account AccountRuntime) (string, error) {
@@ -749,6 +819,7 @@ func shareItems(files []pikpak.FileEntry) []DownloadItem {
 }
 
 func (s *Server) beginAccountAttempt(jobID string, account AccountRuntime) {
+	s.logJob(LogInfo, jobID, "开始尝试账号 "+account.Username)
 	_, _ = s.jobs.update(jobID, func(job *Job) error {
 		job.Status = JobRunning
 		job.Error = ""
@@ -764,6 +835,13 @@ func (s *Server) beginAccountAttempt(jobID string, account AccountRuntime) {
 }
 
 func (s *Server) finishAccountAttempt(jobID, accountID, status, errText string) {
+	switch status {
+	case "success":
+		s.logJob(LogSuccess, jobID, "账号解析成功")
+	case "failed":
+		s.logJob(LogError, jobID, "账号解析失败", errText)
+	}
+
 	_, _ = s.jobs.update(jobID, func(job *Job) error {
 		for i := len(job.AccountAttempts) - 1; i >= 0; i-- {
 			if job.AccountAttempts[i].AccountID == accountID && job.AccountAttempts[i].Status == "running" {
@@ -879,7 +957,30 @@ func copyHeaderIfPresent(dst, src http.Header, key string) {
 
 func buildContentDisposition(filename string) string {
 	escaped := url.PathEscape(filename)
-	return fmt.Sprintf("attachment; filename*=UTF-8''%s", escaped)
+	return fmt.Sprintf("attachment; filename=\"%s\"; filename*=UTF-8''%s", sanitizeDispositionFilename(filename), escaped)
+}
+
+func sanitizeDispositionFilename(filename string) string {
+	filename = strings.TrimSpace(filename)
+	if filename == "" {
+		return "download"
+	}
+
+	var builder strings.Builder
+	for _, char := range filename {
+		switch {
+		case char == '"' || char == '\\' || char == '/' || char < 0x20:
+			builder.WriteByte('_')
+		case char > 0x7e:
+			builder.WriteByte('_')
+		default:
+			builder.WriteRune(char)
+		}
+	}
+	if builder.Len() == 0 {
+		return "download"
+	}
+	return builder.String()
 }
 
 func signatureForItems(items []DownloadItem) string {
@@ -897,6 +998,35 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func (s *Server) logJob(level LogLevel, jobID, message string, details ...string) {
+	if s.logs == nil {
+		return
+	}
+	s.logs.add(level, jobID, message, details...)
+}
+
+func sampleItemDetail(items []DownloadItem) string {
+	if len(items) == 0 {
+		return ""
+	}
+	item := items[0]
+	return "示例：" + firstNonEmpty(item.Path, item.Name)
+}
+
+func itemLogDetails(item DownloadItem) []string {
+	details := []string{}
+	if item.Name != "" {
+		details = append(details, "文件："+item.Name)
+	}
+	if item.Path != "" && item.Path != item.Name {
+		details = append(details, "路径："+item.Path)
+	}
+	if item.Size != "" {
+		details = append(details, "大小："+item.Size)
+	}
+	return details
 }
 
 func mustJob(job *Job, ok bool) *Job {

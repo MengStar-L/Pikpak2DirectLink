@@ -31,6 +31,16 @@
             <path d="M22 11.5h-7"></path>
           </svg>
         </button>
+        <button class="nav-button" type="button" data-page="logs" title="日志" aria-label="日志">
+          <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+            <path d="M8 6h13"></path>
+            <path d="M8 12h13"></path>
+            <path d="M8 18h13"></path>
+            <path d="M3 6h.01"></path>
+            <path d="M3 12h.01"></path>
+            <path d="M3 18h.01"></path>
+          </svg>
+        </button>
       </nav>
     </aside>
 
@@ -215,6 +225,22 @@
         </section>
 
         <div id="accountList" class="account-list"></div>
+      </section>
+
+      <section id="logsPage" class="page-view">
+        <section class="console-shell">
+          <div class="console-head">
+            <div class="console-title">
+              <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                <path d="m4 7 5 5-5 5"></path>
+                <path d="M12 17h8"></path>
+              </svg>
+              <strong>实时控制台诊断</strong>
+            </div>
+            <button id="clearLogsButton" class="secondary compact" type="button">清理终端</button>
+          </div>
+          <div id="logList" class="console-log" aria-live="polite"></div>
+        </section>
       </section>
     </main>
   </div>

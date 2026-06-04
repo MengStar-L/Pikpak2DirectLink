@@ -301,6 +301,14 @@ func (c *Client) GetFile(ctx context.Context, fileID string) (*FileEntry, error)
 	return &resp, nil
 }
 
+func (c *Client) GetVIPInfo(ctx context.Context) (*VIPInfo, error) {
+	var resp VIPInfo
+	if err := c.doJSON(ctx, http.MethodGet, driveHost, "/drive/v1/privilege/vip", nil, nil, true, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 func (c *Client) GetShareInfo(ctx context.Context, shareID, passCode, parentID string) (*ShareListResponse, error) {
 	query := url.Values{}
 	query.Set("limit", "100")
@@ -328,6 +336,31 @@ func (c *Client) RestoreShare(ctx context.Context, shareID, passCodeToken string
 		"file_ids":        fileIDs,
 	}
 	return c.doJSON(ctx, http.MethodPost, driveHost, "/drive/v1/share/restore", nil, payload, true, nil)
+}
+
+func (c *Client) DeleteFiles(ctx context.Context, fileIDs []string) error {
+	ids := make([]string, 0, len(fileIDs))
+	seen := make(map[string]struct{}, len(fileIDs))
+	for _, id := range fileIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	payload := map[string]any{"ids": ids}
+	if err := c.doJSON(ctx, http.MethodPost, driveHost, "/drive/v1/files:batchTrash", nil, payload, true, nil); err != nil {
+		return err
+	}
+	return c.doJSON(ctx, http.MethodPost, driveHost, "/drive/v1/files:batchDelete", nil, payload, true, nil)
 }
 
 func (c *Client) ensurePath(ctx context.Context, parts []string) (string, error) {

@@ -1,6 +1,7 @@
 package pikpak
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -84,5 +85,42 @@ func TestLogoutRemovesSessionFile(t *testing.T) {
 	}
 	if status.LoggedIn {
 		t.Fatalf("expected client to be logged out after logout")
+	}
+}
+
+func TestVIPInfoPremiumDetection(t *testing.T) {
+	t.Parallel()
+
+	vip := VIPInfo{
+		Data: VIPInfoData{
+			Status: "ok",
+			Type:   "platinum",
+			Expire: "2026-12-31T23:59:59Z",
+		},
+	}
+	if !vip.IsPremium() {
+		t.Fatalf("expected platinum account to be premium")
+	}
+	if vip.Expiration() != "2026-12-31T23:59:59Z" {
+		t.Fatalf("unexpected expiration %q", vip.Expiration())
+	}
+
+	normal := VIPInfo{
+		Data: VIPInfoData{
+			Status: "ok",
+			Type:   "novip",
+		},
+	}
+	if normal.IsPremium() {
+		t.Fatalf("expected novip account to be non-premium")
+	}
+}
+
+func TestDeleteFilesIgnoresEmptyIDs(t *testing.T) {
+	t.Parallel()
+
+	client := NewClient(Config{})
+	if err := client.DeleteFiles(context.Background(), []string{"", "   "}); err != nil {
+		t.Fatalf("delete empty ids: %v", err)
 	}
 }

@@ -40,6 +40,35 @@ type captchaInitResponse struct {
 	CaptchaToken string `json:"captcha_token"`
 }
 
+type VIPInfo struct {
+	Result string      `json:"result"`
+	Data   VIPInfoData `json:"data"`
+}
+
+type VIPInfoData struct {
+	Status   string `json:"status"`
+	Type     string `json:"type"`
+	Expire   string `json:"expire"`
+	ExpireAt string `json:"expire_at"`
+}
+
+func (v VIPInfo) IsPremium() bool {
+	vipType := strings.ToLower(strings.TrimSpace(v.Data.Type))
+	if vipType == "" || vipType == "novip" || vipType == "none" || vipType == "normal" {
+		return false
+	}
+
+	status := strings.ToLower(strings.TrimSpace(v.Data.Status))
+	return status == "" || status == "ok" || status == "active" || status == "valid"
+}
+
+func (v VIPInfo) Expiration() string {
+	if strings.TrimSpace(v.Data.Expire) != "" {
+		return strings.TrimSpace(v.Data.Expire)
+	}
+	return strings.TrimSpace(v.Data.ExpireAt)
+}
+
 type tokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`

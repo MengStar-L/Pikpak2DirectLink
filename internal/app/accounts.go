@@ -31,16 +31,21 @@ type AccountPoolConfig struct {
 }
 
 type AccountSummary struct {
-	ID           string        `json:"id"`
-	Username     string        `json:"username"`
-	Status       AccountStatus `json:"status"`
-	Ready        bool          `json:"ready"`
-	LoggedIn     bool          `json:"logged_in"`
-	Persisted    bool          `json:"persisted"`
-	LastError    string        `json:"last_error,omitempty"`
-	LastFailedAt string        `json:"last_failed_at,omitempty"`
-	CreatedAt    time.Time     `json:"created_at"`
-	UpdatedAt    time.Time     `json:"updated_at"`
+	ID               string        `json:"id"`
+	Username         string        `json:"username"`
+	Status           AccountStatus `json:"status"`
+	Ready            bool          `json:"ready"`
+	LoggedIn         bool          `json:"logged_in"`
+	Persisted        bool          `json:"persisted"`
+	Premium          bool          `json:"premium"`
+	PremiumType      string        `json:"premium_type,omitempty"`
+	PremiumUntil     string        `json:"premium_until,omitempty"`
+	PremiumError     string        `json:"premium_error,omitempty"`
+	PremiumCheckedAt string        `json:"premium_checked_at,omitempty"`
+	LastError        string        `json:"last_error,omitempty"`
+	LastFailedAt     string        `json:"last_failed_at,omitempty"`
+	CreatedAt        time.Time     `json:"created_at"`
+	UpdatedAt        time.Time     `json:"updated_at"`
 }
 
 type AccountRuntime struct {
@@ -50,15 +55,20 @@ type AccountRuntime struct {
 }
 
 type accountRecord struct {
-	ID           string        `json:"id"`
-	Username     string        `json:"username"`
-	Password     string        `json:"password"`
-	SessionFile  string        `json:"session_file"`
-	Status       AccountStatus `json:"status"`
-	LastError    string        `json:"last_error,omitempty"`
-	LastFailedAt string        `json:"last_failed_at,omitempty"`
-	CreatedAt    time.Time     `json:"created_at"`
-	UpdatedAt    time.Time     `json:"updated_at"`
+	ID               string        `json:"id"`
+	Username         string        `json:"username"`
+	Password         string        `json:"password"`
+	SessionFile      string        `json:"session_file"`
+	Status           AccountStatus `json:"status"`
+	Premium          bool          `json:"premium"`
+	PremiumType      string        `json:"premium_type,omitempty"`
+	PremiumUntil     string        `json:"premium_until,omitempty"`
+	PremiumError     string        `json:"premium_error,omitempty"`
+	PremiumCheckedAt string        `json:"premium_checked_at,omitempty"`
+	LastError        string        `json:"last_error,omitempty"`
+	LastFailedAt     string        `json:"last_failed_at,omitempty"`
+	CreatedAt        time.Time     `json:"created_at"`
+	UpdatedAt        time.Time     `json:"updated_at"`
 }
 
 type accountState struct {
@@ -72,6 +82,8 @@ type AccountPool struct {
 	accounts map[string]*accountState
 	order    []string
 }
+
+const premiumRefreshInterval = 30 * time.Minute
 
 func NewAccountPool(cfg AccountPoolConfig) (*AccountPool, error) {
 	cfg.AccountsFile = strings.TrimSpace(cfg.AccountsFile)
@@ -104,27 +116,31 @@ func (p *AccountPool) Add(ctx context.Context, username, password string) (Accou
 	if err := client.Login(ctx, username, password); err != nil {
 		return AccountSummary{}, err
 	}
+	premiumInfo, premiumErr := client.GetVIPInfo(ctx)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	now := time.Now()
-	record, existed := p.accounts[id]
+	existingState, existed := p.accounts[id]
 	createdAt := now
 	if existed {
-		createdAt = record.record.CreatedAt
+		createdAt = existingState.record.CreatedAt
 	}
 
+	record := accountRecord{
+		ID:          id,
+		Username:    username,
+		Password:    password,
+		SessionFile: sessionFile,
+		Status:      AccountAvailable,
+		CreatedAt:   createdAt,
+		UpdatedAt:   now,
+	}
+	updatePremiumRecord(&record, premiumInfo, premiumErr, now)
+
 	p.accounts[id] = &accountState{
-		record: accountRecord{
-			ID:          id,
-			Username:    username,
-			Password:    password,
-			SessionFile: sessionFile,
-			Status:      AccountAvailable,
-			CreatedAt:   createdAt,
-			UpdatedAt:   now,
-		},
+		record: record,
 		client: client,
 	}
 	if !existed {
@@ -180,6 +196,45 @@ func (p *AccountPool) List() []AccountSummary {
 		summaries = append(summaries, p.summaryLocked(id))
 	}
 	return summaries
+}
+
+func (p *AccountPool) RefreshPremiumInfo(ctx context.Context) {
+	now := time.Now()
+
+	type target struct {
+		id     string
+		client *pikpak.Client
+	}
+
+	p.mu.RLock()
+	targets := make([]target, 0, len(p.order))
+	for _, id := range p.order {
+		state := p.accounts[id]
+		if state == nil || state.client == nil {
+			continue
+		}
+		if premiumInfoNeedsRefresh(state.record, now) {
+			targets = append(targets, target{id: id, client: state.client})
+		}
+	}
+	p.mu.RUnlock()
+
+	for _, item := range targets {
+		if ctx.Err() != nil {
+			return
+		}
+
+		info, err := item.client.GetVIPInfo(ctx)
+
+		p.mu.Lock()
+		state := p.accounts[item.id]
+		if state != nil {
+			updatePremiumRecord(&state.record, info, err, time.Now())
+			state.record.UpdatedAt = time.Now()
+			_ = p.saveLocked()
+		}
+		p.mu.Unlock()
+	}
 }
 
 func (p *AccountPool) Snapshot() []AccountRuntime {
@@ -272,7 +327,7 @@ func (p *AccountPool) MarkFailed(id string, err error) {
 		return
 	}
 	state.record.Status = AccountFailed
-	state.record.LastError = err.Error()
+	state.record.LastError = friendlyPikPakError(err)
 	state.record.LastFailedAt = time.Now().Format(time.RFC3339)
 	state.record.UpdatedAt = time.Now()
 	_ = p.saveLocked()
@@ -360,16 +415,21 @@ func (p *AccountPool) summaryLocked(id string) AccountSummary {
 
 	status := state.client.Status()
 	return AccountSummary{
-		ID:           state.record.ID,
-		Username:     state.record.Username,
-		Status:       state.record.Status,
-		Ready:        status.Ready,
-		LoggedIn:     status.LoggedIn,
-		Persisted:    status.Persisted,
-		LastError:    state.record.LastError,
-		LastFailedAt: state.record.LastFailedAt,
-		CreatedAt:    state.record.CreatedAt,
-		UpdatedAt:    state.record.UpdatedAt,
+		ID:               state.record.ID,
+		Username:         state.record.Username,
+		Status:           state.record.Status,
+		Ready:            status.Ready,
+		LoggedIn:         status.LoggedIn,
+		Persisted:        status.Persisted,
+		Premium:          state.record.Premium,
+		PremiumType:      state.record.PremiumType,
+		PremiumUntil:     state.record.PremiumUntil,
+		PremiumError:     friendlyPikPakMessage(state.record.PremiumError),
+		PremiumCheckedAt: state.record.PremiumCheckedAt,
+		LastError:        friendlyPikPakMessage(state.record.LastError),
+		LastFailedAt:     state.record.LastFailedAt,
+		CreatedAt:        state.record.CreatedAt,
+		UpdatedAt:        state.record.UpdatedAt,
 	}
 }
 
@@ -398,4 +458,51 @@ func accountIDForUsername(username string) string {
 		return fmt.Sprintf("acct_%d", time.Now().UnixNano())
 	}
 	return "acct_" + hex.EncodeToString(buf)
+}
+
+func premiumInfoNeedsRefresh(record accountRecord, now time.Time) bool {
+	if record.PremiumCheckedAt == "" {
+		return true
+	}
+
+	checkedAt, err := time.Parse(time.RFC3339, record.PremiumCheckedAt)
+	if err != nil {
+		return true
+	}
+	return now.Sub(checkedAt) >= premiumRefreshInterval
+}
+
+func updatePremiumRecord(record *accountRecord, info *pikpak.VIPInfo, err error, checkedAt time.Time) {
+	record.PremiumCheckedAt = checkedAt.Format(time.RFC3339)
+	if err != nil {
+		record.PremiumError = friendlyPikPakError(err)
+		return
+	}
+	if info == nil {
+		record.PremiumError = "empty premium response"
+		return
+	}
+
+	record.Premium = info.IsPremium()
+	record.PremiumType = strings.TrimSpace(info.Data.Type)
+	record.PremiumUntil = strings.TrimSpace(info.Expiration())
+	record.PremiumError = ""
+}
+
+func friendlyPikPakError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return friendlyPikPakMessage(err.Error())
+}
+
+func friendlyPikPakMessage(message string) string {
+	message = strings.TrimSpace(message)
+	lower := strings.ToLower(message)
+	if strings.Contains(lower, "result:review") ||
+		strings.Contains(lower, `value:"review"`) ||
+		strings.Contains(lower, "value:\"review\"") {
+		return "PikPak 触发登录风控，请先在官方客户端完成验证后再重试。"
+	}
+	return message
 }

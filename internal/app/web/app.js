@@ -1,6 +1,7 @@
 const navButtons = Array.from(document.querySelectorAll('.nav-button'));
 const resolvePage = document.getElementById('resolvePage');
 const accountsPage = document.getElementById('accountsPage');
+const logsPage = document.getElementById('logsPage');
 
 const metricAccountCount = document.getElementById('metricAccountCount');
 const metricAvailableCount = document.getElementById('metricAvailableCount');
@@ -40,10 +41,14 @@ const accountPassword = document.getElementById('accountPassword');
 const accountSubmitButton = document.getElementById('accountSubmitButton');
 const accountFormError = document.getElementById('accountFormError');
 const accountList = document.getElementById('accountList');
+const clearLogsButton = document.getElementById('clearLogsButton');
+const logList = document.getElementById('logList');
 
 const state = {
   config: null,
   accounts: [],
+  logs: [],
+  lastLogId: 0,
   currentPage: 'resolve',
   resolveBusy: false,
   accountBusy: false,
@@ -51,6 +56,7 @@ const state = {
 
 let currentJobId = null;
 let pollTimer = null;
+let logPollTimer = null;
 
 boot();
 
@@ -58,6 +64,7 @@ async function boot() {
   bindActions();
   await refreshAppState();
   showPage('resolve');
+  startLogPolling();
 }
 
 function bindActions() {
@@ -66,6 +73,7 @@ function bindActions() {
   });
   resolveForm.addEventListener('submit', onResolveSubmit);
   accountForm.addEventListener('submit', onAccountSubmit);
+  clearLogsButton.addEventListener('click', clearLogs);
   directCopy.addEventListener('click', () => copyText(directValue.value, directCopy));
   proxyCopy.addEventListener('click', () => copyText(proxyValue.value, proxyCopy));
 }
@@ -74,9 +82,13 @@ function showPage(page) {
   state.currentPage = page;
   resolvePage.classList.toggle('active', page === 'resolve');
   accountsPage.classList.toggle('active', page === 'accounts');
+  logsPage.classList.toggle('active', page === 'logs');
   navButtons.forEach((button) => {
     button.classList.toggle('active', button.dataset.page === page);
   });
+  if (page === 'logs') {
+    renderLogs();
+  }
 }
 
 async function refreshAppState() {
@@ -134,9 +146,24 @@ function renderAccounts() {
     const main = document.createElement('div');
     main.className = 'account-main';
 
+    const heading = document.createElement('div');
+    heading.className = 'account-heading';
+
     const title = document.createElement('strong');
     title.textContent = account.username;
-    main.appendChild(title);
+    heading.appendChild(title);
+
+    heading.appendChild(createPremiumBadge(account));
+
+    const premiumUntil = formatPremiumUntil(account.premium_until);
+    if (premiumUntil) {
+      const expireBadge = document.createElement('span');
+      expireBadge.className = 'status-pill neutral compact-pill';
+      expireBadge.textContent = `到期 ${premiumUntil}`;
+      heading.appendChild(expireBadge);
+    }
+
+    main.appendChild(heading);
 
     const meta = document.createElement('div');
     meta.className = 'muted';
@@ -181,6 +208,27 @@ function renderAccounts() {
     card.appendChild(side);
     accountList.appendChild(card);
   }
+}
+
+function createPremiumBadge(account) {
+  const badge = document.createElement('span');
+  badge.className = 'status-pill neutral compact-pill';
+
+  if (account.premium) {
+    badge.className = 'status-pill success compact-pill';
+    badge.textContent = account.premium_type ? `会员 ${account.premium_type}` : '会员';
+    return badge;
+  }
+
+  if (account.premium_error) {
+    badge.className = 'status-pill warn compact-pill';
+    badge.textContent = '会员未知';
+    badge.title = account.premium_error;
+    return badge;
+  }
+
+  badge.textContent = '非会员';
+  return badge;
 }
 
 function renderAvailability() {
@@ -434,6 +482,118 @@ function renderResult(job) {
   proxyOpen.href = result.proxy_url || '#';
 }
 
+function startLogPolling() {
+  stopLogPolling();
+  fetchLogs();
+  logPollTimer = window.setInterval(fetchLogs, 1600);
+}
+
+function stopLogPolling() {
+  if (logPollTimer !== null) {
+    window.clearInterval(logPollTimer);
+    logPollTimer = null;
+  }
+}
+
+async function fetchLogs() {
+  try {
+    const payload = await api(`/api/logs?after=${state.lastLogId}`);
+    const nextLogs = payload.logs || [];
+    if (nextLogs.length === 0) {
+      renderLogs();
+      return;
+    }
+
+    for (const entry of nextLogs) {
+      state.logs.push(entry);
+      state.lastLogId = Math.max(state.lastLogId, Number(entry.id) || 0);
+    }
+    if (state.logs.length > 500) {
+      state.logs = state.logs.slice(-500);
+    }
+    renderLogs();
+  } catch {
+    stopLogPolling();
+  }
+}
+
+function renderLogs() {
+  logList.innerHTML = '';
+
+  if (state.logs.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'console-empty';
+    empty.textContent = '暂无日志';
+    logList.appendChild(empty);
+    return;
+  }
+
+  for (const entry of state.logs) {
+    const row = document.createElement('article');
+    row.className = `console-entry ${entry.level || 'info'}`;
+
+    const glyph = document.createElement('span');
+    glyph.className = 'console-glyph';
+    glyph.textContent = logGlyph(entry.level);
+    row.appendChild(glyph);
+
+    const body = document.createElement('div');
+    body.className = 'console-entry-body';
+
+    const line = document.createElement('div');
+    line.className = 'console-line';
+
+    if (entry.job_id) {
+      const job = document.createElement('span');
+      job.className = 'console-job';
+      job.textContent = `[${entry.job_id}]`;
+      line.appendChild(job);
+    }
+
+    const message = document.createElement('span');
+    message.className = 'console-message';
+    message.textContent = entry.message || '-';
+    line.appendChild(message);
+    body.appendChild(line);
+
+    if (entry.details?.length) {
+      const details = document.createElement('div');
+      details.className = 'console-details';
+      for (const detailText of entry.details) {
+        const detail = document.createElement('span');
+        detail.textContent = detailText;
+        details.appendChild(detail);
+      }
+      body.appendChild(details);
+    }
+
+    const time = document.createElement('time');
+    time.className = 'console-time';
+    time.dateTime = entry.time || '';
+    time.textContent = formatLogTime(entry.time);
+
+    row.appendChild(body);
+    row.appendChild(time);
+    logList.appendChild(row);
+  }
+
+  if (state.currentPage === 'logs') {
+    logList.scrollTop = logList.scrollHeight;
+  }
+}
+
+async function clearLogs() {
+  clearLogsButton.disabled = true;
+  try {
+    await api('/api/logs', { method: 'DELETE' });
+    state.logs = [];
+    state.lastLogId = 0;
+    renderLogs();
+  } finally {
+    clearLogsButton.disabled = false;
+  }
+}
+
 function clearJobUI() {
   stopPolling();
   currentJobId = null;
@@ -576,6 +736,41 @@ function formatDateTime(value) {
     return value;
   }
   return date.toLocaleString();
+}
+
+function formatLogTime(value) {
+  if (!value) {
+    return '';
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function formatPremiumUntil(value) {
+  if (!value) {
+    return '';
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleDateString();
+}
+
+function logGlyph(level) {
+  switch (level) {
+    case 'success':
+      return 'ok';
+    case 'warn':
+      return '!';
+    case 'error':
+      return 'x';
+    default:
+      return 'i';
+  }
 }
 
 async function api(endpoint, options = {}) {
