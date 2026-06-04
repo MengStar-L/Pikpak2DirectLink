@@ -31,8 +31,8 @@ PIKPAK_PASSWORD=your_password
 其他可选项：
 
 ```bash
-ADDR=:8080
-PUBLIC_BASE_URL=http://localhost:8080
+ADDR=:51873
+PUBLIC_BASE_URL=http://localhost:51873
 PIKPAK_ROOT_FOLDER=Pikpak2DirectLink
 PIKPAK_SESSION_FILE=data/pikpak-session.json
 PIKPAK_ACCOUNTS_FILE=data/pikpak-accounts.json
@@ -51,8 +51,10 @@ go run ./cmd/server
 打开：
 
 ```text
-http://localhost:8080
+http://localhost:51873
 ```
+
+默认端口使用高位端口 `51873`，避免和常见本地开发服务的 `8080` 冲突。你仍然可以通过 `ADDR` 和 `PUBLIC_BASE_URL` 覆盖成自己的端口或域名。
 
 第一次打开时如果还没有本地 session，先在网页端登录一次。登录成功后就会自动持久化保存 refresh token。
 

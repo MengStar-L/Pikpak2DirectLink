@@ -23,7 +23,7 @@ type Config struct {
 
 func LoadConfig() Config {
 	return Config{
-		Addr:              envOrDefault("ADDR", ":8080"),
+		Addr:              envOrDefault("ADDR", ":51873"),
 		PublicBaseURL:     strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
 		Username:          strings.TrimSpace(os.Getenv("PIKPAK_USERNAME")),
 		Password:          os.Getenv("PIKPAK_PASSWORD"),
