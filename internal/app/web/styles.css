@@ -1024,6 +1024,31 @@ button:disabled {
 
 .hidden { display: none !important; }
 
+/* --- Change access password --- */
+.password-panel { margin-top: 4px; }
+.password-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: start;
+}
+.password-form .status-error,
+.password-form .password-note {
+  grid-column: 1 / -1;
+  margin-top: 0;
+}
+.password-note code {
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--surface-tint);
+  border: 1px solid var(--border);
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 12px;
+}
+@media (max-width: 980px) {
+  .password-form { grid-template-columns: 1fr; }
+}
+
 /* --- Version & update page --- */
 .nav-dot {
   position: absolute;

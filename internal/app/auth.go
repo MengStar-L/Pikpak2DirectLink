@@ -59,6 +59,14 @@ func (s *authSessionStore) delete(sessionID string) {
 	delete(s.sessions, sessionID)
 }
 
+// invalidateAll drops every session, e.g. after the access password changes so
+// any other signed-in clients are forced to log in again.
+func (s *authSessionStore) invalidateAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions = make(map[string]time.Time)
+}
+
 func generateSessionID() string {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {

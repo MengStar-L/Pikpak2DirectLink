@@ -42,6 +42,7 @@ type configResponse struct {
 	RootFolder            string `json:"root_folder"`
 	AuthRequired          bool   `json:"auth_required"`
 	Authenticated         bool   `json:"authenticated"`
+	PasswordFixed         bool   `json:"password_fixed"`
 }
 
 type authStatusResponse struct {
@@ -66,6 +67,11 @@ type loginRequest struct {
 
 type authLoginRequest struct {
 	Password string `json:"password"`
+}
+
+type changePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -135,6 +141,7 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("POST /api/auth/setup", server.handleAuthSetup)
 	server.mux.HandleFunc("POST /api/auth/login", server.handleAuthLogin)
 	server.mux.HandleFunc("POST /api/auth/logout", server.handleAuthLogout)
+	server.mux.HandleFunc("POST /api/auth/password", server.handleChangePassword)
 	server.mux.HandleFunc("GET /api/config", server.handleConfig)
 	server.mux.HandleFunc("GET /api/update", server.handleUpdateStatus)
 	server.mux.HandleFunc("POST /api/update/check", server.handleUpdateCheck)
@@ -289,6 +296,54 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	})
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
+}
+
+// handleChangePassword lets an authenticated admin rotate the access password.
+// It is registered outside the auth middleware allowlist, so the caller is
+// already known to hold a valid session. The current password must still be
+// confirmed, and changing it logs out every other session.
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	if s.config.HasFixedPassword() {
+		writeError(w, http.StatusConflict, "访问密码由 ACCESS_PASSWORD 环境变量固定，无法在网页内修改")
+		return
+	}
+	if !s.creds.HasPassword() {
+		writeError(w, http.StatusConflict, "尚未设置访问密码")
+		return
+	}
+
+	var req changePasswordRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if !s.creds.Verify(req.CurrentPassword) {
+		writeError(w, http.StatusUnauthorized, "当前密码不正确")
+		return
+	}
+
+	newPassword := strings.TrimSpace(req.NewPassword)
+	if len(newPassword) < 6 {
+		writeError(w, http.StatusBadRequest, "新密码至少 6 位")
+		return
+	}
+	if s.creds.Verify(req.NewPassword) {
+		writeError(w, http.StatusBadRequest, "新密码不能与当前密码相同")
+		return
+	}
+
+	if err := s.creds.Set(req.NewPassword); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Invalidate every session (other devices are logged out), then mint a fresh
+	// one for this client so the caller stays signed in.
+	s.authSessions.invalidateAll()
+	s.issueSession(w)
+	s.logJob(LogSuccess, "", "访问密码已修改，其它设备的登录已失效")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -1142,6 +1197,7 @@ func (s *Server) authStatusResponse(authenticated bool) configResponse {
 		RootFolder:            s.config.RootFolderName,
 		AuthRequired:          true,
 		Authenticated:         authenticated,
+		PasswordFixed:         s.config.HasFixedPassword(),
 	}
 }
 

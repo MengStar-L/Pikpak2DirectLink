@@ -98,6 +98,10 @@
       <path d="m7.5 10 4.5 4.5L16.5 10"/>
       <path d="M5 19.5h14"/>
     </symbol>
+    <symbol id="icon-settings" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    </symbol>
   </svg>
 
   <div class="app-shell">
@@ -118,6 +122,9 @@
         <button class="nav-button" type="button" data-page="update" data-tip="更新" aria-label="检查更新">
           <svg class="ui-icon"><use href="#icon-download"></use></svg>
           <span id="updateNavDot" class="nav-dot" hidden></span>
+        </button>
+        <button class="nav-button" type="button" data-page="settings" data-tip="设置" aria-label="设置">
+          <svg class="ui-icon"><use href="#icon-settings"></use></svg>
         </button>
       </nav>
       <div class="nav-controls">
@@ -408,6 +415,40 @@
             <h3>更新内容</h3>
             <pre id="updateNotesBody" class="update-notes-body"></pre>
           </div>
+        </section>
+      </section>
+
+      <section id="settingsPage" class="page-view">
+        <section class="panel password-panel">
+          <div class="panel-head">
+            <div class="section-title compact-title">
+              <span class="title-icon orange" aria-hidden="true"><svg class="ui-icon"><use href="#icon-lock"></use></svg></span>
+              <div>
+                <h2>修改访问密码</h2>
+                <p>更改登录此工具的访问密码，修改后其它设备需重新登录</p>
+              </div>
+            </div>
+          </div>
+          <form id="passwordForm" class="password-form">
+            <label class="field floating">
+              <input id="currentPassword" name="current_password" type="password" autocomplete="current-password" placeholder=" ">
+              <span class="floating-label">当前密码</span>
+            </label>
+            <label class="field floating">
+              <input id="newPassword" name="new_password" type="password" autocomplete="new-password" placeholder=" ">
+              <span class="floating-label">新密码（至少 6 位）</span>
+            </label>
+            <label class="field floating">
+              <input id="confirmPassword" name="confirm_password" type="password" autocomplete="new-password" placeholder=" ">
+              <span class="floating-label">确认新密码</span>
+            </label>
+            <button id="passwordSubmitButton" type="submit" class="primary button-large">
+              <svg class="ui-icon"><use href="#icon-lock"></use></svg>
+              <span class="button-label">修改密码</span>
+            </button>
+            <p id="passwordFormError" class="status-error hidden"></p>
+            <p id="passwordFixedNote" class="muted password-note hidden">访问密码由 <code>ACCESS_PASSWORD</code> 环境变量固定，无法在此修改。如需更改，请修改环境变量后重启服务。</p>
+          </form>
         </section>
       </section>
     </main>

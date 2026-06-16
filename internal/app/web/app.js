@@ -44,10 +44,19 @@ const accountSubmitButton = document.getElementById('accountSubmitButton');
 const accountFormError = document.getElementById('accountFormError');
 const accountList = document.getElementById('accountList');
 
+const passwordForm = document.getElementById('passwordForm');
+const currentPassword = document.getElementById('currentPassword');
+const newPassword = document.getElementById('newPassword');
+const confirmPassword = document.getElementById('confirmPassword');
+const passwordSubmitButton = document.getElementById('passwordSubmitButton');
+const passwordFormError = document.getElementById('passwordFormError');
+const passwordFixedNote = document.getElementById('passwordFixedNote');
+
 const clearLogsButton = document.getElementById('clearLogsButton');
 const logList = document.getElementById('logList');
 
 const updatePage = document.getElementById('updatePage');
+const settingsPage = document.getElementById('settingsPage');
 const updateNavDot = document.getElementById('updateNavDot');
 const updateStatusPill = document.getElementById('updateStatusPill');
 const updateCurrentVersion = document.getElementById('updateCurrentVersion');
@@ -108,6 +117,7 @@ function bindActions() {
   document.addEventListener('pointerdown', spawnRipple);
   resolveForm.addEventListener('submit', onResolveSubmit);
   accountForm.addEventListener('submit', onAccountSubmit);
+  passwordForm.addEventListener('submit', onChangePassword);
   logoutButton?.addEventListener('click', onLogout);
   clearLogsButton.addEventListener('click', clearLogs);
   checkUpdateButton.addEventListener('click', onCheckUpdate);
@@ -123,6 +133,7 @@ function showPage(page) {
     accounts: accountsPage,
     logs: logsPage,
     update: updatePage,
+    settings: settingsPage,
   };
   if (!pages[page]) return;
 
@@ -157,6 +168,7 @@ async function refreshAppState() {
     state.accounts = accountPayload.accounts || [];
     renderMetrics();
     renderAccounts();
+    renderPasswordPanel();
     renderAvailability();
     renderAuthUI();
     ensureLogPolling();
@@ -300,6 +312,64 @@ function renderAvailability() {
 
   accountSubmitButton.disabled = state.accountBusy;
   setButtonLabel(accountSubmitButton, state.accountBusy ? '登录中...' : '添加并登录');
+}
+
+function renderPasswordPanel() {
+  const fixed = Boolean(state.config?.password_fixed);
+  passwordFixedNote.classList.toggle('hidden', !fixed);
+  [currentPassword, newPassword, confirmPassword, passwordSubmitButton].forEach((el) => {
+    if (el) el.disabled = fixed;
+  });
+}
+
+async function onChangePassword(event) {
+  event.preventDefault();
+  hidePasswordError();
+
+  const current = currentPassword.value;
+  const next = newPassword.value;
+  const confirm = confirmPassword.value;
+
+  if (next.length < 6) {
+    showPasswordError('新密码至少 6 位');
+    return;
+  }
+  if (next !== confirm) {
+    showPasswordError('两次输入的新密码不一致');
+    return;
+  }
+  if (next === current) {
+    showPasswordError('新密码不能与当前密码相同');
+    return;
+  }
+
+  passwordSubmitButton.disabled = true;
+  setButtonLabel(passwordSubmitButton, '修改中...');
+  try {
+    await api('/api/auth/password', {
+      method: 'POST',
+      body: JSON.stringify({ current_password: current, new_password: next }),
+    });
+    currentPassword.value = '';
+    newPassword.value = '';
+    confirmPassword.value = '';
+    showToast('访问密码已修改', 'success');
+  } catch (error) {
+    showPasswordError(error.message);
+  } finally {
+    passwordSubmitButton.disabled = false;
+    setButtonLabel(passwordSubmitButton, '修改密码');
+  }
+}
+
+function showPasswordError(message) {
+  passwordFormError.textContent = message;
+  passwordFormError.classList.remove('hidden');
+}
+
+function hidePasswordError() {
+  passwordFormError.textContent = '';
+  passwordFormError.classList.add('hidden');
 }
 
 async function onAccountSubmit(event) {

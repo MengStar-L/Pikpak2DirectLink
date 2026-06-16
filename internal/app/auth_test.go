@@ -199,6 +199,127 @@ func TestFixedPasswordDisablesSetup(t *testing.T) {
 	}
 }
 
+func TestChangePasswordFlow(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServer(t)
+	handler := srv.Handler()
+
+	// Establish a password and capture the session.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/auth/setup", `{"password":"admin-secret"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("setup: expected 200, got %d", rec.Code)
+	}
+	oldCookie := sessionCookie(t, rec.Result().Cookies())
+
+	// Unauthenticated change is rejected by the middleware.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/auth/password", `{"current_password":"admin-secret","new_password":"brand-new-pass"}`))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated change: expected 401, got %d", rec.Code)
+	}
+
+	// Wrong current password is rejected.
+	rec = httptest.NewRecorder()
+	req := jsonRequest(http.MethodPost, "/api/auth/password", `{"current_password":"wrong","new_password":"brand-new-pass"}`)
+	req.AddCookie(oldCookie)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong current password: expected 401, got %d", rec.Code)
+	}
+
+	// Too-short new password is rejected.
+	rec = httptest.NewRecorder()
+	req = jsonRequest(http.MethodPost, "/api/auth/password", `{"current_password":"admin-secret","new_password":"123"}`)
+	req.AddCookie(oldCookie)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("short new password: expected 400, got %d", rec.Code)
+	}
+
+	// Reusing the same password is rejected.
+	rec = httptest.NewRecorder()
+	req = jsonRequest(http.MethodPost, "/api/auth/password", `{"current_password":"admin-secret","new_password":"admin-secret"}`)
+	req.AddCookie(oldCookie)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("same password: expected 400, got %d", rec.Code)
+	}
+
+	// A valid change succeeds and mints a fresh session.
+	rec = httptest.NewRecorder()
+	req = jsonRequest(http.MethodPost, "/api/auth/password", `{"current_password":"admin-secret","new_password":"brand-new-pass"}`)
+	req.AddCookie(oldCookie)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid change: expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	newCookie := sessionCookie(t, rec.Result().Cookies())
+
+	// The previous session was invalidated; the freshly issued one still works.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
+	req.AddCookie(oldCookie)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("old session should be invalidated after password change, got %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
+	req.AddCookie(newCookie)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("new session should remain valid, got %d", rec.Code)
+	}
+
+	// Login reflects the new password, not the old one.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/auth/login", `{"password":"admin-secret"}`))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("old password should no longer log in, got %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/auth/login", `{"password":"brand-new-pass"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("new password should log in, got %d", rec.Code)
+	}
+}
+
+func TestChangePasswordBlockedWhenFixed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := Config{
+		AccessPassword:    "env-pinned-pass",
+		RootFolderName:    "TestRoot",
+		AccountsFile:      filepath.Join(dir, "accounts.json"),
+		AccountSessionDir: filepath.Join(dir, "sessions"),
+		AuthFile:          filepath.Join(dir, "auth.json"),
+	}
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	handler := srv.Handler()
+
+	// Log in with the pinned password to get a session.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/auth/login", `{"password":"env-pinned-pass"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login: expected 200, got %d", rec.Code)
+	}
+	cookie := sessionCookie(t, rec.Result().Cookies())
+
+	rec = httptest.NewRecorder()
+	req := jsonRequest(http.MethodPost, "/api/auth/password", `{"current_password":"env-pinned-pass","new_password":"something-else"}`)
+	req.AddCookie(cookie)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("change with fixed password: expected 409, got %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
 func jsonRequest(method, target, body string) *http.Request {
 	req := httptest.NewRequest(method, target, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
