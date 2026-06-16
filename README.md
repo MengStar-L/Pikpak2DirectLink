@@ -109,7 +109,9 @@ Type=simple
 User=$(whoami)
 WorkingDirectory=/opt/Pikpak2DirectLink
 Environment=ADDR=:51873
-Environment=ACCESS_PASSWORD=your_secure_password
+# 可选：固定访问密码。取消注释并改成你自己的密码后，登录页用此密码；
+# 保持注释则首次打开网页时由你在页面上设置密码（推荐）。详见下方说明。
+#Environment=ACCESS_PASSWORD=your_secure_password
 ExecStart=/opt/Pikpak2DirectLink/Pikpak2DirectLink
 Restart=always
 RestartSec=5
@@ -122,6 +124,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now Pikpak2DirectLink
 sudo systemctl status Pikpak2DirectLink --no-pager
 ```
+
+> **关于访问密码（两种模式）：**
+> - **不设 `ACCESS_PASSWORD`（默认）**：首次打开网页时，页面会让你设置一个管理员密码，之后用它登录。
+> - **设了 `ACCESS_PASSWORD`**：程序用该值固定密码并跳过首次设置流程，直接显示登录页——此时必须用 `ACCESS_PASSWORD` 的值登录。
+>
+> 如果你照搬示例没改密码就启用了该项，登录页会要求输入字面量 `your_secure_password`，导致一直提示密码错误。要自己在页面设密码，请保持该行注释。改动该项后需 `sudo systemctl daemon-reload && sudo systemctl restart Pikpak2DirectLink`。
 
 > 在线更新依赖 `Restart=always`：安装新版本后程序会替换二进制并正常退出，由 systemd 立即重启到新版本。若使用 `Restart=on-failure`，正常退出（退出码 0）不会被重启，更新后服务会停止。
 
@@ -169,7 +177,7 @@ sudo systemctl stop Pikpak2DirectLink
 
 ## 安全建议
 
-- 如果服务暴露在公网，**强烈建议**设置 `ACCESS_PASSWORD` 环境变量。未设置时，任何人都可以添加/删除账号、查看日志。
+- 访问门始终开启：不设 `ACCESS_PASSWORD` 时，首次访问需在页面设置管理员密码，之后所有访问都要登录。设置 `ACCESS_PASSWORD` 可改为固定密码。公网部署时务必设置一个**足够强**的密码（无论用哪种方式）。
 - 妥善保护服务器和数据目录权限，账号密码和 session 信息以明文保存在本地。
 - 代理链接包含令牌保护，但仍应避免公开分享。
 
@@ -193,7 +201,7 @@ UPDATE_CHECK_INTERVAL=6h
 
 **重要配置项说明：**
 
-- `ACCESS_PASSWORD`：访问密码。设置后，UI 和 API 需要登录才能访问。**强烈建议在公网部署时设置。**
+- `ACCESS_PASSWORD`：固定访问密码。**设置后会跳过首次设置流程**，登录页只接受此密码；不设则由首次访问者在页面设置密码。
 - `PUBLIC_BASE_URL`：代理链接的公开访问地址。如果服务通过反向代理或域名访问，应设置为实际访问地址。
 - `UPDATE_REPO`：检测更新时使用的 GitHub 仓库（`owner/name`）。默认指向官方仓库。
 - `UPDATE_CHECK_INTERVAL`：后台检查新版本的间隔。设为 `0` 可关闭后台自动检查（仍可在「更新」页面手动检查）。
