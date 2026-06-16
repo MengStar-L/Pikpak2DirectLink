@@ -24,9 +24,37 @@ PikPak2DirectLink 是一个基于 Go 的网页工具，用于将磁力链接或 
 
 ## 安装
 
-默认安装目录为 `/opt/Pikpak2DirectLink`。
+默认安装目录为 `/opt/Pikpak2DirectLink`。本程序面向 Linux 服务器运行。
 
-本程序面向 Linux 服务器运行。以下命令以 Debian/Ubuntu x86_64 为例：
+推荐直接下载预编译二进制（方式一）；如需自行从源码构建，见方式二。
+
+### 方式一：下载预编译二进制（推荐）
+
+[Releases](https://github.com/MengStar-L/Pikpak2DirectLink/releases) 提供各架构的预编译二进制，文件命名为 `Pikpak2DirectLink_<os>_<arch>`（如 `Pikpak2DirectLink_linux_amd64`、`Pikpak2DirectLink_linux_arm64`）。下载后即可运行，无需安装 Go 环境。
+
+以 Linux x86_64 为例：
+
+```bash
+sudo apt update
+sudo apt install -y curl ca-certificates
+
+sudo mkdir -p /opt/Pikpak2DirectLink
+sudo chown -R "$USER:$USER" /opt/Pikpak2DirectLink
+cd /opt/Pikpak2DirectLink
+
+# 下载对应架构的最新版本二进制（此处为 linux_amd64；arm64 机器改为 Pikpak2DirectLink_linux_arm64）
+curl -L -o Pikpak2DirectLink \
+  https://github.com/MengStar-L/Pikpak2DirectLink/releases/latest/download/Pikpak2DirectLink_linux_amd64
+chmod +x Pikpak2DirectLink
+```
+
+> 不确定架构时，用 `uname -m` 查看：`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。
+>
+> 预编译二进制已写入版本号，「更新」页面会据此与 GitHub 最新 Release 比较，并直接下载替换二进制完成更新——无需在服务器上保留 Go 环境。
+
+### 方式二：从源码构建
+
+需要本机安装 Go。以 Debian/Ubuntu x86_64 为例：
 
 ```bash
 sudo apt update
