@@ -7,158 +7,239 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
+  <svg class="icon-sprite" aria-hidden="true" focusable="false">
+    <symbol id="icon-brand" viewBox="0 0 24 24">
+      <path d="M12 3.25c-3.3 0-6 2.68-6 5.98 0 2.73 1.85 5.04 4.36 5.75l-.86 2.27 2.5-1.12 2.5 1.12-.86-2.27A5.99 5.99 0 0 0 18 9.23c0-3.3-2.7-5.98-6-5.98Z"/>
+      <path d="M9.9 10.55 11.35 12l2.9-3.15"/>
+    </symbol>
+    <symbol id="icon-link" viewBox="0 0 24 24">
+      <path d="M9.2 17.2H7.4a5.2 5.2 0 0 1 0-10.4h1.8"/>
+      <path d="M14.8 6.8h1.8a5.2 5.2 0 0 1 0 10.4h-1.8"/>
+      <path d="M8.4 12h7.2"/>
+    </symbol>
+    <symbol id="icon-users" viewBox="0 0 24 24">
+      <path d="M16 19v-1.1c0-2.2-1.8-4-4-4H7.4c-2.2 0-4 1.8-4 4V19"/>
+      <path d="M9.7 10.7a3.85 3.85 0 1 0 0-7.7 3.85 3.85 0 0 0 0 7.7Z"/>
+      <path d="M19 8v6"/>
+      <path d="M22 11h-6"/>
+    </symbol>
+    <symbol id="icon-logs" viewBox="0 0 24 24">
+      <path d="M8 6h12"/>
+      <path d="M8 12h12"/>
+      <path d="M8 18h12"/>
+      <path d="M4 6h.01"/>
+      <path d="M4 12h.01"/>
+      <path d="M4 18h.01"/>
+    </symbol>
+    <symbol id="icon-logout" viewBox="0 0 24 24">
+      <path d="M9 20H5.8A2.8 2.8 0 0 1 3 17.2V6.8A2.8 2.8 0 0 1 5.8 4H9"/>
+      <path d="m16 17 5-5-5-5"/>
+      <path d="M21 12H9"/>
+    </symbol>
+    <symbol id="icon-database" viewBox="0 0 24 24">
+      <ellipse cx="12" cy="5.8" rx="7" ry="3.2"/>
+      <path d="M5 5.8v6.4c0 1.77 3.13 3.2 7 3.2s7-1.43 7-3.2V5.8"/>
+      <path d="M5 12.2v6c0 1.77 3.13 3.2 7 3.2s7-1.43 7-3.2v-6"/>
+    </symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24">
+      <path d="m5 12.2 4.1 4.1L19 6.5"/>
+    </symbol>
+    <symbol id="icon-alert" viewBox="0 0 24 24">
+      <path d="M12 8v5"/>
+      <path d="M12 17h.01"/>
+      <path d="M4.8 20h14.4L12 4 4.8 20Z"/>
+    </symbol>
+    <symbol id="icon-folder" viewBox="0 0 24 24">
+      <path d="M3.6 7.2a2 2 0 0 1 2-2h4.3l2 2h6.5a2 2 0 0 1 2 2v8.6a2 2 0 0 1-2 2H5.6a2 2 0 0 1-2-2V7.2Z"/>
+    </symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24">
+      <path d="M8 8h10.2a1.8 1.8 0 0 1 1.8 1.8V20a1.8 1.8 0 0 1-1.8 1.8H8A1.8 1.8 0 0 1 6.2 20V9.8A1.8 1.8 0 0 1 8 8Z"/>
+      <path d="M4 15.8V5.8A1.8 1.8 0 0 1 5.8 4h10"/>
+    </symbol>
+    <symbol id="icon-open" viewBox="0 0 24 24">
+      <path d="M14 4h6v6"/>
+      <path d="M20 4 10 14"/>
+      <path d="M20 14v4.5A1.5 1.5 0 0 1 18.5 20h-13A1.5 1.5 0 0 1 4 18.5v-13A1.5 1.5 0 0 1 5.5 4H10"/>
+    </symbol>
+    <symbol id="icon-play" viewBox="0 0 24 24">
+      <path d="M7 5.5v13l11-6.5L7 5.5Z"/>
+    </symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24">
+      <path d="M20 12a8 8 0 0 1-13.66 5.66"/>
+      <path d="M4 12A8 8 0 0 1 17.66 6.34"/>
+      <path d="M17 3.6v3.5h3.5"/>
+      <path d="M7 20.4v-3.5H3.5"/>
+    </symbol>
+    <symbol id="icon-trash" viewBox="0 0 24 24">
+      <path d="M4 7h16"/>
+      <path d="M9 7V4.8h6V7"/>
+      <path d="M18 7l-.8 12.2a2 2 0 0 1-2 1.8H8.8a2 2 0 0 1-2-1.8L6 7"/>
+      <path d="M10 11v6"/>
+      <path d="M14 11v6"/>
+    </symbol>
+    <symbol id="icon-lock" viewBox="0 0 24 24">
+      <path d="M7 10V8a5 5 0 0 1 10 0v2"/>
+      <path d="M6.4 10h11.2A2.4 2.4 0 0 1 20 12.4v6.2a2.4 2.4 0 0 1-2.4 2.4H6.4A2.4 2.4 0 0 1 4 18.6v-6.2A2.4 2.4 0 0 1 6.4 10Z"/>
+      <path d="M12 15v2"/>
+    </symbol>
+    <symbol id="icon-terminal" viewBox="0 0 24 24">
+      <path d="m4 7 5 5-5 5"/>
+      <path d="M12 17h8"/>
+    </symbol>
+    <symbol id="icon-file" viewBox="0 0 24 24">
+      <path d="M14 3.5H7A2.5 2.5 0 0 0 4.5 6v12A2.5 2.5 0 0 0 7 20.5h10A2.5 2.5 0 0 0 19.5 18V9l-5.5-5.5Z"/>
+      <path d="M14 3.5V9h5.5"/>
+    </symbol>
+    <symbol id="icon-bolt" viewBox="0 0 24 24">
+      <path d="m13 2.8-8 10.4h6l-1 8 8.6-11.2h-6.1L13 2.8Z"/>
+    </symbol>
+    <symbol id="icon-download" viewBox="0 0 24 24">
+      <path d="M12 4v10"/>
+      <path d="m7.5 10 4.5 4.5L16.5 10"/>
+      <path d="M5 19.5h14"/>
+    </symbol>
+  </svg>
+
   <div class="app-shell">
     <aside class="sidebar" aria-label="主导航">
       <div class="brand-mark" title="PikPak 直链工具" aria-hidden="true">
-        <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-          <path d="M12 3.5 5.8 7v6.9c0 3.6 2.6 6.8 6.2 7.6 3.6-.8 6.2-4 6.2-7.6V7L12 3.5Z"></path>
-          <path d="M9.5 12.1 11.3 14l3.4-4.2"></path>
-        </svg>
+        <svg class="ui-icon"><use href="#icon-brand"></use></svg>
       </div>
       <nav class="nav-stack">
-        <button class="nav-button active" type="button" data-page="resolve" title="解析" aria-label="解析">
-          <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-            <path d="M9 17H7A5 5 0 0 1 7 7h2"></path>
-            <path d="M15 7h2a5 5 0 0 1 0 10h-2"></path>
-            <path d="M8 12h8"></path>
-          </svg>
+        <button class="nav-button active" type="button" data-page="resolve" data-tip="解析" aria-label="解析">
+          <svg class="ui-icon"><use href="#icon-link"></use></svg>
         </button>
-        <button class="nav-button" type="button" data-page="accounts" title="账号管理" aria-label="账号管理">
-          <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-            <path d="M14 19.5v-1.1c0-2.2-1.8-4-4-4H7.2c-2.2 0-4 1.8-4 4v1.1"></path>
-            <path d="M8.6 11.5a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"></path>
-            <path d="M18.5 8v7"></path>
-            <path d="M22 11.5h-7"></path>
-          </svg>
+        <button class="nav-button" type="button" data-page="accounts" data-tip="账号" aria-label="账号管理">
+          <svg class="ui-icon"><use href="#icon-users"></use></svg>
         </button>
-        <button class="nav-button" type="button" data-page="logs" title="日志" aria-label="日志">
-          <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-            <path d="M8 6h13"></path>
-            <path d="M8 12h13"></path>
-            <path d="M8 18h13"></path>
-            <path d="M3 6h.01"></path>
-            <path d="M3 12h.01"></path>
-            <path d="M3 18h.01"></path>
-          </svg>
+        <button class="nav-button" type="button" data-page="logs" data-tip="日志" aria-label="实时日志">
+          <svg class="ui-icon"><use href="#icon-logs"></use></svg>
+        </button>
+        <button class="nav-button" type="button" data-page="update" data-tip="更新" aria-label="检查更新">
+          <svg class="ui-icon"><use href="#icon-download"></use></svg>
+          <span id="updateNavDot" class="nav-dot" hidden></span>
         </button>
       </nav>
+      <div class="nav-controls">
+        <button id="logoutButton" class="nav-action" type="button" data-tip="退出" aria-label="退出登录" style="display:none">
+          <svg class="ui-icon"><use href="#icon-logout"></use></svg>
+        </button>
+      </div>
     </aside>
 
     <main class="workspace">
       <section class="metric-grid" aria-label="运行概览">
-        <article class="metric-card">
-          <span class="metric-icon blue" aria-hidden="true">
-            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-              <path d="M12 6v12"></path>
-              <path d="M7 10h10"></path>
-              <path d="M7 14h10"></path>
-            </svg>
-          </span>
-          <div>
-            <span class="metric-label">账号数量</span>
-            <strong id="metricAccountCount">0</strong>
+        <article class="metric-card metric-card-blue">
+          <span class="metric-icon" aria-hidden="true"><svg class="ui-icon"><use href="#icon-database"></use></svg></span>
+          <div class="metric-body">
+            <span class="metric-label">账号总数</span>
+            <strong id="metricAccountCount" data-count="0">0</strong>
           </div>
         </article>
-        <article class="metric-card">
-          <span class="metric-icon green" aria-hidden="true">
-            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-              <path d="m6 12 3.2 3.2L18 6.8"></path>
-            </svg>
-          </span>
-          <div>
+        <article class="metric-card metric-card-green">
+          <span class="metric-icon" aria-hidden="true"><svg class="ui-icon"><use href="#icon-check"></use></svg></span>
+          <div class="metric-body">
             <span class="metric-label">可用账号</span>
-            <strong id="metricAvailableCount">0</strong>
+            <strong id="metricAvailableCount" data-count="0">0</strong>
           </div>
         </article>
-        <article class="metric-card">
-          <span class="metric-icon red" aria-hidden="true">
-            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-              <path d="M12 8v5"></path>
-              <path d="M12 17h.01"></path>
-              <path d="M4.5 19.5 12 4l7.5 15.5H4.5Z"></path>
-            </svg>
-          </span>
-          <div>
-            <span class="metric-label">失败标记</span>
-            <strong id="metricFailedCount">0</strong>
+        <article class="metric-card metric-card-pink">
+          <span class="metric-icon" aria-hidden="true"><svg class="ui-icon"><use href="#icon-alert"></use></svg></span>
+          <div class="metric-body">
+            <span class="metric-label">失败账号</span>
+            <strong id="metricFailedCount" data-count="0">0</strong>
           </div>
         </article>
-        <article class="metric-card">
-          <span class="metric-icon amber" aria-hidden="true">
-            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-              <path d="M4 6.5h6l2 2h8v9.5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6.5Z"></path>
-            </svg>
-          </span>
-          <div>
-            <span class="metric-label">根目录</span>
-            <strong id="metricRootFolder">-</strong>
+        <article class="metric-card metric-card-orange">
+          <span class="metric-icon" aria-hidden="true"><svg class="ui-icon"><use href="#icon-folder"></use></svg></span>
+          <div class="metric-body">
+            <span class="metric-label">PikPak 根目录</span>
+            <strong id="metricRootFolder" class="metric-text">-</strong>
           </div>
         </article>
       </section>
 
       <section id="resolvePage" class="page-view active">
-        <div class="content-grid">
-          <section class="panel form-panel">
-            <form id="resolveForm" class="form">
+        <section class="panel workbench-panel">
+          <div class="workbench-head">
+            <div class="section-title">
+              <span class="title-icon blue" aria-hidden="true"><svg class="ui-icon"><use href="#icon-link"></use></svg></span>
+              <div>
+                <h2>PikPak 链接解析</h2>
+                <p>粘贴磁力链接或 PikPak 分享链接，生成直链或代理链接</p>
+              </div>
+            </div>
+            <div class="status-cluster">
+              <span id="resolveHint" class="status-pill neutral">等待账号</span>
+              <span id="jobBadge" class="status-pill neutral">空闲</span>
+              <span id="linkTypeIndicator" class="link-type-indicator"></span>
+            </div>
+          </div>
+
+          <form id="resolveForm" class="resolver-form">
+            <div class="resolver-grid">
               <label class="field resource-field">
-                <textarea id="resourceInput" name="input" rows="5" aria-label="磁链或 PikPak 分享链接" placeholder="magnet:?xt=... 或 https://mypikpak.com/s/..."></textarea>
+                <textarea id="resourceInput" name="input" rows="7" aria-label="磁力链接或 PikPak 分享链接" placeholder="magnet:?xt=urn:btih:...&#10;或&#10;https://mypikpak.com/s/..."></textarea>
               </label>
 
-              <div class="resolve-controls">
-                <label class="field">
-                  <span>提取码</span>
-                  <input id="passCode" name="pass_code" type="text" autocomplete="off" placeholder="没有可留空">
+              <div class="resolver-side">
+                <label class="field floating">
+                  <input id="passCode" name="pass_code" type="text" autocomplete="off" placeholder=" ">
+                  <span class="floating-label">提取码（可选）</span>
                 </label>
 
                 <div class="mode-group" role="radiogroup" aria-label="链接方式">
-                  <span class="inline-label">链接方式</span>
                   <label>
                     <input type="radio" name="mode" value="direct" checked>
-                    <span>直链</span>
+                    <span><svg class="ui-icon"><use href="#icon-bolt"></use></svg>直链优先</span>
                   </label>
                   <label>
                     <input type="radio" name="mode" value="proxy">
-                    <span>代理</span>
+                    <span><svg class="ui-icon"><use href="#icon-database"></use></svg>代理优先</span>
                   </label>
                 </div>
 
-                <div class="actions resolve-submit">
-                  <button id="submitButton" type="submit" class="primary">开始解析</button>
-                </div>
+                <button id="submitButton" type="submit" class="primary block button-large">
+                  <svg class="ui-icon"><use href="#icon-play"></use></svg>
+                  <span class="button-label">开始解析</span>
+                </button>
               </div>
-            </form>
-          </section>
+            </div>
+          </form>
 
-          <section class="panel status-panel">
-            <div class="task-toolbar">
-              <span id="resolveHint" class="status-pill neutral">等待账号</span>
-              <span id="jobBadge" class="status-pill neutral">空闲</span>
-              <span id="jobMessage" class="task-message hidden"></span>
+          <div class="task-dock">
+            <div class="task-dock-head">
+              <h3>任务状态</h3>
+              <p id="jobMessage" class="task-message hidden"></p>
             </div>
             <p id="jobError" class="status-error hidden"></p>
-
             <div class="subsection attempt-section">
               <div id="attemptList" class="attempt-list empty">暂无尝试记录</div>
             </div>
-          </section>
-        </div>
+          </div>
+        </section>
 
         <section id="selectionPanel" class="panel hidden">
-          <div class="section-head">
-            <div>
-              <p class="eyebrow">Selection</p>
-              <h2>选择文件</h2>
+          <div class="panel-head">
+            <div class="section-title compact-title">
+              <span class="title-icon orange" aria-hidden="true"><svg class="ui-icon"><use href="#icon-file"></use></svg></span>
+              <div>
+                <h2>选择文件</h2>
+                <p id="selectionHint" class="muted"></p>
+              </div>
             </div>
-            <span id="selectionHint" class="muted"></span>
           </div>
           <div id="selectionList" class="selection-list"></div>
         </section>
 
-        <section id="resultPanel" class="panel hidden">
-          <div class="section-head">
-            <div>
-              <p class="eyebrow">Result</p>
-              <h2>解析结果</h2>
+        <section id="resultPanel" class="panel result-panel hidden">
+          <div class="panel-head">
+            <div class="section-title compact-title">
+              <span class="title-icon green" aria-hidden="true"><svg class="ui-icon"><use href="#icon-check"></use></svg></span>
+              <div>
+                <h2>解析结果</h2>
+                <p>复制链接到下载器，或直接打开验证</p>
+              </div>
             </div>
             <span id="resultMode" class="status-pill neutral"></span>
           </div>
@@ -184,10 +265,14 @@
 
           <div class="link-block">
             <div class="link-row">
-              <span>直链</span>
+              <span class="link-tag direct">直链</span>
               <div class="link-actions">
-                <a id="directOpen" class="secondary-link" href="#" target="_blank" rel="noreferrer noopener">打开</a>
-                <button id="directCopy" type="button" class="secondary">复制</button>
+                <a id="directOpen" class="secondary-link compact" href="#" target="_blank" rel="noreferrer noopener">
+                  <svg class="ui-icon"><use href="#icon-open"></use></svg>打开
+                </a>
+                <button id="directCopy" type="button" class="secondary compact">
+                  <svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span>
+                </button>
               </div>
             </div>
             <input id="directValue" class="link-input" type="text" readonly>
@@ -195,10 +280,14 @@
 
           <div class="link-block">
             <div class="link-row">
-              <span>代理链接</span>
+              <span class="link-tag proxy">代理链接</span>
               <div class="link-actions">
-                <a id="proxyOpen" class="secondary-link" href="#" target="_blank" rel="noreferrer noopener">打开</a>
-                <button id="proxyCopy" type="button" class="secondary">复制</button>
+                <a id="proxyOpen" class="secondary-link compact" href="#" target="_blank" rel="noreferrer noopener">
+                  <svg class="ui-icon"><use href="#icon-open"></use></svg>打开
+                </a>
+                <button id="proxyCopy" type="button" class="secondary compact">
+                  <svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span>
+                </button>
               </div>
             </div>
             <input id="proxyValue" class="link-input" type="text" readonly>
@@ -208,18 +297,28 @@
 
       <section id="accountsPage" class="page-view">
         <section class="panel account-add-panel">
-          <form id="accountForm" class="account-inline-form">
-            <label class="field">
-              <span>账号</span>
-              <input id="accountUsername" name="username" type="text" autocomplete="username" placeholder="邮箱、手机号或用户名">
-            </label>
-            <label class="field">
-              <span>密码</span>
-              <input id="accountPassword" name="password" type="password" autocomplete="current-password" placeholder="输入 PikPak 密码">
-            </label>
-            <div class="actions account-add-action">
-              <button id="accountSubmitButton" type="submit" class="primary">添加并登录</button>
+          <div class="panel-head">
+            <div class="section-title compact-title">
+              <span class="title-icon blue" aria-hidden="true"><svg class="ui-icon"><use href="#icon-users"></use></svg></span>
+              <div>
+                <h2>添加 PikPak 账号</h2>
+                <p>账号会保存在本地数据目录，用于解析和刷新 session</p>
+              </div>
             </div>
+          </div>
+          <form id="accountForm" class="account-inline-form">
+            <label class="field floating">
+              <input id="accountUsername" name="username" type="text" autocomplete="username" placeholder=" ">
+              <span class="floating-label">邮箱 / 手机号 / 用户名</span>
+            </label>
+            <label class="field floating">
+              <input id="accountPassword" name="password" type="password" autocomplete="current-password" placeholder=" ">
+              <span class="floating-label">PikPak 密码</span>
+            </label>
+            <button id="accountSubmitButton" type="submit" class="primary button-large">
+              <svg class="ui-icon"><use href="#icon-users"></use></svg>
+              <span class="button-label">添加并登录</span>
+            </button>
             <p id="accountFormError" class="status-error hidden"></p>
           </form>
         </section>
@@ -230,16 +329,85 @@
       <section id="logsPage" class="page-view">
         <section class="console-shell">
           <div class="console-head">
-            <div class="console-title">
-              <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-                <path d="m4 7 5 5-5 5"></path>
-                <path d="M12 17h8"></path>
-              </svg>
-              <strong>实时控制台诊断</strong>
+            <div class="section-title compact-title">
+              <span class="title-icon blue" aria-hidden="true"><svg class="ui-icon"><use href="#icon-terminal"></use></svg></span>
+              <div>
+                <h2>实时日志</h2>
+                <p>查看文件检测、直链获取和清理过程</p>
+              </div>
             </div>
-            <button id="clearLogsButton" class="secondary compact" type="button">清理终端</button>
+            <button id="clearLogsButton" class="secondary compact" type="button">
+              <svg class="ui-icon"><use href="#icon-trash"></use></svg>
+              <span class="button-label">清理日志</span>
+            </button>
           </div>
           <div id="logList" class="console-log" aria-live="polite"></div>
+        </section>
+      </section>
+
+      <section id="updatePage" class="page-view">
+        <section class="panel update-panel">
+          <div class="panel-head">
+            <div class="section-title compact-title">
+              <span class="title-icon blue" aria-hidden="true"><svg class="ui-icon"><use href="#icon-download"></use></svg></span>
+              <div>
+                <h2>版本与更新</h2>
+                <p>检测 GitHub 上对应架构的新版本，并下载安装更新</p>
+              </div>
+            </div>
+            <span id="updateStatusPill" class="status-pill neutral">空闲</span>
+          </div>
+
+          <dl class="result-grid update-grid">
+            <div>
+              <dt>当前版本</dt>
+              <dd id="updateCurrentVersion">-</dd>
+            </div>
+            <div>
+              <dt>最新版本</dt>
+              <dd id="updateLatestVersion">-</dd>
+            </div>
+            <div>
+              <dt>运行平台</dt>
+              <dd id="updatePlatform">-</dd>
+            </div>
+            <div>
+              <dt>上次检查</dt>
+              <dd id="updateCheckedAt">-</dd>
+            </div>
+          </dl>
+
+          <div id="updateProgress" class="update-progress hidden">
+            <div class="progress-head">
+              <span id="updateProgressLabel" class="progress-label">下载中</span>
+              <span id="updateProgressPercent" class="progress-percent">0%</span>
+            </div>
+            <div class="progress-track">
+              <div id="updateProgressFill" class="progress-fill"></div>
+            </div>
+            <div id="updateProgressMeta" class="progress-meta"></div>
+          </div>
+
+          <p id="updateError" class="status-error hidden"></p>
+
+          <div class="update-actions">
+            <button id="checkUpdateButton" type="button" class="secondary button-large">
+              <svg class="ui-icon"><use href="#icon-refresh"></use></svg>
+              <span class="button-label">检查更新</span>
+            </button>
+            <button id="installUpdateButton" type="button" class="primary button-large" disabled>
+              <svg class="ui-icon"><use href="#icon-download"></use></svg>
+              <span class="button-label">立即更新</span>
+            </button>
+            <a id="updateReleaseLink" class="secondary-link compact hidden" href="#" target="_blank" rel="noreferrer noopener">
+              <svg class="ui-icon"><use href="#icon-open"></use></svg>发布页
+            </a>
+          </div>
+
+          <div id="updateNotes" class="update-notes hidden">
+            <h3>更新内容</h3>
+            <pre id="updateNotesBody" class="update-notes-body"></pre>
+          </div>
         </section>
       </section>
     </main>

@@ -15,6 +15,12 @@ PikPak2DirectLink 是一个基于 Go 的网页工具，用于将磁力链接或 
 - 解析完成后提供 PikPak 直链和服务端代理链接。
 - 解析完成后会清理本次转存或离线下载产生的 PikPak 临时文件。
 - 日志页面提供实时控制台诊断，可查看账号尝试、文件检测、直链获取、临时文件清理等过程。
+- **可选访问密码保护**：设置 `ACCESS_PASSWORD` 环境变量后，UI 和 API 需要登录才能访问。
+- **代理链接令牌保护**：每个代理链接附带唯一令牌，防止未授权访问。
+- **深色模式支持**：自动跟随系统主题，或手动切换浅色/深色模式。
+- **实时链接检测**：输入时自动识别磁力链接或 PikPak 分享链接。
+- **任务内存限制**：自动清理旧任务（保留最近 200 个），防止内存泄漏。
+- **在线更新**：在「更新」页面检测 GitHub 上对应架构（os/arch）的最新版本，一键下载并安装；下载与安装过程显示进度条，安装后服务自动重启。后台还会定时检查新版本并在侧边栏提示。
 
 ## 安装
 
@@ -37,8 +43,10 @@ sudo chown -R "$USER:$USER" /opt/Pikpak2DirectLink
 git clone https://github.com/MengStar-L/Pikpak2DirectLink.git /opt/Pikpak2DirectLink
 cd /opt/Pikpak2DirectLink
 
-/usr/local/go/bin/go build -o Pikpak2DirectLink ./cmd/server
+/usr/local/go/bin/go build -ldflags "-X pikpak2directlink/internal/version.Version=$(git describe --tags --always)" -o Pikpak2DirectLink ./cmd/server
 ```
+
+> `-ldflags "-X .../version.Version=..."` 会把版本号写入二进制，「更新」页面据此与 GitHub 最新 Release 比较。不带该参数构建时版本显示为 `dev`，仍可正常使用与更新。
 
 ## 运行
 
@@ -73,8 +81,9 @@ Type=simple
 User=$(whoami)
 WorkingDirectory=/opt/Pikpak2DirectLink
 Environment=ADDR=:51873
+Environment=ACCESS_PASSWORD=your_secure_password
 ExecStart=/opt/Pikpak2DirectLink/Pikpak2DirectLink
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
@@ -85,6 +94,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now Pikpak2DirectLink
 sudo systemctl status Pikpak2DirectLink --no-pager
 ```
+
+> 在线更新依赖 `Restart=always`：安装新版本后程序会替换二进制并正常退出，由 systemd 立即重启到新版本。若使用 `Restart=on-failure`，正常退出（退出码 0）不会被重启，更新后服务会停止。
 
 如需固定代理链接中的公开访问地址，可在服务文件的 `[Service]` 段增加：
 
@@ -108,21 +119,31 @@ sudo systemctl stop Pikpak2DirectLink
 ## 使用
 
 1. 打开网页。
-2. 进入账号管理页面。
-3. 添加一个或多个 PikPak 账号。
-4. 返回解析页面。
-5. 输入磁力链接或 PikPak 分享链接。
-6. 如分享链接需要提取码，填写提取码。
-7. 选择直链或代理方式。
-8. 提交解析任务。
-9. 等待任务完成后复制下载链接。
-10. 如需排查解析过程，可进入日志页面查看实时诊断信息。
+2. （可选）如果配置了访问密码，输入密码登录。
+3. 进入账号管理页面。
+4. 添加一个或多个 PikPak 账号。
+5. 返回解析页面。
+6. 输入磁力链接或 PikPak 分享链接（会自动识别链接类型）。
+7. 如分享链接需要提取码，填写提取码。
+8. 选择直链或代理方式。
+9. 提交解析任务。
+10. 等待任务完成后复制下载链接。
+11. 如需排查解析过程，可进入日志页面查看实时诊断信息。
+12. 右下角可切换深色/浅色主题。
 
 ## 代理链接
 
 代理链接由本程序服务端转发已获取到的 PikPak 下载直链，适合下载器无法直接使用原始直链的场景。
 
+每个代理链接包含唯一令牌，仅持有令牌者可访问。代理链接不需要登录即可使用，方便下载器直接调用。
+
 解析完成后，程序会删除本次写入 PikPak 的临时文件，因此代理链接不会再重新向 PikPak 刷新直链。代理链接的有效期受已获取直链的过期时间影响，过期后需要重新解析。
+
+## 安全建议
+
+- 如果服务暴露在公网，**强烈建议**设置 `ACCESS_PASSWORD` 环境变量。未设置时，任何人都可以添加/删除账号、查看日志。
+- 妥善保护服务器和数据目录权限，账号密码和 session 信息以明文保存在本地。
+- 代理链接包含令牌保护，但仍应避免公开分享。
 
 ## 配置项
 
@@ -131,13 +152,23 @@ sudo systemctl stop Pikpak2DirectLink
 ```bash
 ADDR=:51873
 PUBLIC_BASE_URL=http://your-server-ip:51873
+ACCESS_PASSWORD=your_secure_password
 PIKPAK_ROOT_FOLDER=Pikpak2DirectLink
 PIKPAK_ACCOUNTS_FILE=data/pikpak-accounts.json
 PIKPAK_ACCOUNT_SESSION_DIR=data/accounts
 PIKPAK_REQUEST_TIMEOUT=20s
 RESOLVE_TIMEOUT=12m
 POLL_INTERVAL=5s
+UPDATE_REPO=MengStar-L/Pikpak2DirectLink
+UPDATE_CHECK_INTERVAL=6h
 ```
+
+**重要配置项说明：**
+
+- `ACCESS_PASSWORD`：访问密码。设置后，UI 和 API 需要登录才能访问。**强烈建议在公网部署时设置。**
+- `PUBLIC_BASE_URL`：代理链接的公开访问地址。如果服务通过反向代理或域名访问，应设置为实际访问地址。
+- `UPDATE_REPO`：检测更新时使用的 GitHub 仓库（`owner/name`）。默认指向官方仓库。
+- `UPDATE_CHECK_INTERVAL`：后台检查新版本的间隔。设为 `0` 可关闭后台自动检查（仍可在「更新」页面手动检查）。
 
 也可以通过环境变量预置一个启动账号：
 
@@ -145,6 +176,25 @@ POLL_INTERVAL=5s
 PIKPAK_USERNAME=your_account
 PIKPAK_PASSWORD=your_password
 ```
+
+## 在线更新
+
+程序内置自更新能力，更新源为 GitHub Releases。
+
+工作方式：
+
+1. 仓库推送 `v*` 形式的标签（如 `v1.2.0`）时，`.github/workflows/release.yml` 会交叉编译各架构二进制（linux/darwin/windows × amd64/arm64），并连同 `SHA256SUMS` 一起发布到对应 Release。
+2. 程序在后台按 `UPDATE_CHECK_INTERVAL` 周期检查最新 Release，发现新版本时在侧边栏「更新」按钮上显示红点。
+3. 在「更新」页面可手动「检查更新」，或在发现新版本时点击「立即更新」。
+4. 更新时程序下载与当前 `os/arch` 匹配的二进制（显示下载进度条），校验 `SHA256SUMS`，替换正在运行的可执行文件，然后退出由 systemd 重启到新版本。
+
+发布二进制的命名约定为 `Pikpak2DirectLink_<os>_<arch>`（Windows 追加 `.exe`），更新器据此选择对应架构的资源。
+
+注意：
+
+- 在线更新需要服务进程对自身可执行文件所在目录有写权限（按本文「安装」步骤将 `/opt/Pikpak2DirectLink` 归属当前用户即满足）。
+- 更新依赖 systemd 自动重启，请确保服务文件使用 `Restart=always`（见「自启动」）。
+- 更新后内存中的登录会话会失效，需要重新输入访问密码登录。
 
 ## 数据保存
 

@@ -23,11 +23,15 @@ import (
 var webFS embed.FS
 
 type Server struct {
-	config   Config
-	accounts *AccountPool
-	jobs     *jobStore
-	logs     *logStore
-	mux      *http.ServeMux
+	config       Config
+	accounts     *AccountPool
+	jobs         *jobStore
+	logs         *logStore
+	authSessions *authSessionStore
+	creds        *credentialStore
+	updater      *updater
+	gateHTML     []byte
+	mux          *http.ServeMux
 }
 
 type configResponse struct {
@@ -36,6 +40,13 @@ type configResponse struct {
 	FailedAccountCount    int    `json:"failed_account_count"`
 	AvailableAccountCount int    `json:"available_account_count"`
 	RootFolder            string `json:"root_folder"`
+	AuthRequired          bool   `json:"auth_required"`
+	Authenticated         bool   `json:"authenticated"`
+}
+
+type authStatusResponse struct {
+	Configured    bool `json:"configured"`
+	Authenticated bool `json:"authenticated"`
 }
 
 type createJobRequest struct {
@@ -53,8 +64,17 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
+type authLoginRequest struct {
+	Password string `json:"password"`
+}
+
 func NewServer(cfg Config) (*Server, error) {
 	staticFiles, err := fs.Sub(webFS, "web")
+	if err != nil {
+		return nil, err
+	}
+
+	gateHTML, err := fs.ReadFile(staticFiles, "gate.html")
 	if err != nil {
 		return nil, err
 	}
@@ -74,13 +94,33 @@ func NewServer(cfg Config) (*Server, error) {
 		}
 	}
 
-	server := &Server{
-		config:   cfg,
-		accounts: accounts,
-		jobs:     newJobStore(),
-		logs:     newLogStore(500),
-		mux:      http.NewServeMux(),
+	creds, err := newCredentialStore(cfg.AuthFile)
+	if err != nil {
+		return nil, err
 	}
+	// A password pinned via ACCESS_PASSWORD takes precedence and disables the
+	// first-visitor setup flow.
+	if cfg.HasFixedPassword() {
+		if err := creds.Set(cfg.AccessPassword); err != nil {
+			return nil, err
+		}
+	}
+
+	server := &Server{
+		config:       cfg,
+		accounts:     accounts,
+		jobs:         newJobStore(200),
+		logs:         newLogStore(500),
+		authSessions: newAuthSessionStore(),
+		creds:        creds,
+		gateHTML:     gateHTML,
+		mux:          http.NewServeMux(),
+	}
+
+	// The updater logs into the shared console with no job context.
+	server.updater = newUpdater(cfg.UpdateRepo, cfg.RequestTimeout, func(level LogLevel, message string, details ...string) {
+		server.logJob(level, "", message, details...)
+	})
 
 	server.mux.Handle("GET /app.js", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serveEmbeddedFile(w, r, staticFiles, "app.js", "application/javascript; charset=utf-8")
@@ -91,29 +131,186 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serveEmbeddedFile(w, r, staticFiles, "index.html", "text/html; charset=utf-8")
 	}))
+	server.mux.HandleFunc("GET /api/auth/status", server.handleAuthStatus)
+	server.mux.HandleFunc("POST /api/auth/setup", server.handleAuthSetup)
+	server.mux.HandleFunc("POST /api/auth/login", server.handleAuthLogin)
+	server.mux.HandleFunc("POST /api/auth/logout", server.handleAuthLogout)
 	server.mux.HandleFunc("GET /api/config", server.handleConfig)
+	server.mux.HandleFunc("GET /api/update", server.handleUpdateStatus)
+	server.mux.HandleFunc("POST /api/update/check", server.handleUpdateCheck)
+	server.mux.HandleFunc("POST /api/update/install", server.handleUpdateInstall)
 	server.mux.HandleFunc("GET /api/logs", server.handleListLogs)
 	server.mux.HandleFunc("DELETE /api/logs", server.handleClearLogs)
 	server.mux.HandleFunc("GET /api/accounts", server.handleListAccounts)
 	server.mux.HandleFunc("POST /api/accounts", server.handleAddAccount)
 	server.mux.HandleFunc("DELETE /api/accounts/{id}", server.handleDeleteAccount)
 	server.mux.HandleFunc("POST /api/accounts/{id}/reset", server.handleResetAccount)
-	server.mux.HandleFunc("POST /api/login", server.handleAddAccount)
 	server.mux.HandleFunc("POST /api/jobs", server.handleCreateJob)
 	server.mux.HandleFunc("GET /api/jobs/{id}", server.handleGetJob)
 	server.mux.HandleFunc("POST /api/jobs/{id}/select", server.handleSelectItem)
 	server.mux.HandleFunc("GET /proxy/{id}", server.handleProxy)
 	server.mux.HandleFunc("HEAD /proxy/{id}", server.handleProxy)
 
+	// Poll GitHub Releases in the background so the UI can surface an available
+	// update. Installs are always user-initiated.
+	go server.updater.runPeriodicCheck(context.Background(), cfg.UpdateCheckPeriod)
+
 	return server, nil
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return s.authMiddleware(s.mux)
 }
 
-func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.authStatusResponse())
+// authenticated reports whether the request carries a valid session cookie.
+func (s *Server) authenticated(r *http.Request) bool {
+	cookie, err := r.Cookie("session")
+	return err == nil && s.authSessions.validate(cookie.Value)
+}
+
+// authMiddleware enforces the access gate for every request. Unauthenticated
+// browsers never receive the application shell or its scripts — they are served
+// a self-contained gate page instead — so the gate cannot be bypassed by
+// editing the DOM in devtools. Only the auth endpoints (needed to log in) and
+// the per-job proxy links (protected by their own tokens) stay open.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/api/auth/status" ||
+			path == "/api/auth/setup" ||
+			path == "/api/auth/login" ||
+			strings.HasPrefix(path, "/proxy/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if s.authenticated(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// API calls get a clean 401 so the front-end can react; everything else
+		// (the app shell, scripts, styles, unknown paths) gets the gate page.
+		if strings.HasPrefix(path, "/api/") {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+
+		s.serveGate(w)
+	})
+}
+
+func (s *Server) serveGate(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(s.gateHTML)
+}
+
+func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, authStatusResponse{
+		Configured:    s.creds.HasPassword(),
+		Authenticated: s.authenticated(r),
+	})
+}
+
+// handleAuthSetup lets the first visitor set the admin password. Once a password
+// exists this endpoint is closed, so it can only ever be used once.
+func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
+	if s.creds.HasPassword() {
+		writeError(w, http.StatusConflict, "password has already been set")
+		return
+	}
+
+	var req authLoginRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(strings.TrimSpace(req.Password)) < 6 {
+		writeError(w, http.StatusBadRequest, "password must be at least 6 characters")
+		return
+	}
+
+	if err := s.creds.SetInitial(req.Password); err != nil {
+		writeError(w, http.StatusConflict, "password has already been set")
+		return
+	}
+
+	s.issueSession(w)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "configured"})
+}
+
+func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.creds.HasPassword() {
+		writeError(w, http.StatusConflict, "password has not been set yet")
+		return
+	}
+
+	var req authLoginRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if !s.creds.Verify(req.Password) {
+		writeError(w, http.StatusUnauthorized, "incorrect password")
+		return
+	}
+
+	s.issueSession(w)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "authenticated"})
+}
+
+func (s *Server) issueSession(w http.ResponseWriter) {
+	sessionID := s.authSessions.create()
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session",
+		Value:    sessionID,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   86400 * 30,
+	})
+}
+
+func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("session")
+	if err == nil {
+		s.authSessions.delete(cookie.Value)
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+	})
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
+}
+
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.authStatusResponse(s.authenticated(r)))
+}
+
+func (s *Server) handleUpdateStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.updater.snapshot())
+}
+
+func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.updater.check(ctx))
+}
+
+func (s *Server) handleUpdateInstall(w http.ResponseWriter, _ *http.Request) {
+	if err := s.updater.startInstall(); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, s.updater.snapshot())
 }
 
 func (s *Server) handleListLogs(w http.ResponseWriter, r *http.Request) {
@@ -343,6 +540,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if job.Result == nil || job.Result.File.ID == "" {
 		writeError(w, http.StatusConflict, "job is not ready")
+		return
+	}
+
+	expectedToken := job.Result.ProxyToken
+	providedToken := strings.TrimSpace(r.URL.Query().Get("token"))
+	if expectedToken != "" && providedToken != expectedToken {
+		writeError(w, http.StatusForbidden, "invalid or missing proxy token")
 		return
 	}
 
@@ -613,10 +817,12 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 	item.MimeType = firstNonEmpty(item.MimeType, file.MimeType)
 	item.Size = firstNonEmpty(item.Size, file.Size)
 
+	proxyToken := newJobID()
 	result := &JobResult{
-		File:      item,
-		DirectURL: directURL,
-		ProxyURL:  strings.TrimRight(mustJob(s.jobs.get(jobID)).BaseURL, "/") + "/proxy/" + jobID,
+		File:       item,
+		DirectURL:  directURL,
+		ProxyURL:   strings.TrimRight(mustJob(s.jobs.get(jobID)).BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken,
+		ProxyToken: proxyToken,
 	}
 	if expiresAt := file.ExpireAt(); !expiresAt.IsZero() {
 		result.ExpiresAt = expiresAt.Format(time.RFC3339)
@@ -917,7 +1123,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func (s *Server) authStatusResponse() configResponse {
+func (s *Server) authStatusResponse(authenticated bool) configResponse {
 	accounts := s.accounts.List()
 	failed := 0
 	available := 0
@@ -934,6 +1140,8 @@ func (s *Server) authStatusResponse() configResponse {
 		FailedAccountCount:    failed,
 		AvailableAccountCount: available,
 		RootFolder:            s.config.RootFolderName,
+		AuthRequired:          true,
+		Authenticated:         authenticated,
 	}
 }
 

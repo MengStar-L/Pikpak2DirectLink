@@ -48,10 +48,11 @@ type DownloadItem struct {
 }
 
 type JobResult struct {
-	File      DownloadItem `json:"file"`
-	DirectURL string       `json:"direct_url"`
-	ProxyURL  string       `json:"proxy_url"`
-	ExpiresAt string       `json:"expires_at,omitempty"`
+	File       DownloadItem `json:"file"`
+	DirectURL  string       `json:"direct_url"`
+	ProxyURL   string       `json:"proxy_url"`
+	ProxyToken string       `json:"proxy_token"`
+	ExpiresAt  string       `json:"expires_at,omitempty"`
 }
 
 type AccountAttempt struct {
@@ -90,13 +91,19 @@ type Job struct {
 }
 
 type jobStore struct {
-	mu   sync.RWMutex
-	jobs map[string]*Job
+	mu       sync.RWMutex
+	jobs     map[string]*Job
+	order    []string
+	capacity int
 }
 
-func newJobStore() *jobStore {
+func newJobStore(capacity int) *jobStore {
+	if capacity <= 0 {
+		capacity = 200
+	}
 	return &jobStore{
-		jobs: make(map[string]*Job),
+		jobs:     make(map[string]*Job),
+		capacity: capacity,
 	}
 }
 
@@ -104,6 +111,13 @@ func (s *jobStore) create(job *Job) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.jobs[job.ID] = cloneJob(job)
+	s.order = append(s.order, job.ID)
+
+	if len(s.order) > s.capacity {
+		toEvict := s.order[0]
+		delete(s.jobs, toEvict)
+		s.order = s.order[1:]
+	}
 }
 
 func (s *jobStore) get(id string) (*Job, bool) {
