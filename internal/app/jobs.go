@@ -81,11 +81,13 @@ type Job struct {
 	Error           string       `json:"error,omitempty"`
 	BaseURL         string       `json:"-"`
 	FolderID        string       `json:"-"`
+	CDKCode         string       `json:"-"`
 	AccountID       string       `json:"account_id,omitempty"`
 	Share           *ShareState  `json:"share,omitempty"`
 	Items           []DownloadItem
 	AccountAttempts []AccountAttempt `json:"account_attempts,omitempty"`
 	Result          *JobResult       `json:"result,omitempty"`
+	QueueAhead      int              `json:"queue_ahead"`
 	CreatedAt       time.Time        `json:"created_at"`
 	UpdatedAt       time.Time        `json:"updated_at"`
 }

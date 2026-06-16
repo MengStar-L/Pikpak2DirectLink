@@ -17,12 +17,14 @@ func newTestServer(t *testing.T) *Server {
 		AccountsFile:      filepath.Join(dir, "accounts.json"),
 		AccountSessionDir: filepath.Join(dir, "sessions"),
 		AuthFile:          filepath.Join(dir, "auth.json"),
+		DBFile:            filepath.Join(dir, "pikpak.db"),
 		RequestTimeout:    0,
 	}
 	srv, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
+	t.Cleanup(func() { srv.Close() })
 	return srv
 }
 
@@ -84,7 +86,9 @@ func TestGateBlocksAppForUnauthenticated(t *testing.T) {
 	srv := newTestServer(t)
 	handler := srv.Handler()
 
-	for _, path := range []string{"/", "/app.js", "/styles.css", "/anything"} {
+	// The app shell and its script must never reach an unauthenticated client.
+	// (/styles.css is intentionally public so the CDK user portal can render.)
+	for _, path := range []string{"/", "/app.js", "/anything"} {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		body := rec.Body.String()
@@ -179,11 +183,13 @@ func TestFixedPasswordDisablesSetup(t *testing.T) {
 		AccountsFile:      filepath.Join(dir, "accounts.json"),
 		AccountSessionDir: filepath.Join(dir, "sessions"),
 		AuthFile:          filepath.Join(dir, "auth.json"),
+		DBFile:            filepath.Join(dir, "pikpak.db"),
 	}
 	srv, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
+	defer srv.Close()
 	handler := srv.Handler()
 
 	rec := httptest.NewRecorder()
@@ -296,11 +302,13 @@ func TestChangePasswordBlockedWhenFixed(t *testing.T) {
 		AccountsFile:      filepath.Join(dir, "accounts.json"),
 		AccountSessionDir: filepath.Join(dir, "sessions"),
 		AuthFile:          filepath.Join(dir, "auth.json"),
+		DBFile:            filepath.Join(dir, "pikpak.db"),
 	}
 	srv, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
+	defer srv.Close()
 	handler := srv.Handler()
 
 	// Log in with the pinned password to get a session.
@@ -317,6 +325,34 @@ func TestChangePasswordBlockedWhenFixed(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("change with fixed password: expected 409, got %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCDKAdminGatedUserPortalPublic(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServer(t)
+	handler := srv.Handler()
+
+	// Admin CDK endpoints require a session.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/cdks", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated /api/cdks, got %d", rec.Code)
+	}
+
+	// The user portal page is reachable without the admin session.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/u", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "CDK") {
+		t.Fatalf("expected the user portal page at /u, got %d", rec.Code)
+	}
+
+	// An unknown CDK is rejected at login.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/u/login", `{"code":"DOES-NOTE-XIST-0000"}`))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unknown CDK, got %d", rec.Code)
 	}
 }
 

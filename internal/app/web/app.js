@@ -57,6 +57,15 @@ const logList = document.getElementById('logList');
 
 const updatePage = document.getElementById('updatePage');
 const settingsPage = document.getElementById('settingsPage');
+const cdkPage = document.getElementById('cdkPage');
+const cdkGenForm = document.getElementById('cdkGenForm');
+const cdkCount = document.getElementById('cdkCount');
+const cdkRemaining = document.getElementById('cdkRemaining');
+const cdkDays = document.getElementById('cdkDays');
+const cdkGenSubmit = document.getElementById('cdkGenSubmit');
+const cdkGenError = document.getElementById('cdkGenError');
+const cdkList = document.getElementById('cdkList');
+const cdkPortalLink = document.getElementById('cdkPortalLink');
 const updateNavDot = document.getElementById('updateNavDot');
 const updateStatusPill = document.getElementById('updateStatusPill');
 const updateCurrentVersion = document.getElementById('updateCurrentVersion');
@@ -85,6 +94,7 @@ const state = {
   accountBusy: false,
   authenticated: false,
   update: null,
+  cdks: [],
 };
 
 let currentJobId = null;
@@ -122,6 +132,7 @@ function bindActions() {
   clearLogsButton.addEventListener('click', clearLogs);
   checkUpdateButton.addEventListener('click', onCheckUpdate);
   installUpdateButton.addEventListener('click', onInstallUpdate);
+  cdkGenForm.addEventListener('submit', onGenerateCDKs);
   directCopy.addEventListener('click', () => copyText(directValue.value, directCopy));
   proxyCopy.addEventListener('click', () => copyText(proxyValue.value, proxyCopy));
   resourceInput.addEventListener('input', detectLinkType);
@@ -134,6 +145,7 @@ function showPage(page) {
     logs: logsPage,
     update: updatePage,
     settings: settingsPage,
+    cdk: cdkPage,
   };
   if (!pages[page]) return;
 
@@ -149,6 +161,9 @@ function showPage(page) {
   }
   if (page === 'update') {
     fetchUpdateStatus();
+  }
+  if (page === 'cdk') {
+    fetchCDKs();
   }
 }
 
@@ -492,7 +507,14 @@ function renderJob(job) {
     jobBadge.classList.add('is-running');
   }
 
-  jobMessage.textContent = job.message || '处理中...';
+  if (job.status === 'queued') {
+    const ahead = Number(job.queue_ahead) || 0;
+    jobMessage.textContent = ahead > 0
+      ? `排队中：前方还有 ${ahead} 条任务`
+      : '排队中：等待当前任务完成…';
+  } else {
+    jobMessage.textContent = job.message || '处理中...';
+  }
   jobMessage.classList.remove('hidden');
   renderAttempts(job.account_attempts || []);
 
@@ -996,6 +1018,199 @@ function updateStatusInfo(phase, status) {
         ? { label: '有新版本', variant: 'warn' }
         : { label: '空闲', variant: 'neutral' };
   }
+}
+
+// --- CDK distribution (admin) ---
+
+async function fetchCDKs() {
+  try {
+    const payload = await api('/api/cdks');
+    state.cdks = payload.cdks || [];
+    renderCDKs();
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function onGenerateCDKs(event) {
+  event.preventDefault();
+  hideCdkGenError();
+
+  const count = Number(cdkCount.value);
+  const remaining = Number(cdkRemaining.value);
+  const days = Number(cdkDays.value);
+  if (!(count >= 1)) { showCdkGenError('分发数量至少为 1'); return; }
+  if (!(remaining >= 1)) { showCdkGenError('可解析次数至少为 1'); return; }
+  if (!(days >= 1)) { showCdkGenError('到期天数至少为 1'); return; }
+
+  cdkGenSubmit.disabled = true;
+  setButtonLabel(cdkGenSubmit, '生成中...');
+  try {
+    const payload = await api('/api/cdks', {
+      method: 'POST',
+      body: JSON.stringify({ count, remaining, days }),
+    });
+    const generated = payload.cdks || [];
+    await fetchCDKs();
+
+    const codes = generated.map((cdk) => cdk.code).join('\n');
+    let copied = false;
+    if (codes) {
+      try {
+        await navigator.clipboard.writeText(codes);
+        copied = true;
+      } catch {
+        // clipboard may be unavailable (insecure context / denied); ignore
+      }
+    }
+    showToast(`已生成 ${generated.length} 个 CDK${copied ? '，已复制到剪贴板' : ''}`, 'success');
+  } catch (error) {
+    showCdkGenError(error.message);
+  } finally {
+    cdkGenSubmit.disabled = false;
+    setButtonLabel(cdkGenSubmit, '生成 CDK');
+  }
+}
+
+async function saveCDK(code, remaining, days, button) {
+  if (!(remaining >= 0) || !(days >= 1)) {
+    showToast('次数不能为负，天数至少为 1', 'error');
+    return;
+  }
+  button.disabled = true;
+  const original = getButtonLabel(button);
+  setButtonLabel(button, '保存中...');
+  try {
+    await api(`/api/cdks/${encodeURIComponent(code)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ remaining, days }),
+    });
+    await fetchCDKs();
+    showToast('CDK 已更新', 'success');
+  } catch (error) {
+    showToast(error.message, 'error');
+    button.disabled = false;
+    setButtonLabel(button, original);
+  }
+}
+
+async function deleteCDK(code) {
+  if (!window.confirm(`确定删除 CDK ${code} 吗？此操作不可撤销。`)) return;
+  try {
+    await api(`/api/cdks/${encodeURIComponent(code)}`, { method: 'DELETE' });
+    await fetchCDKs();
+    showToast('CDK 已删除', 'success');
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+function renderCDKs() {
+  cdkList.innerHTML = '';
+  if (state.cdks.length === 0) {
+    cdkList.className = 'cdk-list empty';
+    cdkList.textContent = '还没有分发任何 CDK';
+    return;
+  }
+  cdkList.className = 'cdk-list';
+  for (const cdk of state.cdks) {
+    cdkList.appendChild(buildCDKCard(cdk));
+  }
+}
+
+function buildCDKCard(cdk) {
+  const card = document.createElement('article');
+  card.className = `cdk-card ${cdk.expired ? 'danger' : 'success'}`;
+
+  // left group: ticket stub + code/meta + status pill
+  const id = document.createElement('div');
+  id.className = 'cdk-id';
+  const stub = document.createElement('span');
+  stub.className = 'cdk-stub';
+  stub.setAttribute('aria-hidden', 'true');
+  stub.appendChild(createIcon('ticket'));
+  const text = document.createElement('div');
+  text.className = 'cdk-text';
+  const code = document.createElement('code');
+  code.className = 'cdk-code';
+  code.textContent = cdk.code;
+  const meta = document.createElement('div');
+  meta.className = 'muted';
+  meta.textContent = `已用 ${cdk.used} 次 · 创建于 ${formatDateTime(cdk.created_at)}`;
+  text.appendChild(code);
+  text.appendChild(meta);
+  id.appendChild(stub);
+  id.appendChild(text);
+  id.appendChild(createStatusPill(cdk.expired ? '已过期' : `有效 ${cdk.days_left} 天`, cdk.expired ? 'danger' : 'success'));
+
+  // right group: editable fields + save, then copy/delete actions
+  const ops = document.createElement('div');
+  ops.className = 'cdk-ops';
+
+  const edit = document.createElement('div');
+  edit.className = 'cdk-edit';
+  const remField = cdkNumberField('剩余次数', cdk.remaining, 0);
+  const dayField = cdkNumberField('到期天数', cdk.expired ? 1 : cdk.days_left, 1);
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'button';
+  saveBtn.className = 'secondary compact';
+  setButtonContent(saveBtn, '保存', 'check');
+  saveBtn.addEventListener('click', () => saveCDK(cdk.code, Number(remField.input.value), Number(dayField.input.value), saveBtn));
+  edit.appendChild(remField.wrap);
+  edit.appendChild(dayField.wrap);
+  edit.appendChild(saveBtn);
+
+  const actions = document.createElement('div');
+  actions.className = 'mini-actions';
+  const copyCodeBtn = document.createElement('button');
+  copyCodeBtn.type = 'button';
+  copyCodeBtn.className = 'secondary compact';
+  setButtonContent(copyCodeBtn, '复制码', 'copy');
+  copyCodeBtn.addEventListener('click', () => copyText(cdk.code, copyCodeBtn));
+  const copyLinkBtn = document.createElement('button');
+  copyLinkBtn.type = 'button';
+  copyLinkBtn.className = 'secondary compact';
+  setButtonContent(copyLinkBtn, '复制链接', 'open');
+  copyLinkBtn.addEventListener('click', () => copyText(`${location.origin}/u?code=${cdk.code}`, copyLinkBtn));
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.className = 'danger-button compact';
+  setButtonContent(delBtn, '删除', 'trash');
+  delBtn.addEventListener('click', () => deleteCDK(cdk.code));
+  actions.appendChild(copyCodeBtn);
+  actions.appendChild(copyLinkBtn);
+  actions.appendChild(delBtn);
+
+  ops.appendChild(edit);
+  ops.appendChild(actions);
+
+  card.appendChild(id);
+  card.appendChild(ops);
+  return card;
+}
+
+function cdkNumberField(label, value, min) {
+  const wrap = document.createElement('label');
+  wrap.className = 'cdk-field';
+  const span = document.createElement('span');
+  span.textContent = label;
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min = String(min);
+  input.value = String(value);
+  wrap.appendChild(span);
+  wrap.appendChild(input);
+  return { wrap, input };
+}
+
+function showCdkGenError(message) {
+  cdkGenError.textContent = message;
+  cdkGenError.classList.remove('hidden');
+}
+
+function hideCdkGenError() {
+  cdkGenError.textContent = '';
+  cdkGenError.classList.add('hidden');
 }
 
 function clearJobUI() {

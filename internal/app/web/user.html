@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>PikPak 直链工具 · 用户</title>
+  <link rel="stylesheet" href="/styles.css">
+  <style>
+    .portal { max-width: 780px; margin: 0 auto; padding: 26px 18px 64px; display: grid; gap: 22px; }
+    .portal-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+    .portal-brand { display: flex; align-items: center; gap: 12px; }
+    .portal-logo { width: 46px; height: 46px; border-radius: 15px; display: grid; place-items: center; background: var(--primary); color: #fff; box-shadow: 0 16px 28px rgba(11,107,255,.28); }
+    .portal-logo .ui-icon { width: 24px; height: 24px; }
+    .portal-title { font-size: 18px; font-weight: 850; color: var(--text-primary); }
+    .portal-sub { color: var(--text-muted); font-size: 12.5px; font-weight: 700; }
+    .cdk-status { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .gate-wrap { min-height: 86vh; display: grid; place-items: center; padding: 20px; }
+    .gate-card { width: 100%; max-width: 430px; text-align: center; }
+    .gate-card .panel-head { justify-content: center; margin-bottom: 14px; }
+    .gate-card .field { margin-top: 8px; text-align: left; }
+    .cdk-input { text-transform: uppercase; letter-spacing: 1px; font-family: Consolas, "SFMono-Regular", monospace; }
+    .resolver-form.portal-form { grid-template-columns: 1fr; }
+  </style>
+</head>
+<body>
+  <svg class="icon-sprite" aria-hidden="true" focusable="false">
+    <symbol id="icon-brand" viewBox="0 0 24 24"><path d="M12 3.25c-3.3 0-6 2.68-6 5.98 0 2.73 1.85 5.04 4.36 5.75l-.86 2.27 2.5-1.12 2.5 1.12-.86-2.27A5.99 5.99 0 0 0 18 9.23c0-3.3-2.7-5.98-6-5.98Z"/><path d="M9.9 10.55 11.35 12l2.9-3.15"/></symbol>
+    <symbol id="icon-link" viewBox="0 0 24 24"><path d="M9.2 17.2H7.4a5.2 5.2 0 0 1 0-10.4h1.8"/><path d="M14.8 6.8h1.8a5.2 5.2 0 0 1 0 10.4h-1.8"/><path d="M8.4 12h7.2"/></symbol>
+    <symbol id="icon-bolt" viewBox="0 0 24 24"><path d="m13 2.8-8 10.4h6l-1 8 8.6-11.2h-6.1L13 2.8Z"/></symbol>
+    <symbol id="icon-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5.8" rx="7" ry="3.2"/><path d="M5 5.8v6.4c0 1.77 3.13 3.2 7 3.2s7-1.43 7-3.2V5.8"/><path d="M5 12.2v6c0 1.77 3.13 3.2 7 3.2s7-1.43 7-3.2v-6"/></symbol>
+    <symbol id="icon-play" viewBox="0 0 24 24"><path d="M7 5.5v13l11-6.5L7 5.5Z"/></symbol>
+    <symbol id="icon-open" viewBox="0 0 24 24"><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M20 14v4.5A1.5 1.5 0 0 1 18.5 20h-13A1.5 1.5 0 0 1 4 18.5v-13A1.5 1.5 0 0 1 5.5 4H10"/></symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24"><path d="M8 8h10.2a1.8 1.8 0 0 1 1.8 1.8V20a1.8 1.8 0 0 1-1.8 1.8H8A1.8 1.8 0 0 1 6.2 20V9.8A1.8 1.8 0 0 1 8 8Z"/><path d="M4 15.8V5.8A1.8 1.8 0 0 1 5.8 4h10"/></symbol>
+    <symbol id="icon-file" viewBox="0 0 24 24"><path d="M14 3.5H7A2.5 2.5 0 0 0 4.5 6v12A2.5 2.5 0 0 0 7 20.5h10A2.5 2.5 0 0 0 19.5 18V9l-5.5-5.5Z"/><path d="M14 3.5V9h5.5"/></symbol>
+    <symbol id="icon-lock" viewBox="0 0 24 24"><path d="M7 10V8a5 5 0 0 1 10 0v2"/><path d="M6.4 10h11.2A2.4 2.4 0 0 1 20 12.4v6.2a2.4 2.4 0 0 1-2.4 2.4H6.4A2.4 2.4 0 0 1 4 18.6v-6.2A2.4 2.4 0 0 1 6.4 10Z"/><path d="M12 15v2"/></symbol>
+    <symbol id="icon-logout" viewBox="0 0 24 24"><path d="M9 20H5.8A2.8 2.8 0 0 1 3 17.2V6.8A2.8 2.8 0 0 1 5.8 4H9"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></symbol>
+    <symbol id="icon-ticket" viewBox="0 0 24 24"><path d="M4 8.5A1.5 1.5 0 0 1 5.5 7h13A1.5 1.5 0 0 1 20 8.5v2a2 2 0 0 0 0 4v2A1.5 1.5 0 0 1 18.5 17h-13A1.5 1.5 0 0 1 4 15.5v-2a2 2 0 0 0 0-4Z"/><path d="M13 7v10"/></symbol>
+  </svg>
+
+  <!-- CDK gate -->
+  <div id="gateView" class="gate-wrap">
+    <section class="panel gate-card">
+      <div class="panel-head">
+        <div class="section-title compact-title">
+          <span class="title-icon blue" aria-hidden="true"><svg class="ui-icon"><use href="#icon-ticket"></use></svg></span>
+          <div>
+            <h2>输入 CDK 进入</h2>
+            <p>使用拿到的 CDK 兑换码使用解析功能</p>
+          </div>
+        </div>
+      </div>
+      <form id="cdkForm">
+        <label class="field floating">
+          <input id="cdkInput" class="cdk-input" type="text" autocomplete="off" placeholder=" ">
+          <span class="floating-label">CDK 兑换码</span>
+        </label>
+        <button id="cdkSubmit" type="submit" class="primary block button-large" style="margin-top:14px">
+          <svg class="ui-icon"><use href="#icon-play"></use></svg>
+          <span class="button-label">进入</span>
+        </button>
+        <p id="cdkError" class="status-error hidden"></p>
+      </form>
+    </section>
+  </div>
+
+  <!-- App (after CDK login) -->
+  <div id="appView" class="portal hidden">
+    <header class="portal-head">
+      <div class="portal-brand">
+        <span class="portal-logo" aria-hidden="true"><svg class="ui-icon"><use href="#icon-brand"></use></svg></span>
+        <div>
+          <div class="portal-title">PikPak 直链工具</div>
+          <div class="portal-sub">CDK 用户</div>
+        </div>
+      </div>
+      <div class="cdk-status">
+        <span id="queuePill" class="status-pill neutral hidden">队列 -</span>
+        <span id="cdkRemainingPill" class="status-pill success">剩余 -</span>
+        <span id="cdkDaysPill" class="status-pill neutral">到期 -</span>
+        <button id="logoutButton" type="button" class="secondary compact">
+          <svg class="ui-icon"><use href="#icon-logout"></use></svg><span class="button-label">退出</span>
+        </button>
+      </div>
+    </header>
+
+    <section class="panel workbench-panel">
+      <div class="workbench-head">
+        <div class="section-title">
+          <span class="title-icon blue" aria-hidden="true"><svg class="ui-icon"><use href="#icon-link"></use></svg></span>
+          <div>
+            <h2>链接解析</h2>
+            <p>粘贴磁力链接或 PikPak 分享链接，生成直链或代理链接</p>
+          </div>
+        </div>
+        <span id="jobBadge" class="status-pill neutral">空闲</span>
+      </div>
+
+      <form id="resolveForm" class="resolver-form portal-form">
+        <label class="field">
+          <textarea id="resourceInput" rows="6" placeholder="magnet:?xt=urn:btih:...&#10;或&#10;https://mypikpak.com/s/..."></textarea>
+        </label>
+        <div class="resolver-side">
+          <label class="field floating">
+            <input id="passCode" type="text" autocomplete="off" placeholder=" ">
+            <span class="floating-label">提取码（可选）</span>
+          </label>
+          <div class="mode-group" role="radiogroup" aria-label="链接方式">
+            <label><input type="radio" name="mode" value="direct" checked><span><svg class="ui-icon"><use href="#icon-bolt"></use></svg>直链优先</span></label>
+            <label><input type="radio" name="mode" value="proxy"><span><svg class="ui-icon"><use href="#icon-database"></use></svg>代理优先</span></label>
+          </div>
+          <button id="submitButton" type="submit" class="primary block button-large">
+            <svg class="ui-icon"><use href="#icon-play"></use></svg>
+            <span class="button-label">开始解析</span>
+          </button>
+        </div>
+      </form>
+
+      <div class="task-dock">
+        <div class="task-dock-head">
+          <h3>任务状态</h3>
+          <p id="jobMessage" class="task-message hidden"></p>
+        </div>
+        <p id="jobError" class="status-error hidden"></p>
+      </div>
+    </section>
+
+    <section id="selectionPanel" class="panel hidden">
+      <div class="panel-head">
+        <div class="section-title compact-title">
+          <span class="title-icon orange" aria-hidden="true"><svg class="ui-icon"><use href="#icon-file"></use></svg></span>
+          <div><h2>选择文件</h2><p id="selectionHint" class="muted"></p></div>
+        </div>
+      </div>
+      <div id="selectionList" class="selection-list"></div>
+    </section>
+
+    <section id="resultPanel" class="panel result-panel hidden">
+      <div class="panel-head">
+        <div class="section-title compact-title">
+          <span class="title-icon green" aria-hidden="true"><svg class="ui-icon"><use href="#icon-link"></use></svg></span>
+          <div><h2>解析结果</h2><p>复制链接到下载器，或直接打开验证</p></div>
+        </div>
+        <span id="resultMode" class="status-pill neutral"></span>
+      </div>
+      <dl class="result-grid">
+        <div><dt>文件名</dt><dd id="resultName">-</dd></div>
+        <div><dt>路径</dt><dd id="resultPath">-</dd></div>
+        <div><dt>大小</dt><dd id="resultSize">-</dd></div>
+        <div><dt>过期时间</dt><dd id="resultExpire">-</dd></div>
+      </dl>
+      <div class="link-block">
+        <div class="link-row">
+          <span class="link-tag direct">直链</span>
+          <div class="link-actions">
+            <a id="directOpen" class="secondary-link compact" href="#" target="_blank" rel="noreferrer noopener"><svg class="ui-icon"><use href="#icon-open"></use></svg>打开</a>
+            <button id="directCopy" type="button" class="secondary compact"><svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span></button>
+          </div>
+        </div>
+        <input id="directValue" class="link-input" type="text" readonly>
+      </div>
+      <div class="link-block">
+        <div class="link-row">
+          <span class="link-tag proxy">代理链接</span>
+          <div class="link-actions">
+            <a id="proxyOpen" class="secondary-link compact" href="#" target="_blank" rel="noreferrer noopener"><svg class="ui-icon"><use href="#icon-open"></use></svg>打开</a>
+            <button id="proxyCopy" type="button" class="secondary compact"><svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span></button>
+          </div>
+        </div>
+        <input id="proxyValue" class="link-input" type="text" readonly>
+      </div>
+    </section>
+  </div>
+
+  <script src="/u/app.js" defer></script>
+</body>
+</html>

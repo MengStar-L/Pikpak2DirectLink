@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -26,11 +27,15 @@ type Server struct {
 	config       Config
 	accounts     *AccountPool
 	jobs         *jobStore
+	resolver     *resolveQueue
 	logs         *logStore
 	authSessions *authSessionStore
 	creds        *credentialStore
 	updater      *updater
+	db           *sql.DB
+	cdk          *cdkStore
 	gateHTML     []byte
+	userHTML     []byte
 	mux          *http.ServeMux
 }
 
@@ -85,6 +90,16 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 
+	userHTML, err := fs.ReadFile(staticFiles, "user.html")
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := openDatabase(cfg.DBFile)
+	if err != nil {
+		return nil, err
+	}
+
 	accounts, err := NewAccountPool(AccountPoolConfig{
 		AccountsFile:   cfg.AccountsFile,
 		SessionDir:     cfg.AccountSessionDir,
@@ -119,7 +134,10 @@ func NewServer(cfg Config) (*Server, error) {
 		logs:         newLogStore(500),
 		authSessions: newAuthSessionStore(),
 		creds:        creds,
+		db:           db,
+		cdk:          newCDKStore(db),
 		gateHTML:     gateHTML,
+		userHTML:     userHTML,
 		mux:          http.NewServeMux(),
 	}
 
@@ -127,6 +145,11 @@ func NewServer(cfg Config) (*Server, error) {
 	server.updater = newUpdater(cfg.UpdateRepo, cfg.RequestTimeout, func(level LogLevel, message string, details ...string) {
 		server.logJob(level, "", message, details...)
 	})
+
+	// Serialize all link resolution through a single global worker so the
+	// system only ever drives PikPak for one job at a time.
+	server.resolver = newResolveQueue(cfg.QueueTimeout, server.failJob)
+	go server.resolver.run()
 
 	server.mux.Handle("GET /app.js", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serveEmbeddedFile(w, r, staticFiles, "app.js", "application/javascript; charset=utf-8")
@@ -155,6 +178,25 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("POST /api/jobs", server.handleCreateJob)
 	server.mux.HandleFunc("GET /api/jobs/{id}", server.handleGetJob)
 	server.mux.HandleFunc("POST /api/jobs/{id}/select", server.handleSelectItem)
+
+	// Admin-only CDK management (behind the access gate).
+	server.mux.HandleFunc("GET /api/cdks", server.handleListCDKs)
+	server.mux.HandleFunc("POST /api/cdks", server.handleCreateCDKs)
+	server.mux.HandleFunc("PATCH /api/cdks/{code}", server.handleUpdateCDK)
+	server.mux.HandleFunc("DELETE /api/cdks/{code}", server.handleDeleteCDK)
+
+	// Public CDK user portal. The handlers enforce CDK validity themselves.
+	server.mux.Handle("GET /u", http.HandlerFunc(server.handleUserPortal))
+	server.mux.Handle("GET /u/app.js", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serveEmbeddedFile(w, r, staticFiles, "user.js", "application/javascript; charset=utf-8")
+	}))
+	server.mux.HandleFunc("POST /api/u/login", server.handleUserLogin)
+	server.mux.HandleFunc("GET /api/u/status", server.handleUserStatus)
+	server.mux.HandleFunc("POST /api/u/logout", server.handleUserLogout)
+	server.mux.HandleFunc("POST /api/u/jobs", server.handleUserCreateJob)
+	server.mux.HandleFunc("GET /api/u/jobs/{id}", server.handleUserGetJob)
+	server.mux.HandleFunc("POST /api/u/jobs/{id}/select", server.handleUserSelectItem)
+
 	server.mux.HandleFunc("GET /proxy/{id}", server.handleProxy)
 	server.mux.HandleFunc("HEAD /proxy/{id}", server.handleProxy)
 
@@ -167,6 +209,15 @@ func NewServer(cfg Config) (*Server, error) {
 
 func (s *Server) Handler() http.Handler {
 	return s.authMiddleware(s.mux)
+}
+
+// Close releases server-held resources such as the database handle. It is safe
+// to call on a nil database.
+func (s *Server) Close() error {
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
 }
 
 // authenticated reports whether the request carries a valid session cookie.
@@ -186,6 +237,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		if path == "/api/auth/status" ||
 			path == "/api/auth/setup" ||
 			path == "/api/auth/login" ||
+			path == "/styles.css" ||
+			path == "/u" ||
+			strings.HasPrefix(path, "/u/") ||
+			strings.HasPrefix(path, "/api/u/") ||
 			strings.HasPrefix(path, "/proxy/") {
 			next.ServeHTTP(w, r)
 			return
@@ -493,8 +548,11 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 
 	s.jobs.create(job)
 	s.logJob(LogInfo, job.ID, "解析任务已创建", "来源："+string(kind))
-	go s.processJob(job.ID)
+	s.resolver.enqueue(job.ID, priorityAdmin, func(ctx context.Context) {
+		s.processJob(ctx, job.ID)
+	})
 
+	job.QueueAhead = s.resolver.position(job.ID)
 	writeJSON(w, http.StatusAccepted, job)
 }
 
@@ -505,6 +563,7 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "job not found")
 		return
 	}
+	job.QueueAhead = s.resolver.position(jobID)
 	writeJSON(w, http.StatusOK, job)
 }
 
@@ -514,75 +573,17 @@ func (s *Server) handleSelectItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jobID := r.PathValue("id")
 	var req selectItemRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	req.ItemID = strings.TrimSpace(req.ItemID)
-	if req.ItemID == "" {
-		writeError(w, http.StatusBadRequest, "item_id is required")
+
+	updatedJob, status, msg := s.applyItemSelection(r.PathValue("id"), req.ItemID)
+	if status != 0 {
+		writeError(w, status, msg)
 		return
 	}
-
-	job, ok := s.jobs.get(jobID)
-	if !ok {
-		writeError(w, http.StatusNotFound, "job not found")
-		return
-	}
-
-	if job.Status != JobSelectionRequired {
-		writeError(w, http.StatusConflict, "job is not waiting for a selection")
-		return
-	}
-
-	var selectedItem *DownloadItem
-	if job.Stage == StageResultSelection {
-		for _, item := range job.Items {
-			if item.ID == req.ItemID {
-				copyItem := item
-				selectedItem = &copyItem
-				break
-			}
-		}
-		if selectedItem == nil {
-			writeError(w, http.StatusBadRequest, "selected file was not found in the current result set")
-			return
-		}
-	}
-
-	_, err := s.jobs.update(jobID, func(current *Job) error {
-		current.Status = JobRunning
-		current.Message = "resuming"
-		current.Error = ""
-		switch current.Stage {
-		case StageSourceSelection:
-			if current.Share == nil {
-				return errors.New("share context is missing")
-			}
-			current.Items = nil
-			current.Share.SelectedID = req.ItemID
-			current.Stage = StageTransfer
-		case StageResultSelection:
-			current.Message = "resolving selected file"
-		default:
-			return errors.New("job cannot accept selections right now")
-		}
-		return nil
-	})
-	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
-		return
-	}
-
-	if job.Stage == StageSourceSelection {
-		go s.processJob(jobID)
-	} else {
-		go s.resolveExistingFile(jobID, *selectedItem)
-	}
-
-	updatedJob, _ := s.jobs.get(jobID)
 	writeJSON(w, http.StatusAccepted, updatedJob)
 }
 
@@ -677,7 +678,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (s *Server) processJob(jobID string) {
+func (s *Server) processJob(ctx context.Context, jobID string) {
 	accounts := s.accounts.Snapshot()
 	if len(accounts) == 0 {
 		s.logJob(LogError, jobID, "没有可用的 PikPak 账号")
@@ -687,10 +688,16 @@ func (s *Server) processJob(jobID string) {
 
 	var failures []string
 	for _, account := range accounts {
-		ctx, cancel := context.WithTimeout(context.Background(), s.config.ResolveTimeout)
+		// Stop as soon as the global per-job budget (the resolve queue's hard
+		// timeout) is spent — the next queued job should get its turn.
+		if ctx.Err() != nil {
+			break
+		}
+
+		attemptCtx, cancel := context.WithTimeout(ctx, s.config.ResolveTimeout)
 		s.beginAccountAttempt(jobID, account)
 
-		err := s.processJobWithAccount(ctx, jobID, account)
+		err := s.processJobWithAccount(attemptCtx, jobID, account)
 		cancel()
 
 		if err == nil {
@@ -699,10 +706,23 @@ func (s *Server) processJob(jobID string) {
 			return
 		}
 
+		// A global-budget timeout (or cancellation) is not the account's fault,
+		// so don't mark it failed — just stop and let the next job run.
+		if ctx.Err() != nil {
+			s.finishAccountAttempt(jobID, account.ID, "failed", "解析超时")
+			break
+		}
+
 		message := friendlyPikPakError(err)
 		s.accounts.MarkFailed(account.ID, err)
 		s.finishAccountAttempt(jobID, account.ID, "failed", message)
 		failures = append(failures, account.Username+": "+message)
+	}
+
+	if ctx.Err() != nil {
+		s.logJob(LogError, jobID, "解析超时，已自动跳过", "上限："+s.resolver.timeout.String())
+		s.failJob(jobID, fmt.Errorf("解析超时：%s 内未完成", s.resolver.timeout))
+		return
 	}
 
 	err := fmt.Errorf("all PikPak accounts failed: %s", strings.Join(failures, "; "))
@@ -838,10 +858,7 @@ func (s *Server) requestSelection(jobID string, stage JobStage, message string, 
 	return err
 }
 
-func (s *Server) resolveExistingFile(jobID string, item DownloadItem) {
-	ctx, cancel := context.WithTimeout(context.Background(), s.config.RequestTimeout*3)
-	defer cancel()
-
+func (s *Server) resolveExistingFile(ctx context.Context, jobID string, item DownloadItem) {
 	job := mustJob(s.jobs.get(jobID))
 	account, ok := s.accounts.Get(job.AccountID)
 	if !ok {
@@ -1132,6 +1149,11 @@ func (s *Server) updateJobState(jobID string, status JobStatus, stage JobStage, 
 
 func (s *Server) failJob(jobID string, err error) {
 	s.updateJobState(jobID, JobFailed, StageFailed, "", err.Error())
+	// A CDK-originated parse only "costs" a credit when it succeeds, so refund
+	// the reservation made at submit time.
+	if job, ok := s.jobs.get(jobID); ok && job.CDKCode != "" {
+		_ = s.cdk.refund(job.CDKCode)
+	}
 }
 
 func (s *Server) baseURL(r *http.Request) string {

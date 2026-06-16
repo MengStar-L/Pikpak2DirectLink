@@ -102,6 +102,10 @@
       <circle cx="12" cy="12" r="3"/>
       <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
     </symbol>
+    <symbol id="icon-ticket" viewBox="0 0 24 24">
+      <path d="M4 8.5A1.5 1.5 0 0 1 5.5 7h13A1.5 1.5 0 0 1 20 8.5v2a2 2 0 0 0 0 4v2A1.5 1.5 0 0 1 18.5 17h-13A1.5 1.5 0 0 1 4 15.5v-2a2 2 0 0 0 0-4Z"/>
+      <path d="M13 7v10"/>
+    </symbol>
   </svg>
 
   <div class="app-shell">
@@ -118,6 +122,9 @@
         </button>
         <button class="nav-button" type="button" data-page="logs" data-tip="日志" aria-label="实时日志">
           <svg class="ui-icon"><use href="#icon-logs"></use></svg>
+        </button>
+        <button class="nav-button" type="button" data-page="cdk" data-tip="CDK" aria-label="CDK 分发">
+          <svg class="ui-icon"><use href="#icon-ticket"></use></svg>
         </button>
         <button class="nav-button" type="button" data-page="update" data-tip="更新" aria-label="检查更新">
           <svg class="ui-icon"><use href="#icon-download"></use></svg>
@@ -450,6 +457,44 @@
             <p id="passwordFixedNote" class="muted password-note hidden">访问密码由 <code>ACCESS_PASSWORD</code> 环境变量固定，无法在此修改。如需更改，请修改环境变量后重启服务。</p>
           </form>
         </section>
+      </section>
+
+      <section id="cdkPage" class="page-view">
+        <section class="panel">
+          <div class="panel-head">
+            <div class="section-title compact-title">
+              <span class="title-icon green" aria-hidden="true"><svg class="ui-icon"><use href="#icon-ticket"></use></svg></span>
+              <div>
+                <h2>CDK 分发</h2>
+                <p>生成兑换码，用户凭码进入用户页面使用解析功能</p>
+              </div>
+            </div>
+            <a id="cdkPortalLink" class="secondary-link compact" href="/u" target="_blank" rel="noreferrer noopener">
+              <svg class="ui-icon"><use href="#icon-open"></use></svg>用户入口
+            </a>
+          </div>
+          <form id="cdkGenForm" class="cdk-form">
+            <label class="field floating">
+              <input id="cdkCount" name="count" type="number" min="1" max="100" value="1" placeholder=" ">
+              <span class="floating-label">分发数量</span>
+            </label>
+            <label class="field floating">
+              <input id="cdkRemaining" name="remaining" type="number" min="1" value="10" placeholder=" ">
+              <span class="floating-label">可解析次数</span>
+            </label>
+            <label class="field floating">
+              <input id="cdkDays" name="days" type="number" min="1" value="30" placeholder=" ">
+              <span class="floating-label">到期天数</span>
+            </label>
+            <button id="cdkGenSubmit" type="submit" class="primary button-large">
+              <svg class="ui-icon"><use href="#icon-ticket"></use></svg>
+              <span class="button-label">生成 CDK</span>
+            </button>
+            <p id="cdkGenError" class="status-error hidden"></p>
+          </form>
+        </section>
+
+        <div id="cdkList" class="cdk-list"></div>
       </section>
     </main>
   </div>

@@ -379,6 +379,7 @@ h3 { font-size: 15px; line-height: 1.25; font-weight: 800; }
 textarea,
 input[type="text"],
 input[type="password"],
+input[type="number"],
 .link-input {
   width: 100%;
   border: 1px solid var(--border-strong);
@@ -388,6 +389,16 @@ input[type="password"],
   padding: 13px 16px;
   font-size: 14px;
   transition: background 180ms var(--ease), border-color 180ms var(--ease), box-shadow 180ms var(--ease);
+}
+
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 textarea {
@@ -401,6 +412,7 @@ textarea::placeholder { color: #a8b4c3; }
 textarea:focus,
 input[type="text"]:focus,
 input[type="password"]:focus,
+input[type="number"]:focus,
 .link-input:focus {
   outline: none;
   background: #fff;
@@ -1023,6 +1035,154 @@ button:disabled {
 .toast-info { border-left-color: var(--primary); color: var(--primary); }
 
 .hidden { display: none !important; }
+
+/* --- CDK distribution --- */
+.cdk-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+  gap: 14px;
+  align-items: start;
+}
+.cdk-form .status-error { grid-column: 1 / -1; margin-top: 0; }
+
+.cdk-list { display: grid; gap: 14px; }
+
+/* single-row ticket: identity (+status) on the left, controls on the right */
+.cdk-card {
+  position: relative;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 14px 22px;
+  flex-wrap: wrap;
+  padding: 14px 22px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at left center, transparent 9px, #fff 10px) left / 51% 100% no-repeat,
+    radial-gradient(circle at right center, transparent 9px, #fff 10px) right / 51% 100% no-repeat;
+  box-shadow: 0 10px 28px rgba(31, 46, 76, 0.05);
+  animation: rise-in 300ms var(--ease) both;
+  transition: border-color 170ms var(--ease), box-shadow 170ms var(--ease), transform 170ms var(--ease);
+}
+.cdk-card::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: 0;
+  width: 4px;
+  border-radius: 0 4px 4px 0;
+  background: var(--green);
+}
+.cdk-card:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
+  box-shadow: 0 18px 38px rgba(31, 46, 76, 0.09);
+}
+.cdk-card.danger::before { background: var(--pink); }
+.cdk-card.success::before { background: var(--green); }
+.cdk-card.danger { opacity: 0.86; }
+
+/* left: ticket stub + code/meta + status, grows to push controls right */
+.cdk-id {
+  flex: 1 1 380px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+}
+.cdk-stub {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 13px;
+  color: var(--green);
+  background: var(--green-soft);
+  border: 1px solid var(--green-line);
+}
+.cdk-card.danger .cdk-stub {
+  color: var(--pink);
+  background: var(--pink-soft);
+  border-color: var(--pink-line);
+}
+.cdk-stub .ui-icon { width: 21px; height: 21px; }
+.cdk-text { min-width: 0; display: grid; gap: 3px; }
+.cdk-text .muted {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cdk-code {
+  display: inline-flex;
+  align-items: center;
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 15px;
+  font-weight: 850;
+  letter-spacing: 1.3px;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+.cdk-id .status-pill { flex: 0 0 auto; }
+
+/* right: editable fields + save, then copy/delete actions — single line */
+.cdk-ops {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px 16px;
+  flex-wrap: wrap;
+}
+.cdk-edit {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.cdk-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.cdk-field span {
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-weight: 800;
+}
+.cdk-field input {
+  width: 58px;
+  min-height: 40px;
+  padding: 7px 8px;
+  border-radius: 11px;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+}
+.cdk-ops .mini-actions { flex: 0 0 auto; }
+
+@media (max-width: 1180px) {
+  .cdk-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 1024px) {
+  .cdk-id { flex-basis: 100%; }
+}
+@media (max-width: 860px) {
+  .cdk-form { grid-template-columns: 1fr; }
+  .cdk-ops { flex: 1 1 100%; }
+}
+@media (max-width: 640px) {
+  .cdk-ops .mini-actions { justify-content: flex-start; }
+  .cdk-ops .mini-actions button { flex: 0 0 auto; }
+}
+@media (max-width: 520px) {
+  .cdk-edit { flex: 1 1 100%; gap: 10px 14px; }
+  .cdk-field { flex: 1 1 auto; }
+  .cdk-field input { flex: 1; width: auto; min-width: 0; }
+}
 
 /* --- Change access password --- */
 .password-panel { margin-top: 4px; }

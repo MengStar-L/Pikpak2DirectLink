@@ -18,8 +18,10 @@ type Config struct {
 	AccountsFile      string
 	AccountSessionDir string
 	AuthFile          string
+	DBFile            string
 	RequestTimeout    time.Duration
 	ResolveTimeout    time.Duration
+	QueueTimeout      time.Duration
 	PollInterval      time.Duration
 	UpdateRepo        string
 	UpdateCheckPeriod time.Duration
@@ -37,8 +39,10 @@ func LoadConfig() Config {
 		AccountsFile:      envOrDefault("PIKPAK_ACCOUNTS_FILE", "data/pikpak-accounts.json"),
 		AccountSessionDir: envOrDefault("PIKPAK_ACCOUNT_SESSION_DIR", "data/accounts"),
 		AuthFile:          envOrDefault("ACCESS_AUTH_FILE", "data/auth.json"),
+		DBFile:            envOrDefault("DB_FILE", "data/pikpak.db"),
 		RequestTimeout:    durationOrDefault("PIKPAK_REQUEST_TIMEOUT", 20*time.Second),
 		ResolveTimeout:    durationOrDefault("RESOLVE_TIMEOUT", 12*time.Minute),
+		QueueTimeout:      durationOrDefault("QUEUE_TIMEOUT", 45*time.Second),
 		PollInterval:      durationOrDefault("POLL_INTERVAL", 5*time.Second),
 		UpdateRepo:        strings.TrimSpace(os.Getenv("UPDATE_REPO")),
 		UpdateCheckPeriod: durationOrDefault("UPDATE_CHECK_INTERVAL", 6*time.Hour),
