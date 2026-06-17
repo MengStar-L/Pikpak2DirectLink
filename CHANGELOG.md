@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-06-17 - Multi-Link Parallel Resolution
+
+**Resolve many links in one submission**
+- The resolve box now accepts multiple links separated by newlines; each line is detected independently (magnet **or** PikPak share link) and resolved on its own
+- Each link becomes its own job enqueued in the global resolve queue, so the lines fan out in parallel under the admin's concurrency limit (`maxResolveConcurrency`)
+- A multi-link submission creates a parent batch job that is not itself queued; it merges its children's results once they finish. Single-link submissions keep the existing flow (multi-file links still pause for a manual file selection)
+- Each link's files auto-resolve to download links (no per-file selection); a share with multiple roots restores them all
+- Partial failures are tolerated: only successful links are returned, and the UI shows **解析成功 x/x 条**
+- Results render as a folder tree where **each link is a sibling top-level folder**, on both the admin page and the CDK user portal
+- Proxy links for batch results point at the parent job and carry the resolving account so they keep working across accounts and after a child job is evicted
+- Available on both the admin resolve page and the CDK user portal
+
 ## 2026-06-17 - Monthly Traffic Limits (accounts) + Traffic-based CDKs
 
 **Per-account monthly downstream traffic budget**

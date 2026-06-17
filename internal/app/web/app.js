@@ -27,6 +27,8 @@ const selectionHint = document.getElementById('selectionHint');
 const selectionList = document.getElementById('selectionList');
 const resultPanel = document.getElementById('resultPanel');
 const resultMode = document.getElementById('resultMode');
+const resultSingle = document.getElementById('resultSingle');
+const resultTree = document.getElementById('resultTree');
 const resultName = document.getElementById('resultName');
 const resultPath = document.getElementById('resultPath');
 const resultSize = document.getElementById('resultSize');
@@ -701,7 +703,13 @@ function renderJob(job) {
     selectionList.innerHTML = '';
   }
 
-  if (job.result) {
+  // A batch job (or any job carrying several results) renders a folder tree where
+  // each link is a sibling top-level folder; a single-result job keeps the
+  // detailed single-link panel.
+  const results = job.results && job.results.length ? job.results : null;
+  if (results) {
+    renderResultTree(job, results);
+  } else if (job.result) {
     renderResult(job);
   } else {
     resultPanel.classList.add('hidden');
@@ -812,6 +820,9 @@ async function chooseItem(jobId, itemId, button) {
 function renderResult(job) {
   const result = job.result;
   resultPanel.classList.remove('hidden');
+  resultSingle.classList.remove('hidden');
+  resultTree.classList.add('hidden');
+  resultTree.innerHTML = '';
 
   resultMode.textContent = job.mode === 'proxy' ? '代理优先' : '直链优先';
   resultMode.className = `status-pill ${job.mode === 'proxy' ? 'warn' : 'success'}`;
@@ -830,6 +841,171 @@ function renderResult(job) {
   requestAnimationFrame(() => {
     resultPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   });
+}
+
+// renderResultTree shows a multi-result job as a read-only folder tree. Each
+// link's files live under their own sibling top-level folder (the server already
+// prefixes result paths with "链接N ..."), so the tree groups them naturally.
+function renderResultTree(job, results) {
+  resultPanel.classList.remove('hidden');
+  resultSingle.classList.add('hidden');
+  resultTree.classList.remove('hidden');
+  resultTree.innerHTML = '';
+
+  const batch = job.batch;
+  if (batch) {
+    resultMode.textContent = `解析成功 ${batch.succeeded || 0}/${batch.total || 0} 条`;
+    resultMode.className = `status-pill ${(batch.succeeded || 0) > 0 ? 'success' : 'danger'}`;
+  } else {
+    resultMode.textContent = `${results.length} 个文件`;
+    resultMode.className = 'status-pill success';
+  }
+
+  const root = buildResultTree(results);
+  for (const node of root.children) {
+    resultTree.appendChild(renderResultNode(node));
+  }
+
+  requestAnimationFrame(() => {
+    resultPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  });
+}
+
+// buildResultTree turns flat results (with file.path like "链接1 名/夹/文件.mkv")
+// into a nested folder structure. Leaves carry the JobResult for link rendering.
+function buildResultTree(results) {
+  const root = { name: '', children: [], childMap: new Map(), isFolder: true };
+  for (const result of results) {
+    const file = result.file || {};
+    const parts = (file.path || file.name || '未命名').split('/').filter(Boolean);
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const seg = parts[i];
+      let next = node.childMap.get(seg);
+      if (!next) {
+        next = { name: seg, children: [], childMap: new Map(), isFolder: true };
+        node.childMap.set(seg, next);
+        node.children.push(next);
+      }
+      node = next;
+    }
+    const leafName = parts.length ? parts[parts.length - 1] : (file.name || '未命名');
+    const leaf = { name: leafName, result, children: [], childMap: new Map(), isFolder: false };
+    node.childMap.set(leafName + ':' + (result.proxy_token || result.direct_url || ''), leaf);
+    node.children.push(leaf);
+  }
+  return root;
+}
+
+function renderResultNode(node) {
+  if (node.isFolder) {
+    const wrap = document.createElement('div');
+    wrap.className = 'tree-folder';
+
+    const row = document.createElement('div');
+    row.className = 'tree-row tree-folder-row';
+
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'tree-toggle';
+    toggle.innerHTML = '<svg class="ui-icon"><use href="#icon-chevron"></use></svg>';
+
+    const childrenWrap = document.createElement('div');
+    childrenWrap.className = 'tree-children';
+    const childrenInner = document.createElement('div');
+    childrenInner.className = 'tree-children-inner';
+    childrenWrap.appendChild(childrenInner);
+
+    let open = true;
+    toggle.addEventListener('click', () => {
+      open = !open;
+      childrenWrap.classList.toggle('collapsed', !open);
+      toggle.classList.toggle('collapsed', !open);
+    });
+
+    const label = document.createElement('span');
+    label.className = 'tree-label';
+    label.innerHTML = '<svg class="ui-icon tree-folder-icon"><use href="#icon-folder"></use></svg>';
+    const folderName = document.createElement('span');
+    folderName.textContent = node.name;
+    label.appendChild(folderName);
+
+    row.appendChild(toggle);
+    row.appendChild(label);
+    wrap.appendChild(row);
+
+    for (const child of node.children) {
+      childrenInner.appendChild(renderResultNode(child));
+    }
+    wrap.appendChild(childrenWrap);
+    return wrap;
+  }
+
+  // Leaf: a resolved file with its link rows.
+  const result = node.result;
+  const card = document.createElement('div');
+  card.className = 'tree-result';
+
+  const head = document.createElement('div');
+  head.className = 'tree-row tree-file-row';
+  head.innerHTML = '<svg class="ui-icon tree-file-icon"><use href="#icon-file"></use></svg>';
+  const name = document.createElement('span');
+  name.className = 'tree-file-name';
+  name.textContent = node.name;
+  head.appendChild(name);
+  const meta = document.createElement('span');
+  meta.className = 'tree-file-meta';
+  meta.textContent = formatBytes(result.file?.size);
+  head.appendChild(meta);
+  card.appendChild(head);
+
+  if (result.direct_url) {
+    card.appendChild(buildLinkRow('直链', 'direct', result.direct_url));
+  }
+  if (result.proxy_url) {
+    card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url));
+  }
+  return card;
+}
+
+// buildLinkRow is the compact open/copy block used for each link in the result
+// tree.
+function buildLinkRow(tagText, tagClass, url) {
+  const block = document.createElement('div');
+  block.className = 'link-block';
+
+  const row = document.createElement('div');
+  row.className = 'link-row';
+  const tag = document.createElement('span');
+  tag.className = `link-tag ${tagClass}`;
+  tag.textContent = tagText;
+  row.appendChild(tag);
+
+  const actions = document.createElement('div');
+  actions.className = 'link-actions';
+  const open = document.createElement('a');
+  open.className = 'secondary-link compact';
+  open.href = url;
+  open.target = '_blank';
+  open.rel = 'noreferrer noopener';
+  open.innerHTML = '<svg class="ui-icon"><use href="#icon-open"></use></svg>打开';
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'secondary compact';
+  copy.innerHTML = '<svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span>';
+  copy.addEventListener('click', () => copyText(url, copy));
+  actions.appendChild(open);
+  actions.appendChild(copy);
+  row.appendChild(actions);
+  block.appendChild(row);
+
+  const input = document.createElement('input');
+  input.className = 'link-input';
+  input.type = 'text';
+  input.readOnly = true;
+  input.value = url;
+  block.appendChild(input);
+  return block;
 }
 
 function startLogPolling() {
@@ -1391,6 +1567,7 @@ function clearJobUI() {
   selectionPanel.classList.add('hidden');
   selectionList.innerHTML = '';
   resultPanel.classList.add('hidden');
+  if (resultTree) resultTree.innerHTML = '';
   renderAttempts([]);
   jobBadge.textContent = '空闲';
   jobBadge.className = 'status-pill neutral';
@@ -1585,19 +1762,42 @@ async function onLogout() {
 }
 
 function detectLinkType() {
-  const input = resourceInput.value.trim().toLowerCase();
   if (!linkTypeIndicator) return;
+  const raw = resourceInput.value;
+  const lines = raw.split('\n').map((line) => line.trim()).filter(Boolean);
 
-  if (input === '') {
+  if (lines.length === 0) {
     linkTypeIndicator.textContent = '';
     linkTypeIndicator.className = 'link-type-indicator';
     return;
   }
 
-  if (input.startsWith('magnet:?')) {
+  const classify = (line) => {
+    const lower = line.toLowerCase();
+    if (lower.startsWith('magnet:?')) return 'magnet';
+    if (lower.includes('pikpak.com/s/') || lower.includes('mypikpak.com/s/')) return 'share';
+    return 'invalid';
+  };
+
+  // Multi-line submission: report the count and flag any unrecognized line.
+  if (lines.length > 1) {
+    const kinds = lines.map(classify);
+    const bad = kinds.filter((k) => k === 'invalid').length;
+    if (bad > 0) {
+      linkTypeIndicator.textContent = `${lines.length} 条链接 · ${bad} 条无法识别`;
+      linkTypeIndicator.className = 'link-type-indicator invalid';
+    } else {
+      linkTypeIndicator.textContent = `${lines.length} 条链接`;
+      linkTypeIndicator.className = 'link-type-indicator valid';
+    }
+    return;
+  }
+
+  const kind = classify(lines[0]);
+  if (kind === 'magnet') {
     linkTypeIndicator.textContent = '磁力链接';
     linkTypeIndicator.className = 'link-type-indicator valid';
-  } else if (input.includes('pikpak.com/s/') || input.includes('mypikpak.com/s/')) {
+  } else if (kind === 'share') {
     linkTypeIndicator.textContent = 'PikPak 分享链接';
     linkTypeIndicator.className = 'link-type-indicator valid';
   } else {

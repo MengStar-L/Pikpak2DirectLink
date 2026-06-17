@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -417,6 +418,29 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Traffic is charged at resolve success (once the resource size is known), so
+	// here we only gate on the CDK still having traffic left and not being
+	// expired. A small overage is possible if parallel jobs race, which is fine.
+	if _, err := s.cdk.hasTraffic(c.Code, time.Now()); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	// A multi-line submission fans out into one child job per link, parallelized
+	// through the resolve queue under the same concurrency limit.
+	if lines := splitResourceLines(req.Input); len(lines) > 1 {
+		parent, status, msg := s.createBatchJob(lines, req.Mode, c.Code, priorityUser, s.baseURL(r))
+		if status != 0 {
+			writeError(w, status, msg)
+			return
+		}
+		s.logJob(LogInfo, parent.ID, "CDK 用户批量解析任务已创建", "CDK："+maskCDK(c.Code), "链接数："+itoa(len(lines)))
+		view := toUserJobView(parent)
+		view.QueueAhead = s.resolver.position(parent.ID)
+		writeJSON(w, http.StatusAccepted, view)
+		return
+	}
+
 	kind, err := detectResourceKind(req.Input)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -431,14 +455,6 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		share = &ShareState{ShareID: shareID, TailID: tailID}
-	}
-
-	// Traffic is charged at resolve success (once the resource size is known),
-	// so here we only gate on the CDK still having traffic left and not being
-	// expired. A small overage is possible if parallel jobs race, which is fine.
-	if _, err := s.cdk.hasTraffic(c.Code, time.Now()); err != nil {
-		writeError(w, http.StatusForbidden, err.Error())
-		return
 	}
 
 	job := &Job{
@@ -537,6 +553,7 @@ type userJobView struct {
 	Items      []DownloadItem `json:"items,omitempty"`
 	Result     *JobResult     `json:"result,omitempty"`
 	Results    []JobResult    `json:"results,omitempty"`
+	Batch      *BatchProgress `json:"batch,omitempty"`
 	QueueAhead int            `json:"queue_ahead"`
 	CreatedAt  time.Time      `json:"created_at"`
 	UpdatedAt  time.Time      `json:"updated_at"`
@@ -565,6 +582,7 @@ func toUserJobView(job *Job) userJobView {
 		Items:     job.Items,
 		Result:    job.Result,
 		Results:   job.Results,
+		Batch:     job.Batch,
 		CreatedAt: job.CreatedAt,
 		UpdatedAt: job.UpdatedAt,
 	}
@@ -584,6 +602,10 @@ func safeUserMessage(job *Job) string {
 		// fallback before the first poll.
 		return "排队中"
 	case JobRunning:
+		// A batch parent reports its rollup; the count carries no platform detail.
+		if job.Kind == ResourceBatch && job.Batch != nil {
+			return fmt.Sprintf("解析中：%d/%d 条完成", job.Batch.Succeeded+job.Batch.Failed, job.Batch.Total)
+		}
 		return "正在解析，请稍候…"
 	case JobSelectionRequired:
 		if job.Stage == StageSourceSelection {
@@ -591,6 +613,9 @@ func safeUserMessage(job *Job) string {
 		}
 		return "请选择要生成链接的文件"
 	case JobCompleted:
+		if job.Kind == ResourceBatch && job.Batch != nil {
+			return fmt.Sprintf("解析成功 %d/%d 条", job.Batch.Succeeded, job.Batch.Total)
+		}
 		return "解析完成"
 	default:
 		// Failed jobs carry their text in Error; anything else gets no message.

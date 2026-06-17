@@ -106,6 +106,9 @@
       <path d="M4 8.5A1.5 1.5 0 0 1 5.5 7h13A1.5 1.5 0 0 1 20 8.5v2a2 2 0 0 0 0 4v2A1.5 1.5 0 0 1 18.5 17h-13A1.5 1.5 0 0 1 4 15.5v-2a2 2 0 0 0 0-4Z"/>
       <path d="M13 7v10"/>
     </symbol>
+    <symbol id="icon-chevron" viewBox="0 0 24 24">
+      <path d="m8 10 4 4 4-4"/>
+    </symbol>
   </svg>
 
   <div class="app-shell">
@@ -265,54 +268,58 @@
             <span id="resultMode" class="status-pill neutral"></span>
           </div>
 
-          <dl class="result-grid">
-            <div>
-              <dt>文件名</dt>
-              <dd id="resultName">-</dd>
-            </div>
-            <div>
-              <dt>路径</dt>
-              <dd id="resultPath">-</dd>
-            </div>
-            <div>
-              <dt>大小</dt>
-              <dd id="resultSize">-</dd>
-            </div>
-            <div>
-              <dt>过期时间</dt>
-              <dd id="resultExpire">-</dd>
-            </div>
-          </dl>
-
-          <div class="link-block">
-            <div class="link-row">
-              <span class="link-tag direct">直链</span>
-              <div class="link-actions">
-                <a id="directOpen" class="secondary-link compact" href="#" target="_blank" rel="noreferrer noopener">
-                  <svg class="ui-icon"><use href="#icon-open"></use></svg>打开
-                </a>
-                <button id="directCopy" type="button" class="secondary compact">
-                  <svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span>
-                </button>
+          <div id="resultSingle">
+            <dl class="result-grid">
+              <div>
+                <dt>文件名</dt>
+                <dd id="resultName">-</dd>
               </div>
+              <div>
+                <dt>路径</dt>
+                <dd id="resultPath">-</dd>
+              </div>
+              <div>
+                <dt>大小</dt>
+                <dd id="resultSize">-</dd>
+              </div>
+              <div>
+                <dt>过期时间</dt>
+                <dd id="resultExpire">-</dd>
+              </div>
+            </dl>
+
+            <div class="link-block">
+              <div class="link-row">
+                <span class="link-tag direct">直链</span>
+                <div class="link-actions">
+                  <a id="directOpen" class="secondary-link compact" href="#" target="_blank" rel="noreferrer noopener">
+                    <svg class="ui-icon"><use href="#icon-open"></use></svg>打开
+                  </a>
+                  <button id="directCopy" type="button" class="secondary compact">
+                    <svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span>
+                  </button>
+                </div>
+              </div>
+              <input id="directValue" class="link-input" type="text" readonly>
             </div>
-            <input id="directValue" class="link-input" type="text" readonly>
+
+            <div class="link-block">
+              <div class="link-row">
+                <span class="link-tag proxy">代理链接</span>
+                <div class="link-actions">
+                  <a id="proxyOpen" class="secondary-link compact" href="#" target="_blank" rel="noreferrer noopener">
+                    <svg class="ui-icon"><use href="#icon-open"></use></svg>打开
+                  </a>
+                  <button id="proxyCopy" type="button" class="secondary compact">
+                    <svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span>
+                  </button>
+                </div>
+              </div>
+              <input id="proxyValue" class="link-input" type="text" readonly>
+            </div>
           </div>
 
-          <div class="link-block">
-            <div class="link-row">
-              <span class="link-tag proxy">代理链接</span>
-              <div class="link-actions">
-                <a id="proxyOpen" class="secondary-link compact" href="#" target="_blank" rel="noreferrer noopener">
-                  <svg class="ui-icon"><use href="#icon-open"></use></svg>打开
-                </a>
-                <button id="proxyCopy" type="button" class="secondary compact">
-                  <svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span>
-                </button>
-              </div>
-            </div>
-            <input id="proxyValue" class="link-input" type="text" readonly>
-          </div>
+          <div id="resultTree" class="selection-tree hidden"></div>
         </section>
       </section>
 

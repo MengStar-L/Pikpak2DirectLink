@@ -544,35 +544,62 @@ async function chooseSingle(jobId, itemId, button) {
 }
 
 // renderResults shows one card per resolved file, each with its direct and/or
-// proxy link. The mode the user picked decides which link is emphasized, but
-// both are shown when available.
+// proxy link. For a batch job the cards are grouped by their top-level folder so
+// each link's files sit under their own sibling section.
 function renderResults(job, results) {
   resultPanel.classList.remove('hidden');
-  resultCount.textContent = `${results.length} 个文件`;
+  const batch = job.batch;
+  resultCount.textContent = batch
+    ? `${batch.succeeded || 0}/${batch.total || 0} 条 · ${results.length} 个文件`
+    : `${results.length} 个文件`;
   resultList.innerHTML = '';
 
+  // Group by the first path segment. A batch link's results are pre-prefixed with
+  // "链接N ..." by the server, so each group is one link; single jobs collapse to
+  // one unlabeled group.
+  const groups = new Map();
   for (const result of results) {
-    const card = document.createElement('article');
-    card.className = 'result-card';
+    const path = result.file?.path || result.file?.name || '';
+    const parts = path.split('/').filter(Boolean);
+    const groupName = batch && parts.length > 1 ? parts[0] : '';
+    if (!groups.has(groupName)) groups.set(groupName, []);
+    groups.get(groupName).push(result);
+  }
 
-    const head = document.createElement('div');
-    head.className = 'result-card-head';
-    const name = document.createElement('strong');
-    name.textContent = result.file?.name || '-';
-    head.appendChild(name);
-    const meta = document.createElement('span');
-    meta.className = 'muted';
-    meta.textContent = [result.file?.path, formatBytes(result.file?.size)].filter(Boolean).join(' · ');
-    head.appendChild(meta);
-    card.appendChild(head);
+  for (const [groupName, groupResults] of groups) {
+    if (groupName) {
+      const header = document.createElement('div');
+      header.className = 'result-group-head';
+      header.innerHTML = '<svg class="ui-icon tree-folder-icon"><use href="#icon-folder"></use></svg>';
+      const label = document.createElement('span');
+      label.textContent = `${groupName} · ${groupResults.length} 个文件`;
+      header.appendChild(label);
+      resultList.appendChild(header);
+    }
 
-    if (result.direct_url) {
-      card.appendChild(buildLinkRow('直链', 'direct', result.direct_url));
+    for (const result of groupResults) {
+      const card = document.createElement('article');
+      card.className = 'result-card';
+
+      const head = document.createElement('div');
+      head.className = 'result-card-head';
+      const name = document.createElement('strong');
+      name.textContent = result.file?.name || '-';
+      head.appendChild(name);
+      const meta = document.createElement('span');
+      meta.className = 'muted';
+      meta.textContent = [result.file?.path, formatBytes(result.file?.size)].filter(Boolean).join(' · ');
+      head.appendChild(meta);
+      card.appendChild(head);
+
+      if (result.direct_url) {
+        card.appendChild(buildLinkRow('直链', 'direct', result.direct_url));
+      }
+      if (result.proxy_url) {
+        card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url));
+      }
+      resultList.appendChild(card);
     }
-    if (result.proxy_url) {
-      card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url));
-    }
-    resultList.appendChild(card);
   }
 
   requestAnimationFrame(() => resultPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));

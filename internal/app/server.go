@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"pikpak2directlink/internal/pikpak"
@@ -38,6 +39,8 @@ type Server struct {
 	gateHTML     []byte
 	userHTML     []byte
 	mux          *http.ServeMux
+	batchMu      sync.Mutex
+	batches      map[string]*batchState
 }
 
 type configResponse struct {
@@ -142,6 +145,7 @@ func NewServer(cfg Config) (*Server, error) {
 		gateHTML:     gateHTML,
 		userHTML:     userHTML,
 		mux:          http.NewServeMux(),
+		batches:      make(map[string]*batchState),
 	}
 
 	// The updater logs into the shared console with no job context.
@@ -547,6 +551,20 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A multi-line submission fans out into one child job per link, parallelized
+	// through the resolve queue. A single line keeps the original single-job flow
+	// (multi-file resolution still pauses for a manual selection).
+	if lines := splitResourceLines(req.Input); len(lines) > 1 {
+		parent, status, msg := s.createBatchJob(lines, req.Mode, "", priorityAdmin, s.baseURL(r))
+		if status != 0 {
+			writeError(w, status, msg)
+			return
+		}
+		parent.QueueAhead = s.resolver.position(parent.ID)
+		writeJSON(w, http.StatusAccepted, parent)
+		return
+	}
+
 	kind, err := detectResourceKind(req.Input)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -649,11 +667,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	sourceURL := strings.TrimSpace(result.DirectURL)
 	if sourceURL == "" {
-		if job.AccountID == "" {
+		// A multi-link parent merges results from several children, each possibly
+		// resolved on a different account, so prefer the result's own account and
+		// fall back to the job's for single-result (admin) jobs.
+		accountID := result.AccountID
+		if accountID == "" {
+			accountID = job.AccountID
+		}
+		if accountID == "" {
 			writeError(w, http.StatusConflict, "job account is missing")
 			return
 		}
-		account, ok := s.accounts.Get(job.AccountID)
+		account, ok := s.accounts.Get(accountID)
 		if !ok {
 			writeError(w, http.StatusConflict, "job account is no longer available")
 			return
@@ -856,16 +881,29 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 		selectedID = job.Share.TailID
 	}
 
+	restoreIDs := []string{}
 	if selectedID == "" {
 		items := shareItems(shareInfo.Files)
 		if len(items) == 0 {
 			return errors.New("share link did not return any file or folder")
 		}
 		if len(items) > 1 {
-			s.logJob(LogWarn, jobID, fmt.Sprintf("分享链接包含 %d 个项目，需要选择目标", len(items)), sampleItemDetail(items))
-			return s.requestSelection(jobID, StageSourceSelection, "pick a file or folder from the share first", items, account.ID)
+			// A batch child auto-restores every root item instead of pausing for a
+			// source selection, so it can resolve the whole share unattended.
+			if job.ResolveAll {
+				for _, item := range items {
+					restoreIDs = append(restoreIDs, item.ID)
+				}
+			} else {
+				s.logJob(LogWarn, jobID, fmt.Sprintf("分享链接包含 %d 个项目，需要选择目标", len(items)), sampleItemDetail(items))
+				return s.requestSelection(jobID, StageSourceSelection, "pick a file or folder from the share first", items, account.ID)
+			}
+		} else {
+			selectedID = items[0].ID
 		}
-		selectedID = items[0].ID
+	}
+	if len(restoreIDs) == 0 {
+		restoreIDs = []string{selectedID}
 	}
 
 	folderID, err := s.ensureJobFolder(ctx, jobID, account)
@@ -875,7 +913,7 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 
 	s.updateJobState(jobID, JobRunning, StageTransfer, "restoring the selected share item into PikPak", "")
 	s.logJob(LogInfo, jobID, "分享文件正在转存到 PikPak 临时目录 ...")
-	if err := account.Client.RestoreShare(ctx, job.Share.ShareID, shareInfo.PassCodeToken, []string{selectedID}); err != nil {
+	if err := account.Client.RestoreShare(ctx, job.Share.ShareID, shareInfo.PassCodeToken, restoreIDs); err != nil {
 		return err
 	}
 
@@ -891,6 +929,11 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 func (s *Server) finishWithItems(ctx context.Context, jobID string, account AccountRuntime, items []DownloadItem) error {
 	if len(items) == 0 {
 		return errors.New("no downloadable file was produced")
+	}
+	// A batch child must never pause for a selection — resolve every file it
+	// found and let the batch coordinator merge the results.
+	if mustJob(s.jobs.get(jobID)).ResolveAll {
+		return s.completeJobBatch(ctx, jobID, account, items)
 	}
 	if len(items) > 1 {
 		s.logJob(LogWarn, jobID, fmt.Sprintf("检测到 %d 个可用文件，需要选择目标文件", len(items)), sampleItemDetail(items))
@@ -1032,6 +1075,7 @@ func (s *Server) resolveFileLink(ctx context.Context, jobID string, account Acco
 		DirectURL:  directURL,
 		ProxyURL:   strings.TrimRight(mustJob(s.jobs.get(jobID)).BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken,
 		ProxyToken: proxyToken,
+		AccountID:  account.ID,
 	}
 	if expiresAt := file.ExpireAt(); !expiresAt.IsZero() {
 		result.ExpiresAt = expiresAt.Format(time.RFC3339)
@@ -1044,6 +1088,20 @@ func (s *Server) resolveFileLink(ctx context.Context, jobID string, account Acco
 // It backs the CDK-user multi-select flow. A single GetFile failure aborts the
 // whole batch (the job fails) rather than delivering a partial set.
 func (s *Server) completeJobBatch(ctx context.Context, jobID string, account AccountRuntime, items []DownloadItem) error {
+	// Gate the summed size against the CDK's remaining traffic before doing any
+	// expensive link resolution. The user-select path is already pre-gated in
+	// applyItemsSelection; this also covers the batch-child path, which resolves
+	// every file unattended and would otherwise overdraw.
+	if cdkCode := mustJob(s.jobs.get(jobID)).CDKCode; cdkCode != "" {
+		var sum int64
+		for _, item := range items {
+			sum += parseBytes(item.Size)
+		}
+		if c, ok, err := s.cdk.get(cdkCode); err == nil && ok && sum > c.RemainingBytes {
+			return errCDKOverdraw{size: sum, remaining: c.RemainingBytes}
+		}
+	}
+
 	results := make([]JobResult, 0, len(items))
 	var totalSize int64
 	for _, item := range items {

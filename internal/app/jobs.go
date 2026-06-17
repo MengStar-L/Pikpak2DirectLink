@@ -16,6 +16,10 @@ type ResourceKind string
 const (
 	ResourceMagnet ResourceKind = "magnet"
 	ResourceShare  ResourceKind = "share"
+	// ResourceBatch is the parent job created for a multi-line submission. It owns
+	// no resource of its own; it fans out one child job per line and merges their
+	// results.
+	ResourceBatch ResourceKind = "batch"
 )
 
 type JobStatus string
@@ -53,6 +57,20 @@ type JobResult struct {
 	ProxyURL   string       `json:"proxy_url"`
 	ProxyToken string       `json:"proxy_token"`
 	ExpiresAt  string       `json:"expires_at,omitempty"`
+	// AccountID records which PikPak account produced this link. The single-file
+	// and CDK-batch paths leave it empty (the job's own AccountID applies), but a
+	// multi-link parent merges results from several children that may each have
+	// used a different account, so the proxy handler needs it to re-fetch a fresh
+	// direct link after expiry.
+	AccountID string `json:"-"`
+}
+
+// BatchProgress is the parent-job rollup for a multi-line submission, surfaced to
+// the front-end so it can show "解析成功 x/x 条".
+type BatchProgress struct {
+	Total     int `json:"total"`
+	Succeeded int `json:"succeeded"`
+	Failed    int `json:"failed"`
 }
 
 type AccountAttempt struct {
@@ -89,8 +107,15 @@ type Job struct {
 	Result          *JobResult       `json:"result,omitempty"`
 	Results         []JobResult      `json:"results,omitempty"`
 	QueueAhead      int              `json:"queue_ahead"`
-	CreatedAt       time.Time        `json:"created_at"`
-	UpdatedAt       time.Time        `json:"updated_at"`
+	// ResolveAll marks a child job that must auto-resolve every file it finds
+	// (never pause at selection_required). Set on the children a batch fans out.
+	ResolveAll bool `json:"-"`
+	// ParentID links a child job back to its batch parent.
+	ParentID string `json:"-"`
+	// Batch is the rollup carried by a parent (kind == batch) job.
+	Batch     *BatchProgress `json:"batch,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
 }
 
 // resultForToken returns the resolved file whose proxy token matches, searching
@@ -193,6 +218,10 @@ func cloneJob(job *Job) *Job {
 	if len(job.Results) > 0 {
 		copyJob.Results = append([]JobResult(nil), job.Results...)
 	}
+	if job.Batch != nil {
+		batchCopy := *job.Batch
+		copyJob.Batch = &batchCopy
+	}
 	return &copyJob
 }
 
@@ -219,6 +248,25 @@ func detectResourceKind(input string) (ResourceKind, error) {
 func looksLikeShareLink(input string) bool {
 	lower := strings.ToLower(input)
 	return strings.Contains(lower, "pikpak.com/s/") || strings.Contains(lower, "mypikpak.com/s/")
+}
+
+// splitResourceLines breaks a submission into individual links, one per line. It
+// trims surrounding whitespace, drops blank lines, and removes exact duplicates
+// while preserving first-seen order. A single-link submission therefore yields a
+// one-element slice, so callers can branch on len() to keep the existing
+// single-job behavior intact.
+func splitResourceLines(input string) []string {
+	seen := make(map[string]bool)
+	var lines []string
+	for _, raw := range strings.Split(input, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || seen[line] {
+			continue
+		}
+		seen[line] = true
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 var shareLinkPattern = regexp.MustCompile(`(?i)/s/([^/?#]+)(?:/(.*))?$`)

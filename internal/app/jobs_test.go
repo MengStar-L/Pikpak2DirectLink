@@ -34,6 +34,39 @@ func TestDetectResourceKind(t *testing.T) {
 	}
 }
 
+func TestSplitResourceLinesPerLineDetect(t *testing.T) {
+	t.Parallel()
+
+	input := "magnet:?xt=urn:btih:abc\nhttps://mypikpak.com/s/VO8BcRb-0fibD0Ncymp8nxSMo1\n\n  magnet:?xt=urn:btih:def  "
+	lines := splitResourceLines(input)
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 lines, got %d: %v", len(lines), lines)
+	}
+
+	wantKinds := []ResourceKind{ResourceMagnet, ResourceShare, ResourceMagnet}
+	for i, line := range lines {
+		kind, err := detectResourceKind(line)
+		if err != nil {
+			t.Fatalf("line %d (%q): unexpected error %v", i, line, err)
+		}
+		if kind != wantKinds[i] {
+			t.Fatalf("line %d (%q): kind %q, want %q", i, line, kind, wantKinds[i])
+		}
+	}
+}
+
+func TestSplitResourceLinesRejectsBadLine(t *testing.T) {
+	t.Parallel()
+
+	lines := splitResourceLines("magnet:?xt=urn:btih:abc\nhttps://example.com/file.zip")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 lines, got %d", len(lines))
+	}
+	if _, err := detectResourceKind(lines[1]); err == nil {
+		t.Fatal("expected error for unrecognized line")
+	}
+}
+
 func TestParseShareLink(t *testing.T) {
 	t.Parallel()
 
