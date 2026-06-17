@@ -8,44 +8,48 @@ import (
 )
 
 type Config struct {
-	Addr              string
-	PublicBaseURL     string
-	AccessPassword    string
-	Username          string
-	Password          string
-	RootFolderName    string
-	SessionFile       string
-	AccountsFile      string
-	AccountSessionDir string
-	AuthFile          string
-	DBFile            string
-	RequestTimeout    time.Duration
-	ResolveTimeout    time.Duration
-	QueueTimeout      time.Duration
-	PollInterval      time.Duration
-	UpdateRepo        string
-	UpdateCheckPeriod time.Duration
+	Addr               string
+	PublicBaseURL      string
+	AccessPassword     string
+	Username           string
+	Password           string
+	RootFolderName     string
+	SessionFile        string
+	AccountsFile       string
+	AccountSessionDir  string
+	AuthFile           string
+	DBFile             string
+	RequestTimeout     time.Duration
+	ResolveTimeout     time.Duration
+	QueueTimeout       time.Duration
+	ParallelTimeout    time.Duration
+	ResolveConcurrency int
+	PollInterval       time.Duration
+	UpdateRepo         string
+	UpdateCheckPeriod  time.Duration
 }
 
 func LoadConfig() Config {
 	return Config{
-		Addr:              envOrDefault("ADDR", ":51873"),
-		PublicBaseURL:     strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
-		AccessPassword:    os.Getenv("ACCESS_PASSWORD"),
-		Username:          strings.TrimSpace(os.Getenv("PIKPAK_USERNAME")),
-		Password:          os.Getenv("PIKPAK_PASSWORD"),
-		RootFolderName:    envOrDefault("PIKPAK_ROOT_FOLDER", "Pikpak2DirectLink"),
-		SessionFile:       envOrDefault("PIKPAK_SESSION_FILE", "data/pikpak-session.json"),
-		AccountsFile:      envOrDefault("PIKPAK_ACCOUNTS_FILE", "data/pikpak-accounts.json"),
-		AccountSessionDir: envOrDefault("PIKPAK_ACCOUNT_SESSION_DIR", "data/accounts"),
-		AuthFile:          envOrDefault("ACCESS_AUTH_FILE", "data/auth.json"),
-		DBFile:            envOrDefault("DB_FILE", "data/pikpak.db"),
-		RequestTimeout:    durationOrDefault("PIKPAK_REQUEST_TIMEOUT", 20*time.Second),
-		ResolveTimeout:    durationOrDefault("RESOLVE_TIMEOUT", 12*time.Minute),
-		QueueTimeout:      durationOrDefault("QUEUE_TIMEOUT", 45*time.Second),
-		PollInterval:      durationOrDefault("POLL_INTERVAL", 5*time.Second),
-		UpdateRepo:        strings.TrimSpace(os.Getenv("UPDATE_REPO")),
-		UpdateCheckPeriod: durationOrDefault("UPDATE_CHECK_INTERVAL", 6*time.Hour),
+		Addr:               envOrDefault("ADDR", ":51873"),
+		PublicBaseURL:      strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
+		AccessPassword:     os.Getenv("ACCESS_PASSWORD"),
+		Username:           strings.TrimSpace(os.Getenv("PIKPAK_USERNAME")),
+		Password:           os.Getenv("PIKPAK_PASSWORD"),
+		RootFolderName:     envOrDefault("PIKPAK_ROOT_FOLDER", "Pikpak2DirectLink"),
+		SessionFile:        envOrDefault("PIKPAK_SESSION_FILE", "data/pikpak-session.json"),
+		AccountsFile:       envOrDefault("PIKPAK_ACCOUNTS_FILE", "data/pikpak-accounts.json"),
+		AccountSessionDir:  envOrDefault("PIKPAK_ACCOUNT_SESSION_DIR", "data/accounts"),
+		AuthFile:           envOrDefault("ACCESS_AUTH_FILE", "data/auth.json"),
+		DBFile:             envOrDefault("DB_FILE", "data/pikpak.db"),
+		RequestTimeout:     durationOrDefault("PIKPAK_REQUEST_TIMEOUT", 20*time.Second),
+		ResolveTimeout:     durationOrDefault("RESOLVE_TIMEOUT", 12*time.Minute),
+		QueueTimeout:       durationOrDefault("QUEUE_TIMEOUT", 45*time.Second),
+		ParallelTimeout:    durationOrDefault("PARALLEL_QUEUE_TIMEOUT", 2*time.Minute),
+		ResolveConcurrency: intOrDefault("RESOLVE_CONCURRENCY", 1),
+		PollInterval:       durationOrDefault("POLL_INTERVAL", 5*time.Second),
+		UpdateRepo:         strings.TrimSpace(os.Getenv("UPDATE_REPO")),
+		UpdateCheckPeriod:  durationOrDefault("UPDATE_CHECK_INTERVAL", 6*time.Hour),
 	}
 }
 
@@ -82,5 +86,16 @@ func durationOrDefault(key string, fallback time.Duration) time.Duration {
 		return time.Duration(seconds) * time.Second
 	}
 
+	return fallback
+}
+
+func intOrDefault(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	if parsed, err := strconv.Atoi(value); err == nil {
+		return parsed
+	}
 	return fallback
 }

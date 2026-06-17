@@ -40,6 +40,15 @@ func (s *Server) applyItemSelection(jobID, itemID string) (*Job, int, string) {
 		if selectedItem == nil {
 			return nil, http.StatusBadRequest, "selected file was not found in the current result set"
 		}
+		// For CDK users the file size is known at this point, so refuse a pick
+		// that would exceed the CDK's remaining traffic instead of silently
+		// absorbing the overage at charge time (charge only clamps at zero).
+		if job.CDKCode != "" {
+			size := parseBytes(selectedItem.Size)
+			if c, ok, err := s.cdk.get(job.CDKCode); err == nil && ok && size > c.RemainingBytes {
+				return nil, http.StatusForbidden, "所选文件大小 " + formatTrafficLabel(size) + " 超过 CDK 剩余流量（剩余 " + formatTrafficLabel(c.RemainingBytes) + "），请选择更小的文件"
+			}
+		}
 	}
 
 	_, err := s.jobs.update(jobID, func(current *Job) error {
@@ -83,16 +92,97 @@ func (s *Server) applyItemSelection(jobID, itemID string) (*Job, int, string) {
 	return updated, 0, ""
 }
 
+// applyItemsSelection is the multi-select counterpart of applyItemSelection,
+// used by the CDK-user portal. At the result-selection stage it accepts several
+// files, gates them against the CDK's remaining traffic as a SUM, and resolves
+// each into its own link. At the source-selection stage it accepts exactly one
+// item (you can only transfer one share root at a time) and behaves like the
+// single-select path.
+func (s *Server) applyItemsSelection(jobID string, itemIDs []string) (*Job, int, string) {
+	seen := make(map[string]bool, len(itemIDs))
+	ordered := make([]string, 0, len(itemIDs))
+	for _, id := range itemIDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ordered = append(ordered, id)
+	}
+	if len(ordered) == 0 {
+		return nil, http.StatusBadRequest, "请至少选择一个文件"
+	}
+
+	job, ok := s.jobs.get(jobID)
+	if !ok {
+		return nil, http.StatusNotFound, "job not found"
+	}
+	if job.Status != JobSelectionRequired {
+		return nil, http.StatusConflict, "job is not waiting for a selection"
+	}
+
+	// Source selection only ever picks one item; defer to the single-select path.
+	if job.Stage == StageSourceSelection {
+		if len(ordered) != 1 {
+			return nil, http.StatusBadRequest, "此步骤只能选择一个项目"
+		}
+		return s.applyItemSelection(jobID, ordered[0])
+	}
+	if job.Stage != StageResultSelection {
+		return nil, http.StatusConflict, "job cannot accept selections right now"
+	}
+
+	byID := make(map[string]DownloadItem, len(job.Items))
+	for _, item := range job.Items {
+		byID[item.ID] = item
+	}
+	selected := make([]DownloadItem, 0, len(ordered))
+	var totalSize int64
+	for _, id := range ordered {
+		item, ok := byID[id]
+		if !ok {
+			return nil, http.StatusBadRequest, "selected file was not found in the current result set"
+		}
+		selected = append(selected, item)
+		totalSize += parseBytes(item.Size)
+	}
+
+	// Charge is summed at completion, so gate on the summed size here to refuse a
+	// batch that would overdraw the CDK instead of silently clamping at zero.
+	if job.CDKCode != "" {
+		if c, ok, err := s.cdk.get(job.CDKCode); err == nil && ok && totalSize > c.RemainingBytes {
+			return nil, http.StatusForbidden, "所选文件合计 " + formatTrafficLabel(totalSize) + " 超过 CDK 剩余流量（剩余 " + formatTrafficLabel(c.RemainingBytes) + "），请减少选择"
+		}
+	}
+
+	_, err := s.jobs.update(jobID, func(current *Job) error {
+		current.Status = JobQueued
+		current.Message = "queued"
+		current.Error = ""
+		return nil
+	})
+	if err != nil {
+		return nil, http.StatusConflict, err.Error()
+	}
+
+	s.resolver.enqueue(jobID, priorityResume, func(ctx context.Context) {
+		s.resolveExistingFiles(ctx, jobID, selected)
+	})
+
+	updated, _ := s.jobs.get(jobID)
+	return updated, 0, ""
+}
+
 // --- admin CDK management ---
 
 type createCDKRequest struct {
 	Count     int `json:"count"`
-	Remaining int `json:"remaining"`
+	TrafficGB int `json:"traffic_gb"`
 	Days      int `json:"days"`
 }
 
 type updateCDKRequest struct {
-	Remaining int `json:"remaining"`
+	TrafficGB int `json:"traffic_gb"`
 	Days      int `json:"days"`
 }
 
@@ -124,8 +214,8 @@ func (s *Server) handleCreateCDKs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "单次最多分发 100 个")
 		return
 	}
-	if req.Remaining < 1 {
-		writeError(w, http.StatusBadRequest, "可解析次数至少为 1")
+	if req.TrafficGB < 1 {
+		writeError(w, http.StatusBadRequest, "流量额度至少为 1G")
 		return
 	}
 	if req.Days < 1 {
@@ -134,7 +224,7 @@ func (s *Server) handleCreateCDKs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	created, err := s.cdk.createBatch(req.Count, req.Remaining, req.Days, now)
+	created, err := s.cdk.createBatch(req.Count, int64(req.TrafficGB)*bytesPerGB, req.Days, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -144,7 +234,7 @@ func (s *Server) handleCreateCDKs(w http.ResponseWriter, r *http.Request) {
 	for _, c := range created {
 		views = append(views, toCDKView(c, now))
 	}
-	s.logJob(LogSuccess, "", "已分发 CDK", "数量："+itoa(len(created)), "可解析次数："+itoa(req.Remaining), "有效天数："+itoa(req.Days))
+	s.logJob(LogSuccess, "", "已分发 CDK", "数量："+itoa(len(created)), "流量额度："+itoa(req.TrafficGB)+"G", "有效天数："+itoa(req.Days))
 	writeJSON(w, http.StatusCreated, map[string]any{"cdks": views})
 }
 
@@ -155,8 +245,8 @@ func (s *Server) handleUpdateCDK(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Remaining < 0 {
-		writeError(w, http.StatusBadRequest, "可解析次数不能为负")
+	if req.TrafficGB < 0 {
+		writeError(w, http.StatusBadRequest, "流量额度不能为负")
 		return
 	}
 	if req.Days < 1 {
@@ -165,7 +255,7 @@ func (s *Server) handleUpdateCDK(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	updated, ok, err := s.cdk.update(code, req.Remaining, req.Days, now)
+	updated, ok, err := s.cdk.update(code, int64(req.TrafficGB)*bytesPerGB, req.Days, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -343,9 +433,10 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 		share = &ShareState{ShareID: shareID, TailID: tailID}
 	}
 
-	// Reserve a credit only after the request is known to be runnable; the
-	// reservation is refunded automatically if the job later fails.
-	if _, err := s.cdk.reserve(c.Code, time.Now()); err != nil {
+	// Traffic is charged at resolve success (once the resource size is known),
+	// so here we only gate on the CDK still having traffic left and not being
+	// expired. A small overage is possible if parallel jobs race, which is fine.
+	if _, err := s.cdk.hasTraffic(c.Code, time.Now()); err != nil {
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
@@ -393,6 +484,14 @@ func (s *Server) handleUserGetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
+// selectItemsRequest carries the CDK-user multi-select payload. item_ids is the
+// canonical field; item_id is accepted as a single-value fallback so older
+// callers still work.
+type selectItemsRequest struct {
+	ItemIDs []string `json:"item_ids"`
+	ItemID  string   `json:"item_id"`
+}
+
 func (s *Server) handleUserSelectItem(w http.ResponseWriter, r *http.Request) {
 	c, ok := s.currentCDK(r)
 	if !ok {
@@ -405,13 +504,17 @@ func (s *Server) handleUserSelectItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req selectItemRequest
+	var req selectItemsRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	ids := req.ItemIDs
+	if len(ids) == 0 && req.ItemID != "" {
+		ids = []string{req.ItemID}
+	}
 
-	updated, status, msg := s.applyItemSelection(job.ID, req.ItemID)
+	updated, status, msg := s.applyItemsSelection(job.ID, ids)
 	if status != 0 {
 		writeError(w, status, msg)
 		return
@@ -433,24 +536,65 @@ type userJobView struct {
 	Error      string         `json:"error,omitempty"`
 	Items      []DownloadItem `json:"items,omitempty"`
 	Result     *JobResult     `json:"result,omitempty"`
+	Results    []JobResult    `json:"results,omitempty"`
 	QueueAhead int            `json:"queue_ahead"`
 	CreatedAt  time.Time      `json:"created_at"`
 	UpdatedAt  time.Time      `json:"updated_at"`
 }
 
+// genericUserJobError is the only failure text a CDK user ever sees. Internal
+// errors are deliberately collapsed into it because the raw error can embed
+// platform secrets — most notably the PikPak account usernames, which
+// processJob concatenates into the "all accounts failed" error. CDK users must
+// never receive those.
+const genericUserJobError = "解析失败，请稍后重试；如多次失败请联系管理员。"
+
+// toUserJobView is the CDK-user-facing projection of a Job. It deliberately
+// omits admin-only details such as which PikPak account was used, and — for the
+// same reason — never forwards the raw Message or Error, both of which can carry
+// the platform account username. The progress message is reconstructed from the
+// job's status/stage so it stays informative without leaking anything.
 func toUserJobView(job *Job) userJobView {
-	return userJobView{
+	view := userJobView{
 		ID:        job.ID,
 		Kind:      job.Kind,
 		Mode:      job.Mode,
 		Status:    job.Status,
 		Stage:     job.Stage,
-		Message:   job.Message,
-		Error:     job.Error,
+		Message:   safeUserMessage(job),
 		Items:     job.Items,
 		Result:    job.Result,
+		Results:   job.Results,
 		CreatedAt: job.CreatedAt,
 		UpdatedAt: job.UpdatedAt,
+	}
+	if job.Status == JobFailed || job.Error != "" {
+		view.Error = genericUserJobError
+	}
+	return view
+}
+
+// safeUserMessage derives a CDK-user-facing progress string purely from the
+// job's status and stage. The job's internal Message is never exposed because
+// it can embed platform details (e.g. "starting with <account-username>").
+func safeUserMessage(job *Job) string {
+	switch job.Status {
+	case JobQueued:
+		// The portal overrides this with a queue-position string; this is the
+		// fallback before the first poll.
+		return "排队中"
+	case JobRunning:
+		return "正在解析，请稍候…"
+	case JobSelectionRequired:
+		if job.Stage == StageSourceSelection {
+			return "请选择要转存的项目"
+		}
+		return "请选择要生成链接的文件"
+	case JobCompleted:
+		return "解析完成"
+	default:
+		// Failed jobs carry their text in Error; anything else gets no message.
+		return ""
 	}
 }
 

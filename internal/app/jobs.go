@@ -87,9 +87,28 @@ type Job struct {
 	Items           []DownloadItem
 	AccountAttempts []AccountAttempt `json:"account_attempts,omitempty"`
 	Result          *JobResult       `json:"result,omitempty"`
+	Results         []JobResult      `json:"results,omitempty"`
 	QueueAhead      int              `json:"queue_ahead"`
 	CreatedAt       time.Time        `json:"created_at"`
 	UpdatedAt       time.Time        `json:"updated_at"`
+}
+
+// resultForToken returns the resolved file whose proxy token matches, searching
+// both the single-file Result (admin path) and the multi-file Results (CDK-user
+// batch path). Returns nil when no token matches.
+func (j *Job) resultForToken(token string) *JobResult {
+	if token == "" {
+		return nil
+	}
+	if j.Result != nil && j.Result.ProxyToken == token {
+		return j.Result
+	}
+	for i := range j.Results {
+		if j.Results[i].ProxyToken == token {
+			return &j.Results[i]
+		}
+	}
+	return nil
 }
 
 type jobStore struct {
@@ -170,6 +189,9 @@ func cloneJob(job *Job) *Job {
 		resultCopy := *job.Result
 		resultCopy.File = job.Result.File
 		copyJob.Result = &resultCopy
+	}
+	if len(job.Results) > 0 {
+		copyJob.Results = append([]JobResult(nil), job.Results...)
 	}
 	return &copyJob
 }

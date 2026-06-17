@@ -45,14 +45,99 @@ func openDatabase(path string) (*sql.DB, error) {
 func migrate(db *sql.DB) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS cdks (
-    code        TEXT PRIMARY KEY,
-    remaining   INTEGER NOT NULL,
-    used        INTEGER NOT NULL DEFAULT 0,
-    expires_at  INTEGER NOT NULL,
-    created_at  INTEGER NOT NULL
+    code            TEXT PRIMARY KEY,
+    remaining_bytes INTEGER NOT NULL,
+    used_bytes      INTEGER NOT NULL DEFAULT 0,
+    expires_at      INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );`
 	if _, err := db.Exec(schema); err != nil {
-		return fmt.Errorf("migrate cdks: %w", err)
+		return fmt.Errorf("migrate: %w", err)
+	}
+	if err := migrateCDKToTraffic(db); err != nil {
+		return fmt.Errorf("migrate cdks to traffic: %w", err)
 	}
 	return nil
+}
+
+// legacyCDKBytesPerCredit converts an existing count-based CDK credit into a
+// downstream-traffic allowance: one parse credit becomes 2 GiB.
+const legacyCDKBytesPerCredit = int64(2) << 30
+
+// migrateCDKToTraffic upgrades a pre-existing count-based cdks table (columns
+// remaining/used) to the traffic-based schema (remaining_bytes/used_bytes),
+// converting each credit to 2 GiB. The presence of the remaining_bytes column is
+// itself the version marker, so this is idempotent: once migrated, the legacy
+// `remaining` column is gone and this is a no-op. Fresh databases already have
+// the new schema and skip the rebuild.
+func migrateCDKToTraffic(db *sql.DB) error {
+	hasLegacy, err := columnExists(db, "cdks", "remaining")
+	if err != nil {
+		return err
+	}
+	hasBytes, err := columnExists(db, "cdks", "remaining_bytes")
+	if err != nil {
+		return err
+	}
+	if !hasLegacy || hasBytes {
+		return nil // already on the new schema (or a fresh install)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE cdks_new (
+            code            TEXT PRIMARY KEY,
+            remaining_bytes INTEGER NOT NULL,
+            used_bytes      INTEGER NOT NULL DEFAULT 0,
+            expires_at      INTEGER NOT NULL,
+            created_at      INTEGER NOT NULL
+        )`,
+		fmt.Sprintf(`INSERT INTO cdks_new (code, remaining_bytes, used_bytes, expires_at, created_at)
+            SELECT code, remaining * %d, used * %d, expires_at, created_at FROM cdks`,
+			legacyCDKBytesPerCredit, legacyCDKBytesPerCredit),
+		`DROP TABLE cdks`,
+		`ALTER TABLE cdks_new RENAME TO cdks`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// columnExists reports whether a table has a column of the given name.
+func columnExists(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dfltValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }

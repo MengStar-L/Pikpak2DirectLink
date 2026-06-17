@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"pikpak2directlink/internal/pikpak"
@@ -22,6 +23,15 @@ const (
 	AccountAvailable AccountStatus = "available"
 	AccountFailed    AccountStatus = "failed"
 )
+
+// bytesPerGB is the byte count of one "G" of traffic. We use the binary
+// gibibyte (1024³) consistently for both account limits and CDK allowances, so
+// it lines up with the byte sizes PikPak reports for files.
+const bytesPerGB = int64(1) << 30
+
+// defaultAccountTraffic is the monthly downstream-traffic budget assigned to a
+// new account (or an older record that predates traffic tracking): 700G.
+const defaultAccountTraffic = 700 * bytesPerGB
 
 type AccountPoolConfig struct {
 	AccountsFile   string
@@ -42,6 +52,9 @@ type AccountSummary struct {
 	PremiumUntil     string        `json:"premium_until,omitempty"`
 	PremiumError     string        `json:"premium_error,omitempty"`
 	PremiumCheckedAt string        `json:"premium_checked_at,omitempty"`
+	TrafficLimit     int64         `json:"traffic_limit"`
+	TrafficUsed      int64         `json:"traffic_used"`
+	TrafficLimited   bool          `json:"traffic_limited"`
 	LastError        string        `json:"last_error,omitempty"`
 	LastFailedAt     string        `json:"last_failed_at,omitempty"`
 	CreatedAt        time.Time     `json:"created_at"`
@@ -65,6 +78,9 @@ type accountRecord struct {
 	PremiumUntil     string        `json:"premium_until,omitempty"`
 	PremiumError     string        `json:"premium_error,omitempty"`
 	PremiumCheckedAt string        `json:"premium_checked_at,omitempty"`
+	TrafficLimit     int64         `json:"traffic_limit,omitempty"`
+	TrafficUsed      int64         `json:"traffic_used,omitempty"`
+	TrafficPeriod    string        `json:"traffic_period,omitempty"`
 	LastError        string        `json:"last_error,omitempty"`
 	LastFailedAt     string        `json:"last_failed_at,omitempty"`
 	CreatedAt        time.Time     `json:"created_at"`
@@ -81,6 +97,7 @@ type AccountPool struct {
 	config   AccountPoolConfig
 	accounts map[string]*accountState
 	order    []string
+	cursor   uint64 // rotating round-robin starting point for parallel resolves
 }
 
 const premiumRefreshInterval = 30 * time.Minute
@@ -105,10 +122,13 @@ func NewAccountPool(cfg AccountPoolConfig) (*AccountPool, error) {
 	return pool, nil
 }
 
-func (p *AccountPool) Add(ctx context.Context, username, password string) (AccountSummary, error) {
+func (p *AccountPool) Add(ctx context.Context, username, password string, trafficLimit int64) (AccountSummary, error) {
 	username = strings.TrimSpace(username)
 	if username == "" || strings.TrimSpace(password) == "" {
 		return AccountSummary{}, errors.New("username and password are required")
+	}
+	if trafficLimit <= 0 {
+		trafficLimit = defaultAccountTraffic
 	}
 
 	id, sessionFile := p.accountIdentity(username)
@@ -129,13 +149,22 @@ func (p *AccountPool) Add(ctx context.Context, username, password string) (Accou
 	}
 
 	record := accountRecord{
-		ID:          id,
-		Username:    username,
-		Password:    password,
-		SessionFile: sessionFile,
-		Status:      AccountAvailable,
-		CreatedAt:   createdAt,
-		UpdatedAt:   now,
+		ID:            id,
+		Username:      username,
+		Password:      password,
+		SessionFile:   sessionFile,
+		Status:        AccountAvailable,
+		TrafficLimit:  trafficLimit,
+		TrafficPeriod: monthKey(now),
+		CreatedAt:     createdAt,
+		UpdatedAt:     now,
+	}
+	// Re-adding an existing account keeps its accrued usage for the month.
+	if existed {
+		record.TrafficUsed = existingState.record.TrafficUsed
+		if existingState.record.TrafficPeriod != "" {
+			record.TrafficPeriod = existingState.record.TrafficPeriod
+		}
 	}
 	updatePremiumRecord(&record, premiumInfo, premiumErr, now)
 
@@ -173,13 +202,15 @@ func (p *AccountPool) AddBootstrap(username, password, sessionFile string) error
 	now := time.Now()
 	p.accounts[id] = &accountState{
 		record: accountRecord{
-			ID:          id,
-			Username:    username,
-			Password:    password,
-			SessionFile: sessionFile,
-			Status:      AccountAvailable,
-			CreatedAt:   now,
-			UpdatedAt:   now,
+			ID:            id,
+			Username:      username,
+			Password:      password,
+			SessionFile:   sessionFile,
+			Status:        AccountAvailable,
+			TrafficLimit:  defaultAccountTraffic,
+			TrafficPeriod: monthKey(now),
+			CreatedAt:     now,
+			UpdatedAt:     now,
 		},
 		client: p.newClient(username, password, sessionFile),
 	}
@@ -254,6 +285,64 @@ func (p *AccountPool) Snapshot() []AccountRuntime {
 		})
 	}
 	return accounts
+}
+
+// ResolveOrder returns accounts in the order a resolve job should try them.
+//
+// Accounts that have hit their monthly downstream-traffic limit are excluded
+// entirely (in both modes) — that exclusion is the whole point of the limit, so
+// they are not even used as a fallback. When rotate is false (serial mode) the
+// remaining accounts keep their stored order, regardless of failure status, as
+// before. When rotate is true (parallel mode) currently-available accounts come
+// first, rotated by a per-call cursor so concurrent jobs fan out instead of all
+// hammering the first one; failed accounts are appended last as a fallback.
+func (p *AccountPool) ResolveOrder(rotate bool) []AccountRuntime {
+	now := time.Now()
+	p.mu.RLock()
+	if !rotate {
+		accounts := make([]AccountRuntime, 0, len(p.order))
+		for _, id := range p.order {
+			state := p.accounts[id]
+			if state == nil || accountTrafficLimited(state.record, now) {
+				continue
+			}
+			accounts = append(accounts, AccountRuntime{
+				ID:       state.record.ID,
+				Username: state.record.Username,
+				Client:   state.client,
+			})
+		}
+		p.mu.RUnlock()
+		return accounts
+	}
+
+	var available, failed []AccountRuntime
+	for _, id := range p.order {
+		state := p.accounts[id]
+		if state == nil || accountTrafficLimited(state.record, now) {
+			continue
+		}
+		rt := AccountRuntime{
+			ID:       state.record.ID,
+			Username: state.record.Username,
+			Client:   state.client,
+		}
+		if state.record.Status == AccountFailed {
+			failed = append(failed, rt)
+		} else {
+			available = append(available, rt)
+		}
+	}
+	p.mu.RUnlock()
+
+	if len(available) > 1 {
+		off := int((atomic.AddUint64(&p.cursor, 1) - 1) % uint64(len(available)))
+		rotated := make([]AccountRuntime, 0, len(available))
+		rotated = append(rotated, available[off:]...)
+		rotated = append(rotated, available[:off]...)
+		available = rotated
+	}
+	return append(available, failed...)
 }
 
 func (p *AccountPool) Get(id string) (AccountRuntime, bool) {
@@ -348,6 +437,48 @@ func (p *AccountPool) MarkAvailable(id string) {
 	_ = p.saveLocked()
 }
 
+// SetTrafficLimit updates an account's monthly downstream budget (in bytes).
+func (p *AccountPool) SetTrafficLimit(id string, limitBytes int64) error {
+	if limitBytes <= 0 {
+		limitBytes = defaultAccountTraffic
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state := p.accounts[id]
+	if state == nil {
+		return errors.New("account not found")
+	}
+	state.record.TrafficLimit = limitBytes
+	state.record.UpdatedAt = time.Now()
+	return p.saveLocked()
+}
+
+// AddTraffic records bytes of downstream traffic against an account for the
+// current month. The counter rolls over automatically when the calendar month
+// changes, which is how the monthly "到达限行流量" state clears itself.
+func (p *AccountPool) AddTraffic(id string, bytes int64) {
+	if bytes <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state := p.accounts[id]
+	if state == nil {
+		return
+	}
+	now := time.Now()
+	mk := monthKey(now)
+	if state.record.TrafficPeriod != mk {
+		state.record.TrafficUsed = 0
+		state.record.TrafficPeriod = mk
+	}
+	state.record.TrafficUsed += bytes
+	state.record.UpdatedAt = now
+	_ = p.saveLocked()
+}
+
 func (p *AccountPool) load() error {
 	data, err := os.ReadFile(p.config.AccountsFile)
 	if err != nil {
@@ -372,6 +503,14 @@ func (p *AccountPool) load() error {
 		}
 		if record.Status == "" {
 			record.Status = AccountAvailable
+		}
+		// Records created before traffic tracking get the default budget and the
+		// current month as their baseline period.
+		if record.TrafficLimit <= 0 {
+			record.TrafficLimit = defaultAccountTraffic
+		}
+		if record.TrafficPeriod == "" {
+			record.TrafficPeriod = monthKey(time.Now())
 		}
 		recordCopy := record
 		p.accounts[record.ID] = &accountState{
@@ -414,6 +553,7 @@ func (p *AccountPool) summaryLocked(id string) AccountSummary {
 	}
 
 	status := state.client.Status()
+	now := time.Now()
 	return AccountSummary{
 		ID:               state.record.ID,
 		Username:         state.record.Username,
@@ -426,6 +566,9 @@ func (p *AccountPool) summaryLocked(id string) AccountSummary {
 		PremiumUntil:     state.record.PremiumUntil,
 		PremiumError:     friendlyPikPakMessage(state.record.PremiumError),
 		PremiumCheckedAt: state.record.PremiumCheckedAt,
+		TrafficLimit:     state.record.TrafficLimit,
+		TrafficUsed:      effectiveTrafficUsed(state.record, now),
+		TrafficLimited:   accountTrafficLimited(state.record, now),
 		LastError:        friendlyPikPakMessage(state.record.LastError),
 		LastFailedAt:     state.record.LastFailedAt,
 		CreatedAt:        state.record.CreatedAt,
@@ -458,6 +601,33 @@ func accountIDForUsername(username string) string {
 		return fmt.Sprintf("acct_%d", time.Now().UnixNano())
 	}
 	return "acct_" + hex.EncodeToString(buf)
+}
+
+// monthKey is the calendar-month identifier used to scope traffic counters.
+func monthKey(t time.Time) string {
+	return t.Format("2006-01")
+}
+
+// effectiveTrafficUsed returns the bytes used in the month that contains now.
+// A counter stamped with an earlier month is treated as already reset to 0,
+// which is what makes the monthly refresh automatic (no scheduler needed).
+func effectiveTrafficUsed(rec accountRecord, now time.Time) int64 {
+	if rec.TrafficPeriod != monthKey(now) {
+		return 0
+	}
+	if rec.TrafficUsed < 0 {
+		return 0
+	}
+	return rec.TrafficUsed
+}
+
+// accountTrafficLimited reports whether an account has spent its monthly budget.
+// A non-positive limit is treated as unlimited.
+func accountTrafficLimited(rec accountRecord, now time.Time) bool {
+	if rec.TrafficLimit <= 0 {
+		return false
+	}
+	return effectiveTrafficUsed(rec, now) >= rec.TrafficLimit
 }
 
 func premiumInfoNeedsRefresh(record accountRecord, now time.Time) bool {

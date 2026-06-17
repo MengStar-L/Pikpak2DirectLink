@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,7 +12,7 @@ import (
 func TestResolveQueuePriorityOrdering(t *testing.T) {
 	t.Parallel()
 
-	q := newResolveQueue(time.Second, nil)
+	q := newResolveQueue(time.Second, time.Second, 1, nil)
 	noop := func(context.Context) {}
 
 	// Enqueue interleaved priorities; the worker is never started, so entries
@@ -38,7 +39,7 @@ func TestResolveQueuePriorityOrdering(t *testing.T) {
 func TestResolveQueuePosition(t *testing.T) {
 	t.Parallel()
 
-	q := newResolveQueue(time.Second, nil)
+	q := newResolveQueue(time.Second, time.Second, 1, nil)
 	noop := func(context.Context) {}
 	q.enqueue("u1", priorityUser, noop)
 	q.enqueue("u2", priorityUser, noop)
@@ -53,7 +54,7 @@ func TestResolveQueuePosition(t *testing.T) {
 
 	// Simulate a job holding the slot: everyone in the queue shifts back one.
 	q.mu.Lock()
-	q.current = "running"
+	q.running["running"] = true
 	q.mu.Unlock()
 
 	if got := q.position("u1"); got != 1 {
@@ -73,7 +74,7 @@ func TestResolveQueuePosition(t *testing.T) {
 func TestResolveQueueRunsSerially(t *testing.T) {
 	t.Parallel()
 
-	q := newResolveQueue(2*time.Second, nil)
+	q := newResolveQueue(2*time.Second, 2*time.Second, 1, nil)
 	go q.run()
 
 	var concurrent, maxConcurrent int32
@@ -122,5 +123,110 @@ func TestResolveQueueRunsSerially(t *testing.T) {
 	}
 	if w := q.waiting(); w != 0 {
 		t.Fatalf("expected empty queue after draining, got %d waiting", w)
+	}
+}
+
+func TestResolveQueueRunsInParallel(t *testing.T) {
+	t.Parallel()
+
+	const limit = 3
+	q := newResolveQueue(2*time.Second, 2*time.Second, limit, nil)
+	go q.run()
+
+	var concurrent, maxConcurrent int32
+	var wg sync.WaitGroup
+
+	makeRun := func() func(context.Context) {
+		return func(context.Context) {
+			defer wg.Done()
+			n := atomic.AddInt32(&concurrent, 1)
+			for {
+				old := atomic.LoadInt32(&maxConcurrent)
+				if n <= old || atomic.CompareAndSwapInt32(&maxConcurrent, old, n) {
+					break
+				}
+			}
+			time.Sleep(40 * time.Millisecond)
+			atomic.AddInt32(&concurrent, -1)
+		}
+	}
+
+	const total = 9
+	wg.Add(total)
+	for i := 0; i < total; i++ {
+		q.enqueue("j"+strconv.Itoa(i), priorityUser, makeRun())
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for queued jobs to run")
+	}
+
+	got := atomic.LoadInt32(&maxConcurrent)
+	if got != limit {
+		t.Fatalf("expected peak concurrency %d, got %d", limit, got)
+	}
+}
+
+func TestResolveQueueParallelPosition(t *testing.T) {
+	t.Parallel()
+
+	// Two slots, two jobs "running", three waiting. With C=2 and R=2, the head of
+	// the queue must wait for one running job to finish, then positions step by 1.
+	q := newResolveQueue(time.Second, time.Second, 2, nil)
+	noop := func(context.Context) {}
+	q.enqueue("w1", priorityUser, noop)
+	q.enqueue("w2", priorityUser, noop)
+	q.enqueue("w3", priorityUser, noop)
+
+	q.mu.Lock()
+	q.running["r1"] = true
+	q.running["r2"] = true
+	q.mu.Unlock()
+
+	for id, want := range map[string]int{"w1": 1, "w2": 2, "w3": 3} {
+		if got := q.position(id); got != want {
+			t.Fatalf("position(%s) = %d, want %d", id, got, want)
+		}
+	}
+	if got := q.position("r1"); got != 0 {
+		t.Fatalf("running job position = %d, want 0", got)
+	}
+
+	// A free slot (R < C) lets the head start immediately.
+	q.mu.Lock()
+	delete(q.running, "r2")
+	q.mu.Unlock()
+	if got := q.position("w1"); got != 0 {
+		t.Fatalf("head position with a free slot = %d, want 0", got)
+	}
+}
+
+func TestResolveQueueTimeoutTracksMode(t *testing.T) {
+	t.Parallel()
+
+	serial := 45 * time.Second
+	parallel := 2 * time.Minute
+	q := newResolveQueue(serial, parallel, 1, nil)
+
+	if got := q.currentTimeout(); got != serial {
+		t.Fatalf("serial-mode timeout = %s, want %s", got, serial)
+	}
+	q.setConcurrency(4)
+	if got := q.currentTimeout(); got != parallel {
+		t.Fatalf("parallel-mode timeout = %s, want %s", got, parallel)
+	}
+	if got := q.setConcurrency(999); got != maxResolveConcurrency {
+		t.Fatalf("setConcurrency clamp = %d, want %d", got, maxResolveConcurrency)
+	}
+	if got := q.setConcurrency(0); got != 1 {
+		t.Fatalf("setConcurrency floor = %d, want 1", got)
 	}
 }

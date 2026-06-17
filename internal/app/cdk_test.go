@@ -1,6 +1,9 @@
 package app
 
 import (
+	"errors"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -19,7 +22,7 @@ func TestCDKCreateAndList(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	store := newTestCDKStore(t)
 
-	created, err := store.createBatch(3, 5, 30, now)
+	created, err := store.createBatch(3, 5*bytesPerGB, 30, now)
 	if err != nil {
 		t.Fatalf("createBatch: %v", err)
 	}
@@ -32,8 +35,8 @@ func TestCDKCreateAndList(t *testing.T) {
 			t.Fatalf("duplicate code generated: %s", c.Code)
 		}
 		seen[c.Code] = true
-		if c.Remaining != 5 {
-			t.Fatalf("expected remaining 5, got %d", c.Remaining)
+		if c.RemainingBytes != 5*bytesPerGB {
+			t.Fatalf("expected remaining 5G, got %d", c.RemainingBytes)
 		}
 	}
 
@@ -46,65 +49,63 @@ func TestCDKCreateAndList(t *testing.T) {
 	}
 }
 
-func TestCDKReserveDecrementsAndGuards(t *testing.T) {
+func TestCDKHasTrafficGuards(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	store := newTestCDKStore(t)
 
-	created, _ := store.createBatch(1, 2, 30, now)
+	created, _ := store.createBatch(1, 2*bytesPerGB, 30, now)
 	code := created[0].Code
 
-	c, err := store.reserve(code, now)
-	if err != nil {
-		t.Fatalf("first reserve: %v", err)
-	}
-	if c.Remaining != 1 || c.Used != 1 {
-		t.Fatalf("after first reserve: remaining=%d used=%d", c.Remaining, c.Used)
+	if _, err := store.hasTraffic(code, now); err != nil {
+		t.Fatalf("hasTraffic on fresh CDK: %v", err)
 	}
 
-	if _, err := store.reserve(code, now); err != nil {
-		t.Fatalf("second reserve: %v", err)
+	// Drain it, then it must report exhausted.
+	if err := store.charge(code, 2*bytesPerGB); err != nil {
+		t.Fatalf("charge: %v", err)
 	}
-
-	// Third reserve must fail: quota exhausted.
-	if _, err := store.reserve(code, now); err != errCDKExhausted {
+	if _, err := store.hasTraffic(code, now); err != errCDKExhausted {
 		t.Fatalf("expected errCDKExhausted, got %v", err)
 	}
 
 	// Unknown code.
-	if _, err := store.reserve("NOPE-NOPE-NOPE-NOPE", now); err != errCDKNotFound {
+	if _, err := store.hasTraffic("NOPE-NOPE-NOPE-NOPE", now); err != errCDKNotFound {
 		t.Fatalf("expected errCDKNotFound, got %v", err)
 	}
-}
 
-func TestCDKReserveRejectsExpired(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-
-	created, _ := store.createBatch(1, 5, 1, now)
-	code := created[0].Code
-
-	later := now.Add(48 * time.Hour) // past the 1-day expiry
-	if _, err := store.reserve(code, later); err != errCDKExpired {
+	// Expired code.
+	exp, _ := store.createBatch(1, 5*bytesPerGB, 1, now)
+	later := now.Add(48 * time.Hour)
+	if _, err := store.hasTraffic(exp[0].Code, later); err != errCDKExpired {
 		t.Fatalf("expected errCDKExpired, got %v", err)
 	}
 }
 
-func TestCDKRefund(t *testing.T) {
+func TestCDKCharge(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	store := newTestCDKStore(t)
 
-	created, _ := store.createBatch(1, 3, 30, now)
+	created, _ := store.createBatch(1, 5*bytesPerGB, 30, now)
 	code := created[0].Code
 
-	if _, err := store.reserve(code, now); err != nil {
-		t.Fatalf("reserve: %v", err)
-	}
-	if err := store.refund(code); err != nil {
-		t.Fatalf("refund: %v", err)
+	if err := store.charge(code, 2*bytesPerGB); err != nil {
+		t.Fatalf("charge: %v", err)
 	}
 	c, _, _ := store.get(code)
-	if c.Remaining != 3 || c.Used != 0 {
-		t.Fatalf("after refund: remaining=%d used=%d, want 3/0", c.Remaining, c.Used)
+	if c.RemainingBytes != 3*bytesPerGB || c.UsedBytes != 2*bytesPerGB {
+		t.Fatalf("after charge 2G: remaining=%d used=%d", c.RemainingBytes, c.UsedBytes)
+	}
+
+	// Overdraw clamps remaining at zero but still accumulates used.
+	if err := store.charge(code, 10*bytesPerGB); err != nil {
+		t.Fatalf("overdraw charge: %v", err)
+	}
+	c, _, _ = store.get(code)
+	if c.RemainingBytes != 0 {
+		t.Fatalf("remaining should clamp at 0, got %d", c.RemainingBytes)
+	}
+	if c.UsedBytes != 12*bytesPerGB {
+		t.Fatalf("used should accumulate to 12G, got %d", c.UsedBytes)
 	}
 }
 
@@ -112,15 +113,15 @@ func TestCDKUpdateAndDelete(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	store := newTestCDKStore(t)
 
-	created, _ := store.createBatch(1, 5, 10, now)
+	created, _ := store.createBatch(1, 5*bytesPerGB, 10, now)
 	code := created[0].Code
 
-	updated, ok, err := store.update(code, 20, 60, now)
+	updated, ok, err := store.update(code, 20*bytesPerGB, 60, now)
 	if err != nil || !ok {
 		t.Fatalf("update: ok=%v err=%v", ok, err)
 	}
-	if updated.Remaining != 20 {
-		t.Fatalf("expected remaining 20, got %d", updated.Remaining)
+	if updated.RemainingBytes != 20*bytesPerGB {
+		t.Fatalf("expected remaining 20G, got %d", updated.RemainingBytes)
 	}
 	wantExpiry := now.Add(60 * 24 * time.Hour).Unix()
 	if updated.ExpiresAt != wantExpiry {
@@ -139,10 +140,10 @@ func TestCDKUpdateAndDelete(t *testing.T) {
 func TestCDKViewDaysLeft(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	c := CDK{
-		Code:      "AAAA-BBBB-CCCC-DDDD",
-		Remaining: 5,
-		ExpiresAt: now.Add(72 * time.Hour).Unix(),
-		CreatedAt: now.Unix(),
+		Code:           "AAAA-BBBB-CCCC-DDDD",
+		RemainingBytes: 5 * bytesPerGB,
+		ExpiresAt:      now.Add(72 * time.Hour).Unix(),
+		CreatedAt:      now.Unix(),
 	}
 	v := toCDKView(c, now)
 	if v.Expired {
@@ -151,9 +152,168 @@ func TestCDKViewDaysLeft(t *testing.T) {
 	if v.DaysLeft != 3 {
 		t.Fatalf("expected 3 days left, got %d", v.DaysLeft)
 	}
+	if v.RemainingBytes != 5*bytesPerGB || v.RemainingLabel != "5 GB" {
+		t.Fatalf("unexpected remaining view: bytes=%d label=%q", v.RemainingBytes, v.RemainingLabel)
+	}
 
 	expiredView := toCDKView(CDK{ExpiresAt: now.Add(-time.Hour).Unix()}, now)
 	if !expiredView.Expired || expiredView.DaysLeft != 0 {
 		t.Fatalf("expected expired view, got %+v", expiredView)
 	}
+}
+
+// TestUserJobViewHidesAccountInfo locks in the security boundary: a CDK user
+// must never receive the raw error/message, which embed PikPak account
+// usernames (the "all accounts failed: <email>: ..." leak).
+func TestUserJobViewHidesAccountInfo(t *testing.T) {
+	leak := "all PikPak accounts failed: alice@passinbox.com: record not found; bob@passinbox.com: record not found"
+
+	failed := toUserJobView(&Job{
+		ID:      "job1",
+		Status:  JobFailed,
+		Stage:   StageFailed,
+		Message: "starting with alice@passinbox.com",
+		Error:   leak,
+	})
+	if failed.Error != genericUserJobError {
+		t.Fatalf("failed job error should be generic, got %q", failed.Error)
+	}
+	if failed.Message != "" {
+		t.Fatalf("failed job should expose no message, got %q", failed.Message)
+	}
+	if contains(failed.Error, "@") || contains(failed.Message, "@") {
+		t.Fatalf("account email leaked: error=%q message=%q", failed.Error, failed.Message)
+	}
+
+	// A running job's internal "starting with <username>" message must not pass
+	// through either.
+	running := toUserJobView(&Job{
+		ID:      "job2",
+		Status:  JobRunning,
+		Stage:   StageTransfer,
+		Message: "starting with bob@passinbox.com",
+	})
+	if contains(running.Message, "@") || contains(running.Message, "bob") {
+		t.Fatalf("running message leaked account info: %q", running.Message)
+	}
+	if running.Error != "" {
+		t.Fatalf("running job should have no error, got %q", running.Error)
+	}
+
+	// Defense in depth: an error set without a failed status is still scrubbed.
+	weird := toUserJobView(&Job{ID: "job3", Status: JobRunning, Error: leak})
+	if weird.Error != genericUserJobError {
+		t.Fatalf("stray error not scrubbed, got %q", weird.Error)
+	}
+}
+
+func contains(haystack, needle string) bool {
+	return strings.Contains(haystack, needle)
+}
+
+// TestApplyItemsSelectionRejectsOverdraw locks in the traffic gate: a CDK user
+// picking result files whose SUMMED size exceeds the CDK's remaining traffic
+// must be refused at selection time with a 403, not silently absorbed at charge
+// time. A selection that fits is accepted.
+func TestApplyItemsSelectionRejectsOverdraw(t *testing.T) {
+	now := time.Now()
+	store := newTestCDKStore(t)
+	created, _ := store.createBatch(1, 1*bytesPerGB, 30, now)
+	code := created[0].Code
+
+	noopResolver := newResolveQueue(time.Second, time.Second, 1, func(string, error) {})
+	s := &Server{cdk: store, jobs: newJobStore(10), resolver: noopResolver}
+
+	items := []DownloadItem{
+		{ID: "a", Name: "a.bin", Size: itoa64(512 * 1024 * 1024)}, // 0.5G
+		{ID: "b", Name: "b.bin", Size: itoa64(512 * 1024 * 1024)}, // 0.5G
+		{ID: "c", Name: "c.bin", Size: itoa64(512 * 1024 * 1024)}, // 0.5G
+	}
+	mkJob := func(id string) string {
+		job := &Job{ID: id, Status: JobSelectionRequired, Stage: StageResultSelection, CDKCode: code, Items: items}
+		s.jobs.create(job)
+		return id
+	}
+
+	// 1.5G summed > 1G remaining → refused.
+	if _, status, msg := s.applyItemsSelection(mkJob("job-over"), []string{"a", "b", "c"}); status != 403 {
+		t.Fatalf("expected 403 for oversized batch, got status=%d msg=%q", status, msg)
+	}
+
+	// 1.0G summed == 1G remaining → allowed (not strictly greater).
+	if _, status, msg := s.applyItemsSelection(mkJob("job-fit"), []string{"a", "b"}); status != 0 {
+		t.Fatalf("expected fitting batch to succeed, got status=%d msg=%q", status, msg)
+	}
+
+	// Empty selection is a bad request.
+	if _, status, _ := s.applyItemsSelection(mkJob("job-empty"), []string{"  "}); status != 400 {
+		t.Fatalf("expected 400 for empty selection, got status=%d", status)
+	}
+
+	// Unknown item id is rejected.
+	if _, status, _ := s.applyItemsSelection(mkJob("job-unknown"), []string{"a", "zzz"}); status != 400 {
+		t.Fatalf("expected 400 for unknown item, got status=%d", status)
+	}
+}
+
+// TestResultForToken locks in proxy-link routing for batch jobs: each resolved
+// file's token must select its own result, across both the single Result and
+// the multi-file Results slice.
+func TestResultForToken(t *testing.T) {
+	job := &Job{
+		Result:  &JobResult{ProxyToken: "single-tok", File: DownloadItem{ID: "s"}},
+		Results: []JobResult{{ProxyToken: "tok-a", File: DownloadItem{ID: "a"}}, {ProxyToken: "tok-b", File: DownloadItem{ID: "b"}}},
+	}
+	if r := job.resultForToken("tok-b"); r == nil || r.File.ID != "b" {
+		t.Fatalf("expected result b, got %+v", r)
+	}
+	if r := job.resultForToken("single-tok"); r == nil || r.File.ID != "s" {
+		t.Fatalf("expected single result, got %+v", r)
+	}
+	if r := job.resultForToken("nope"); r != nil {
+		t.Fatalf("expected nil for unknown token, got %+v", r)
+	}
+	if r := job.resultForToken(""); r != nil {
+		t.Fatalf("expected nil for empty token, got %+v", r)
+	}
+}
+
+// TestCDKOverdrawError covers the single-file backstop used by finishWithItems:
+// it returns a typed errCDKOverdraw only when a CDK job's file exceeds remaining
+// traffic, and never blocks non-CDK jobs.
+func TestCDKOverdrawError(t *testing.T) {
+	now := time.Now()
+	store := newTestCDKStore(t)
+	created, _ := store.createBatch(1, 1*bytesPerGB, 30, now)
+	code := created[0].Code
+
+	s := &Server{cdk: store, jobs: newJobStore(10)}
+
+	cdkJob := &Job{ID: "cdk-job", CDKCode: code}
+	s.jobs.create(cdkJob)
+	if err := s.cdkOverdrawError(cdkJob.ID, DownloadItem{Size: itoa64(2 * bytesPerGB)}); err == nil {
+		t.Fatal("expected overdraw error for 2G file against 1G CDK")
+	} else if _, ok := errAsOverdraw(err); !ok {
+		t.Fatalf("expected errCDKOverdraw, got %T", err)
+	}
+	if err := s.cdkOverdrawError(cdkJob.ID, DownloadItem{Size: itoa64(512 * 1024 * 1024)}); err != nil {
+		t.Fatalf("0.5G file should fit 1G CDK, got %v", err)
+	}
+
+	// A job with no CDK is never gated.
+	plainJob := &Job{ID: "plain-job"}
+	s.jobs.create(plainJob)
+	if err := s.cdkOverdrawError(plainJob.ID, DownloadItem{Size: itoa64(99 * bytesPerGB)}); err != nil {
+		t.Fatalf("non-CDK job must never be gated, got %v", err)
+	}
+}
+
+func itoa64(n int64) string {
+	return strconv.FormatInt(n, 10)
+}
+
+func errAsOverdraw(err error) (errCDKOverdraw, bool) {
+	var o errCDKOverdraw
+	ok := errors.As(err, &o)
+	return o, ok
 }

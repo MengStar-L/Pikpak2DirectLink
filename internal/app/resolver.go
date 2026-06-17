@@ -17,47 +17,78 @@ const (
 	priorityResume = 2
 )
 
-// queueEntry is one unit of work waiting for the single resolution slot.
+// maxResolveConcurrency caps how many jobs an admin can run in parallel, so a
+// fat-fingered value can't spawn an unbounded number of goroutines all hammering
+// PikPak at once.
+const maxResolveConcurrency = 32
+
+// queueEntry is one unit of work waiting for a resolution slot.
 type queueEntry struct {
 	jobID    string
 	priority int
 	run      func(ctx context.Context)
 }
 
-// resolveQueue serializes link resolution so the system only ever drives PikPak
-// for one job at a time (which keeps it under PikPak's rate-control radar),
-// while still letting admin submissions jump the line and reporting queue
-// positions back to callers.
+// resolveQueue meters link resolution so the system only ever drives PikPak for
+// a bounded number of jobs at a time (which keeps it under PikPak's rate-control
+// radar), while still letting admin submissions jump the line and reporting
+// queue positions back to callers.
 //
-// A single worker goroutine drains the queue. Each job runs under a hard
-// timeout; if it exceeds the budget it is abandoned and the next job starts. A
-// job that pauses for user input (selection_required) simply returns from its
-// run func, freeing the slot — its continuation is re-enqueued at
-// priorityResume so it resumes almost immediately.
+// A single dispatcher goroutine drains the queue, spawning up to `concurrency`
+// worker goroutines. With concurrency == 1 it behaves exactly like the original
+// serial worker. The admin can change concurrency live; the dispatcher simply
+// stops starting new jobs once the running set reaches the limit and resumes
+// when a slot frees (or when the limit is raised).
+//
+// Each job runs under a hard timeout; if it exceeds the budget it is abandoned
+// and the next job starts. The budget is shorter while serial (snappy
+// turnaround) and longer while parallel (more jobs share PikPak's attention, so
+// each can legitimately take longer). A job that pauses for user input
+// (selection_required) simply returns from its run func, freeing the slot — its
+// continuation is re-enqueued at priorityResume so it resumes almost
+// immediately.
 type resolveQueue struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	entries []*queueEntry
-	current string // jobID currently holding the slot, "" when idle
-	timeout time.Duration
-	fail    func(jobID string, err error) // injected s.failJob, for panic/abort fallback
+	mu              sync.Mutex
+	cond            *sync.Cond
+	entries         []*queueEntry
+	running         map[string]bool // jobIDs currently holding a slot
+	concurrency     int
+	serialTimeout   time.Duration
+	parallelTimeout time.Duration
+	fail            func(jobID string, err error) // injected s.failJob, for panic/abort fallback
 }
 
-func newResolveQueue(timeout time.Duration, fail func(jobID string, err error)) *resolveQueue {
-	if timeout <= 0 {
-		timeout = 45 * time.Second
+func newResolveQueue(serialTimeout, parallelTimeout time.Duration, concurrency int, fail func(jobID string, err error)) *resolveQueue {
+	if serialTimeout <= 0 {
+		serialTimeout = 45 * time.Second
+	}
+	if parallelTimeout <= 0 {
+		parallelTimeout = 2 * time.Minute
 	}
 	q := &resolveQueue{
-		timeout: timeout,
-		fail:    fail,
+		running:         make(map[string]bool),
+		concurrency:     clampConcurrency(concurrency),
+		serialTimeout:   serialTimeout,
+		parallelTimeout: parallelTimeout,
+		fail:            fail,
 	}
 	q.cond = sync.NewCond(&q.mu)
 	return q
 }
 
-// enqueue appends a job and wakes the worker. The entry is placed after the last
-// entry whose priority is greater than or equal to its own, so higher-priority
-// jobs jump ahead while ties preserve submission order.
+func clampConcurrency(n int) int {
+	if n < 1 {
+		return 1
+	}
+	if n > maxResolveConcurrency {
+		return maxResolveConcurrency
+	}
+	return n
+}
+
+// enqueue appends a job and wakes the dispatcher. The entry is placed after the
+// last entry whose priority is greater than or equal to its own, so
+// higher-priority jobs jump ahead while ties preserve submission order.
 func (q *resolveQueue) enqueue(jobID string, priority int, run func(ctx context.Context)) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -74,35 +105,42 @@ func (q *resolveQueue) enqueue(jobID string, priority int, run func(ctx context.
 	copy(q.entries[insertAt+1:], q.entries[insertAt:])
 	q.entries[insertAt] = &queueEntry{jobID: jobID, priority: priority, run: run}
 
-	q.cond.Signal()
+	q.cond.Broadcast()
 }
 
-// run is the worker loop. It must be started exactly once (go q.run()).
+// run is the dispatcher loop. It must be started exactly once (go q.run()). It
+// waits until there is queued work AND a free slot, then pops the head and runs
+// it in its own goroutine.
 func (q *resolveQueue) run() {
 	for {
 		q.mu.Lock()
-		for len(q.entries) == 0 {
+		for len(q.entries) == 0 || len(q.running) >= q.concurrency {
 			q.cond.Wait()
 		}
 		entry := q.entries[0]
 		copy(q.entries, q.entries[1:])
 		q.entries[len(q.entries)-1] = nil
 		q.entries = q.entries[:len(q.entries)-1]
-		q.current = entry.jobID
+		q.running[entry.jobID] = true
 		q.mu.Unlock()
 
-		q.execute(entry)
-
-		q.mu.Lock()
-		q.current = ""
-		q.mu.Unlock()
+		go func(e *queueEntry) {
+			q.execute(e)
+			q.mu.Lock()
+			delete(q.running, e.jobID)
+			q.mu.Unlock()
+			// A slot just freed (or the running set shrank below the limit) — let
+			// the dispatcher re-evaluate.
+			q.cond.Broadcast()
+		}(entry)
 	}
 }
 
 // execute runs one entry under the hard timeout, recovering from panics so a
-// single bad job can never wedge the worker (and the whole queue) permanently.
+// single bad job can never wedge a worker. The timeout is sampled at dispatch
+// time so a live concurrency change applies to subsequent jobs.
 func (q *resolveQueue) execute(entry *queueEntry) {
-	ctx, cancel := context.WithTimeout(context.Background(), q.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), q.currentTimeout())
 	defer cancel()
 	defer func() {
 		if r := recover(); r != nil && q.fail != nil {
@@ -112,21 +150,52 @@ func (q *resolveQueue) execute(entry *queueEntry) {
 	entry.run(ctx)
 }
 
-// position reports how many jobs are ahead of jobID. A running job (or one not
-// in the queue at all) reports 0; the head of the queue reports 1 while another
-// job is running, since that running job will finish first.
+// setConcurrency changes the number of parallel slots live. Raising it wakes the
+// dispatcher so queued jobs can start immediately; lowering it just means no new
+// jobs start until the running set drains below the new limit.
+func (q *resolveQueue) setConcurrency(n int) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.concurrency = clampConcurrency(n)
+	q.cond.Broadcast()
+	return q.concurrency
+}
+
+// concurrencyValue reports the current parallel-slot limit.
+func (q *resolveQueue) concurrencyValue() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.concurrency
+}
+
+// currentTimeout returns the per-job budget for the current mode: the shorter
+// serial budget when running one at a time, the longer parallel budget
+// otherwise.
+func (q *resolveQueue) currentTimeout() time.Duration {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.concurrency > 1 {
+		return q.parallelTimeout
+	}
+	return q.serialTimeout
+}
+
+// position reports how many jobs must finish before jobID starts. A running job
+// (or one not in the queue at all) reports 0. For a queued job at index i with R
+// jobs running and a limit of C, that is max(0, i + R - C + 1): it generalizes
+// the serial case (C == 1) where the head reports 1 while another job runs.
 func (q *resolveQueue) position(jobID string) int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if q.current == jobID {
+	if q.running[jobID] {
 		return 0
 	}
 	for i, e := range q.entries {
 		if e.jobID == jobID {
-			ahead := i
-			if q.current != "" {
-				ahead++
+			ahead := i + len(q.running) - q.concurrency + 1
+			if ahead < 0 {
+				ahead = 0
 			}
 			return ahead
 		}
@@ -141,11 +210,18 @@ func (q *resolveQueue) waiting() int {
 	return len(q.entries)
 }
 
-// active reports whether a job currently holds the resolution slot.
+// active reports whether any job currently holds a resolution slot.
 func (q *resolveQueue) active() bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.current != ""
+	return len(q.running) > 0
+}
+
+// runningCount is how many jobs currently hold a slot.
+func (q *resolveQueue) runningCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.running)
 }
 
 // queuedIDs returns the waiting job IDs in dispatch order. Used by tests.

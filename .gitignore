@@ -1,9 +1,11 @@
 .ref/
 .openteams/
 .playwright-cli/
+.claude/
 data/
 logs/
 output/
 .env
 *.exe
 *.out
+test-with-auth.sh

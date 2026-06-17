@@ -5,6 +5,7 @@ const cdkInput = document.getElementById('cdkInput');
 const cdkSubmit = document.getElementById('cdkSubmit');
 const cdkError = document.getElementById('cdkError');
 
+const cdkCodeLabel = document.getElementById('cdkCodeLabel');
 const cdkRemainingPill = document.getElementById('cdkRemainingPill');
 const cdkDaysPill = document.getElementById('cdkDaysPill');
 const queuePill = document.getElementById('queuePill');
@@ -17,26 +18,30 @@ const submitButton = document.getElementById('submitButton');
 const jobBadge = document.getElementById('jobBadge');
 const jobMessage = document.getElementById('jobMessage');
 const jobError = document.getElementById('jobError');
+
 const selectionPanel = document.getElementById('selectionPanel');
 const selectionHint = document.getElementById('selectionHint');
-const selectionList = document.getElementById('selectionList');
+const selectionTree = document.getElementById('selectionTree');
+const selectAll = document.getElementById('selectAll');
+const selectionSummary = document.getElementById('selectionSummary');
+const generateButton = document.getElementById('generateButton');
+
 const resultPanel = document.getElementById('resultPanel');
-const resultMode = document.getElementById('resultMode');
-const resultName = document.getElementById('resultName');
-const resultPath = document.getElementById('resultPath');
-const resultSize = document.getElementById('resultSize');
-const resultExpire = document.getElementById('resultExpire');
-const directOpen = document.getElementById('directOpen');
-const directCopy = document.getElementById('directCopy');
-const directValue = document.getElementById('directValue');
-const proxyOpen = document.getElementById('proxyOpen');
-const proxyCopy = document.getElementById('proxyCopy');
-const proxyValue = document.getElementById('proxyValue');
+const resultCount = document.getElementById('resultCount');
+const resultList = document.getElementById('resultList');
 
 let currentJobId = null;
 let pollTimer = null;
 let statusTimer = null;
 let resolveBusy = false;
+
+// Selection state for the current selection_required job. checkboxByItemId maps
+// a file's item id to its <input> so select-all and tristate folders can drive
+// them; selectionStage distinguishes source (single transfer pick) from result
+// (multi-file) selection.
+let checkboxByItemId = new Map();
+let selectionStage = '';
+let selectionJobId = null;
 
 boot();
 
@@ -44,25 +49,24 @@ async function boot() {
   cdkForm.addEventListener('submit', onCdkSubmit);
   logoutButton.addEventListener('click', onLogout);
   resolveForm.addEventListener('submit', onResolveSubmit);
-  directCopy.addEventListener('click', () => copyText(directValue.value, directCopy));
-  proxyCopy.addEventListener('click', () => copyText(proxyValue.value, proxyCopy));
+  selectAll.addEventListener('change', onSelectAll);
+  generateButton.addEventListener('click', onGenerate);
 
   const presetCode = new URLSearchParams(location.search).get('code');
   if (presetCode) {
+    // A code in the URL wins over any existing session cookie: logging in
+    // rebinds the cookie to this code, so the header reflects the CDK from the
+    // link rather than whoever logged in last on this browser.
     cdkInput.value = presetCode.trim().toUpperCase();
+    cdkForm.requestSubmit();
+    return;
   }
 
   try {
     const status = await api('/api/u/status');
     enterApp(status);
-    return;
   } catch {
     showGate();
-  }
-
-  // Auto-submit when arriving via a share link that carries a code.
-  if (presetCode) {
-    cdkForm.requestSubmit();
   }
 }
 
@@ -70,33 +74,41 @@ function showGate() {
   stopStatusPolling();
   appView.classList.add('hidden');
   gateView.classList.remove('hidden');
+  playViewEnter(gateView);
   cdkInput.focus();
 }
 
 function enterApp(status) {
   gateView.classList.add('hidden');
   appView.classList.remove('hidden');
+  playViewEnter(appView);
   renderStatus(status);
   startStatusPolling();
 }
 
+// playViewEnter restarts the entrance animation each time a view is shown.
+function playViewEnter(el) {
+  el.classList.remove('view-enter');
+  void el.offsetWidth;
+  el.classList.add('view-enter');
+}
+
 function renderStatus(status) {
   if (!status) return;
-  cdkRemainingPill.textContent = `剩余 ${status.remaining} 次`;
-  cdkRemainingPill.className = `status-pill ${status.remaining > 0 ? 'success' : 'danger'}`;
+  if (status.code) cdkCodeLabel.textContent = status.code;
+  cdkRemainingPill.textContent = `剩余 ${status.remaining_label || formatBytes(status.remaining_bytes)}`;
+  cdkRemainingPill.className = `status-pill ${status.remaining_bytes > 0 ? 'success' : 'danger'}`;
   cdkDaysPill.textContent = status.expired ? '已过期' : `到期 ${status.days_left} 天`;
   cdkDaysPill.className = `status-pill ${status.expired ? 'danger' : 'neutral'}`;
   renderQueue(status.queue);
 
-  const usable = status.remaining > 0 && !status.expired;
+  const usable = status.remaining_bytes > 0 && !status.expired;
   resourceInput.disabled = !usable;
   passCodeInput.disabled = !usable;
   submitButton.disabled = !usable || resolveBusy;
   setButtonLabel(submitButton, resolveBusy ? '处理中...' : usable ? '开始解析' : '次数已用完或已过期');
 }
 
-// renderQueue reflects the global resolution queue on the header pill so a user
-// can see how busy the system is before and after submitting.
 function renderQueue(queue) {
   if (!queuePill) return;
   if (!queue) {
@@ -250,95 +262,371 @@ function renderJob(job) {
     renderSelection(job);
   } else {
     selectionPanel.classList.add('hidden');
-    selectionList.innerHTML = '';
   }
 
-  if (job.result) {
-    renderResult(job);
+  const results = job.results && job.results.length ? job.results : (job.result ? [job.result] : []);
+  if (results.length) {
+    renderResults(job, results);
   } else {
     resultPanel.classList.add('hidden');
   }
 }
 
+// renderSelection builds a folder tree from the flat item list (paths like
+// "图集/foo.mkv") with tristate folder checkboxes and a select-all. Source
+// selection only allows one item, so it falls back to single-pick buttons.
 function renderSelection(job) {
+  if (selectionJobId === job.id && selectionStage === job.stage) {
+    // Already rendered for this job/stage; don't rebuild and wipe the user's
+    // checkbox state on every poll.
+    return;
+  }
+  selectionJobId = job.id;
+  selectionStage = job.stage;
   selectionPanel.classList.remove('hidden');
-  selectionHint.textContent = job.stage === 'source_selection' ? '先选择要转存的项目' : '选择最终生成链接的文件';
-  selectionList.innerHTML = '';
+  checkboxByItemId = new Map();
+  selectionTree.innerHTML = '';
 
-  for (const item of job.items || []) {
-    const row = document.createElement('article');
-    row.className = 'selection-item neutral';
+  const items = job.items || [];
+  const single = job.stage === 'source_selection';
+  selectionHint.textContent = single ? '该分享含多个项目，请选择要转存的一项' : '勾选需要生成下载链接的文件，可多选';
 
-    const info = document.createElement('div');
-    info.className = 'selection-info';
-    const title = document.createElement('strong');
-    title.textContent = item.name || '未命名项目';
-    info.appendChild(title);
-    const meta = document.createElement('div');
-    meta.className = 'muted';
-    const kind = item.kind && item.kind.toLowerCase().includes('folder') ? '文件夹' : '文件';
-    meta.textContent = [item.path || item.name, kind, formatBytes(item.size)].filter(Boolean).join(' · ');
-    info.appendChild(meta);
+  // Select-all / summary / generate button are only meaningful for multi-select.
+  selectAll.closest('.tree-toolbar').classList.toggle('hidden', single);
+  generateButton.parentElement.classList.toggle('hidden', single);
 
+  const root = buildTree(items);
+  for (const node of root.children) {
+    selectionTree.appendChild(renderNode(node, single));
+  }
+  selectAll.checked = false;
+  selectAll.indeterminate = false;
+  updateSelectionSummary();
+}
+
+// buildTree turns flat {id,name,path,kind,size} items into a nested folder
+// structure. Folders are inferred from "/"-separated paths.
+function buildTree(items) {
+  const root = { name: '', children: [], childMap: new Map() };
+  for (const item of items) {
+    const parts = (item.path || item.name || '').split('/').filter(Boolean);
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const seg = parts[i];
+      let next = node.childMap.get(seg);
+      if (!next) {
+        next = { name: seg, children: [], childMap: new Map(), isFolder: true };
+        node.childMap.set(seg, next);
+        node.children.push(next);
+      }
+      node = next;
+    }
+    const leafName = parts.length ? parts[parts.length - 1] : (item.name || '未命名');
+    const leaf = { name: leafName, item, children: [], childMap: new Map(), isFolder: false };
+    node.childMap.set(leafName + ':' + item.id, leaf);
+    node.children.push(leaf);
+  }
+  return root;
+}
+
+function renderNode(node, single) {
+  if (node.isFolder) {
+    const wrap = document.createElement('div');
+    wrap.className = 'tree-folder';
+
+    const row = document.createElement('div');
+    row.className = 'tree-row tree-folder-row';
+
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'tree-toggle';
+    toggle.innerHTML = '<svg class="ui-icon"><use href="#icon-chevron"></use></svg>';
+
+    const childrenWrap = document.createElement('div');
+    childrenWrap.className = 'tree-children';
+    const childrenInner = document.createElement('div');
+    childrenInner.className = 'tree-children-inner';
+    childrenWrap.appendChild(childrenInner);
+
+    let open = true;
+    toggle.addEventListener('click', () => {
+      open = !open;
+      childrenWrap.classList.toggle('collapsed', !open);
+      toggle.classList.toggle('collapsed', !open);
+    });
+
+    const label = document.createElement('span');
+    label.className = 'tree-label';
+    label.innerHTML = '<svg class="ui-icon tree-folder-icon"><use href="#icon-folder"></use></svg>';
+    const folderName = document.createElement('span');
+    folderName.textContent = node.name;
+    label.appendChild(folderName);
+
+    row.appendChild(toggle);
+    if (!single) {
+      const folderCheck = document.createElement('input');
+      folderCheck.type = 'checkbox';
+      folderCheck.className = 'tree-checkbox';
+      folderCheck.addEventListener('change', () => {
+        popCheckbox(folderCheck);
+        setSubtreeChecked(node, folderCheck.checked);
+        refreshFolderStates();
+        updateSelectionSummary();
+      });
+      node._folderCheck = folderCheck;
+      row.appendChild(folderCheck);
+    }
+    row.appendChild(label);
+    wrap.appendChild(row);
+
+    for (const child of node.children) {
+      childrenInner.appendChild(renderNode(child, single));
+    }
+    wrap.appendChild(childrenWrap);
+    return wrap;
+  }
+
+  // Leaf file row.
+  const row = document.createElement('div');
+  row.className = 'tree-row tree-file-row';
+  const label = document.createElement('label');
+  label.className = 'tree-label tree-file-label';
+
+  if (single) {
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = 'secondary';
-    button.textContent = job.stage === 'source_selection' ? '转存这一项' : '生成链接';
-    button.addEventListener('click', () => chooseItem(job.id, item.id, button));
-
-    row.appendChild(info);
+    button.className = 'secondary compact';
+    setButtonLabel(button, '转存这一项');
+    button.addEventListener('click', () => chooseSingle(selectionJobId, node.item.id, button));
+    const meta = document.createElement('span');
+    meta.className = 'tree-file-meta';
+    meta.textContent = formatBytes(node.item.size);
+    label.innerHTML = '<svg class="ui-icon tree-file-icon"><use href="#icon-file"></use></svg>';
+    const name = document.createElement('span');
+    name.className = 'tree-file-name';
+    name.textContent = node.name;
+    label.appendChild(name);
+    row.appendChild(label);
+    row.appendChild(meta);
     row.appendChild(button);
-    selectionList.appendChild(row);
+    return row;
+  }
+
+  const check = document.createElement('input');
+  check.type = 'checkbox';
+  check.className = 'tree-checkbox';
+  check.addEventListener('change', () => {
+    popCheckbox(check);
+    refreshFolderStates();
+    updateSelectionSummary();
+  });
+  checkboxByItemId.set(node.item.id, check);
+
+  label.innerHTML = '<svg class="ui-icon tree-file-icon"><use href="#icon-file"></use></svg>';
+  const name = document.createElement('span');
+  name.className = 'tree-file-name';
+  name.textContent = node.name;
+  label.appendChild(name);
+
+  const meta = document.createElement('span');
+  meta.className = 'tree-file-meta';
+  meta.textContent = formatBytes(node.item.size);
+
+  row.appendChild(check);
+  row.appendChild(label);
+  row.appendChild(meta);
+  return row;
+}
+
+// popCheckbox replays the brief scale animation each time a box is toggled.
+function popCheckbox(box) {
+  box.classList.remove('pop');
+  void box.offsetWidth;
+  box.classList.add('pop');
+}
+
+function setSubtreeChecked(node, checked) {
+  for (const child of node.children) {
+    if (child.isFolder) {
+      setSubtreeChecked(child, checked);    } else {
+      const cb = checkboxByItemId.get(child.item.id);
+      if (cb) cb.checked = checked;
+    }
   }
 }
 
-async function chooseItem(jobId, itemId, button) {
+// refreshFolderStates recomputes every folder checkbox's checked/indeterminate
+// flag from its descendant files, plus the master select-all.
+function refreshFolderStates() {
+  const folders = selectionTree.querySelectorAll('.tree-folder');
+  // Walk deepest-first isn't required since we read leaf checkboxes directly.
+  folders.forEach((el) => {
+    const checks = el.querySelectorAll('.tree-file-row .tree-checkbox');
+    const folderCheck = el.querySelector(':scope > .tree-folder-row .tree-checkbox');
+    if (!folderCheck) return;
+    let total = 0;
+    let on = 0;
+    checks.forEach((c) => { total += 1; if (c.checked) on += 1; });
+    folderCheck.checked = total > 0 && on === total;
+    folderCheck.indeterminate = on > 0 && on < total;
+  });
+
+  const all = [...checkboxByItemId.values()];
+  const on = all.filter((c) => c.checked).length;
+  selectAll.checked = all.length > 0 && on === all.length;
+  selectAll.indeterminate = on > 0 && on < all.length;
+}
+
+function onSelectAll() {
+  for (const cb of checkboxByItemId.values()) cb.checked = selectAll.checked;
+  selectAll.indeterminate = false;
+  refreshFolderStates();
+  updateSelectionSummary();
+}
+
+function selectedItemIds() {
+  const ids = [];
+  for (const [id, cb] of checkboxByItemId) {
+    if (cb.checked) ids.push(id);
+  }
+  return ids;
+}
+
+function updateSelectionSummary() {
+  const count = selectedItemIds().length;
+  selectionSummary.textContent = `已选 ${count} 项`;
+  generateButton.disabled = count === 0;
+}
+
+async function onGenerate() {
+  const ids = selectedItemIds();
+  if (!ids.length) return;
+  generateButton.disabled = true;
+  setButtonLabel(generateButton, '生成中...');
+  try {
+    const job = await api(`/api/u/jobs/${selectionJobId}/select`, {
+      method: 'POST',
+      body: JSON.stringify({ item_ids: ids }),
+    });
+    currentJobId = job.id;
+    selectionPanel.classList.add('hidden');
+    renderJob(job);
+    setResolveBusy(true);
+    startPolling();
+  } catch (error) {
+    showError(jobError, error.message);
+    generateButton.disabled = false;
+  } finally {
+    setButtonLabel(generateButton, '生成下载链接');
+  }
+}
+
+async function chooseSingle(jobId, itemId, button) {
   button.disabled = true;
-  const original = button.textContent;
-  button.textContent = '处理中...';
+  const original = getButtonLabel(button);
+  setButtonLabel(button, '处理中...');
   try {
     const job = await api(`/api/u/jobs/${jobId}/select`, {
       method: 'POST',
-      body: JSON.stringify({ item_id: itemId }),
+      body: JSON.stringify({ item_ids: [itemId] }),
     });
     currentJobId = job.id;
+    selectionPanel.classList.add('hidden');
     renderJob(job);
+    setResolveBusy(true);
     startPolling();
   } catch (error) {
     showError(jobError, error.message);
   } finally {
     button.disabled = false;
-    button.textContent = original;
+    setButtonLabel(button, original);
   }
 }
 
-function renderResult(job) {
-  const result = job.result;
+// renderResults shows one card per resolved file, each with its direct and/or
+// proxy link. The mode the user picked decides which link is emphasized, but
+// both are shown when available.
+function renderResults(job, results) {
   resultPanel.classList.remove('hidden');
-  resultMode.textContent = job.mode === 'proxy' ? '代理优先' : '直链优先';
-  resultMode.className = `status-pill ${job.mode === 'proxy' ? 'warn' : 'success'}`;
-  resultName.textContent = result.file?.name || '-';
-  resultPath.textContent = result.file?.path || '-';
-  resultSize.textContent = formatBytes(result.file?.size);
-  resultExpire.textContent = formatDateTime(result.expires_at);
+  resultCount.textContent = `${results.length} 个文件`;
+  resultList.innerHTML = '';
 
-  directValue.value = result.direct_url || '';
-  proxyValue.value = result.proxy_url || '';
-  directOpen.href = result.direct_url || '#';
-  proxyOpen.href = result.proxy_url || '#';
-  directCopy.disabled = !result.direct_url;
-  proxyCopy.disabled = !result.proxy_url;
+  for (const result of results) {
+    const card = document.createElement('article');
+    card.className = 'result-card';
+
+    const head = document.createElement('div');
+    head.className = 'result-card-head';
+    const name = document.createElement('strong');
+    name.textContent = result.file?.name || '-';
+    head.appendChild(name);
+    const meta = document.createElement('span');
+    meta.className = 'muted';
+    meta.textContent = [result.file?.path, formatBytes(result.file?.size)].filter(Boolean).join(' · ');
+    head.appendChild(meta);
+    card.appendChild(head);
+
+    if (result.direct_url) {
+      card.appendChild(buildLinkRow('直链', 'direct', result.direct_url));
+    }
+    if (result.proxy_url) {
+      card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url));
+    }
+    resultList.appendChild(card);
+  }
 
   requestAnimationFrame(() => resultPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
+}
+
+function buildLinkRow(tagText, tagClass, url) {
+  const block = document.createElement('div');
+  block.className = 'link-block';
+
+  const row = document.createElement('div');
+  row.className = 'link-row';
+  const tag = document.createElement('span');
+  tag.className = `link-tag ${tagClass}`;
+  tag.textContent = tagText;
+  row.appendChild(tag);
+
+  const actions = document.createElement('div');
+  actions.className = 'link-actions';
+  const open = document.createElement('a');
+  open.className = 'secondary-link compact';
+  open.href = url;
+  open.target = '_blank';
+  open.rel = 'noreferrer noopener';
+  open.innerHTML = '<svg class="ui-icon"><use href="#icon-open"></use></svg>打开';
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'secondary compact';
+  copy.innerHTML = '<svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span>';
+  copy.addEventListener('click', () => copyText(url, copy));
+  actions.appendChild(open);
+  actions.appendChild(copy);
+  row.appendChild(actions);
+  block.appendChild(row);
+
+  const input = document.createElement('input');
+  input.className = 'link-input';
+  input.type = 'text';
+  input.readOnly = true;
+  input.value = url;
+  block.appendChild(input);
+  return block;
 }
 
 function clearJobUI() {
   stopPolling();
   currentJobId = null;
+  selectionJobId = null;
+  selectionStage = '';
+  checkboxByItemId = new Map();
   hide(jobError);
   selectionPanel.classList.add('hidden');
-  selectionList.innerHTML = '';
+  selectionTree.innerHTML = '';
   resultPanel.classList.add('hidden');
+  resultList.innerHTML = '';
   jobBadge.textContent = '空闲';
   jobBadge.className = 'status-pill neutral';
   jobMessage.textContent = '';
@@ -393,13 +681,6 @@ function formatBytes(raw) {
     index += 1;
   }
   return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
-}
-
-function formatDateTime(value) {
-  if (!value) return '-';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString('zh-CN', { hour12: false });
 }
 
 function setButtonLabel(button, label) {

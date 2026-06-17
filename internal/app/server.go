@@ -34,6 +34,7 @@ type Server struct {
 	updater      *updater
 	db           *sql.DB
 	cdk          *cdkStore
+	settings     *settingsStore
 	gateHTML     []byte
 	userHTML     []byte
 	mux          *http.ServeMux
@@ -66,8 +67,9 @@ type selectItemRequest struct {
 }
 
 type loginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username       string `json:"username"`
+	Password       string `json:"password"`
+	TrafficLimitGB int    `json:"traffic_limit_gb"`
 }
 
 type authLoginRequest struct {
@@ -136,6 +138,7 @@ func NewServer(cfg Config) (*Server, error) {
 		creds:        creds,
 		db:           db,
 		cdk:          newCDKStore(db),
+		settings:     newSettingsStore(db),
 		gateHTML:     gateHTML,
 		userHTML:     userHTML,
 		mux:          http.NewServeMux(),
@@ -146,9 +149,13 @@ func NewServer(cfg Config) (*Server, error) {
 		server.logJob(level, "", message, details...)
 	})
 
-	// Serialize all link resolution through a single global worker so the
-	// system only ever drives PikPak for one job at a time.
-	server.resolver = newResolveQueue(cfg.QueueTimeout, server.failJob)
+	// Meter link resolution through the resolve queue. Concurrency is admin-
+	// controllable and persisted in the settings table; the config value only
+	// seeds the initial default the first time the server runs. Concurrency > 1
+	// switches the per-job budget from the snappy serial timeout to the longer
+	// parallel one.
+	initialConcurrency := server.settings.getInt(settingKeyConcurrency, cfg.ResolveConcurrency)
+	server.resolver = newResolveQueue(cfg.QueueTimeout, cfg.ParallelTimeout, initialConcurrency, server.failJob)
 	go server.resolver.run()
 
 	server.mux.Handle("GET /app.js", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -166,6 +173,8 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("POST /api/auth/logout", server.handleAuthLogout)
 	server.mux.HandleFunc("POST /api/auth/password", server.handleChangePassword)
 	server.mux.HandleFunc("GET /api/config", server.handleConfig)
+	server.mux.HandleFunc("GET /api/settings", server.handleGetSettings)
+	server.mux.HandleFunc("PUT /api/settings", server.handleUpdateSettings)
 	server.mux.HandleFunc("GET /api/update", server.handleUpdateStatus)
 	server.mux.HandleFunc("POST /api/update/check", server.handleUpdateCheck)
 	server.mux.HandleFunc("POST /api/update/install", server.handleUpdateInstall)
@@ -173,6 +182,7 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("DELETE /api/logs", server.handleClearLogs)
 	server.mux.HandleFunc("GET /api/accounts", server.handleListAccounts)
 	server.mux.HandleFunc("POST /api/accounts", server.handleAddAccount)
+	server.mux.HandleFunc("PATCH /api/accounts/{id}", server.handleUpdateAccount)
 	server.mux.HandleFunc("DELETE /api/accounts/{id}", server.handleDeleteAccount)
 	server.mux.HandleFunc("POST /api/accounts/{id}/reset", server.handleResetAccount)
 	server.mux.HandleFunc("POST /api/jobs", server.handleCreateJob)
@@ -455,7 +465,7 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout*2)
 	defer cancel()
 
-	account, err := s.accounts.Add(ctx, req.Username, req.Password)
+	account, err := s.accounts.Add(ctx, req.Username, req.Password, int64(req.TrafficLimitGB)*bytesPerGB)
 	if err != nil {
 		lowerErr := strings.ToLower(err.Error())
 		message := friendlyPikPakError(err)
@@ -489,6 +499,29 @@ func (s *Server) handleResetAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reset"})
+}
+
+type updateAccountRequest struct {
+	TrafficLimitGB int `json:"traffic_limit_gb"`
+}
+
+// handleUpdateAccount lets an admin change an account's monthly downstream
+// traffic budget (in GB).
+func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
+	var req updateAccountRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.TrafficLimitGB < 1 {
+		writeError(w, http.StatusBadRequest, "流量额度至少为 1G")
+		return
+	}
+	if err := s.accounts.SetTrafficLimit(r.PathValue("id"), int64(req.TrafficLimitGB)*bytesPerGB); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
@@ -594,19 +627,27 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "job not found")
 		return
 	}
-	if job.Result == nil || job.Result.File.ID == "" {
+
+	// A job may carry a single result (admin path) or many (CDK-user batch). The
+	// proxy token in the URL selects which file this request is for.
+	providedToken := strings.TrimSpace(r.URL.Query().Get("token"))
+	result := job.resultForToken(providedToken)
+	if result == nil {
+		// Fall back to the single result only when it has no token of its own, so
+		// legacy single-file proxy links without a token keep working.
+		if job.Result != nil && job.Result.ProxyToken == "" {
+			result = job.Result
+		} else {
+			writeError(w, http.StatusForbidden, "invalid or missing proxy token")
+			return
+		}
+	}
+	if result.File.ID == "" {
 		writeError(w, http.StatusConflict, "job is not ready")
 		return
 	}
 
-	expectedToken := job.Result.ProxyToken
-	providedToken := strings.TrimSpace(r.URL.Query().Get("token"))
-	if expectedToken != "" && providedToken != expectedToken {
-		writeError(w, http.StatusForbidden, "invalid or missing proxy token")
-		return
-	}
-
-	sourceURL := strings.TrimSpace(job.Result.DirectURL)
+	sourceURL := strings.TrimSpace(result.DirectURL)
 	if sourceURL == "" {
 		if job.AccountID == "" {
 			writeError(w, http.StatusConflict, "job account is missing")
@@ -621,7 +662,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
 		defer cancel()
 
-		file, err := account.Client.GetFile(ctx, job.Result.File.ID)
+		file, err := account.Client.GetFile(ctx, result.File.ID)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
@@ -667,8 +708,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	} {
 		copyHeaderIfPresent(w.Header(), resp.Header, key)
 	}
-	if w.Header().Get("Content-Disposition") == "" && job.Result.File.Name != "" {
-		w.Header().Set("Content-Disposition", buildContentDisposition(job.Result.File.Name))
+	if w.Header().Get("Content-Disposition") == "" && result.File.Name != "" {
+		w.Header().Set("Content-Disposition", buildContentDisposition(result.File.Name))
 	}
 
 	w.WriteHeader(resp.StatusCode)
@@ -679,7 +720,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) processJob(ctx context.Context, jobID string) {
-	accounts := s.accounts.Snapshot()
+	// In parallel mode, try accounts in a rotating order so concurrent jobs fan
+	// out across the pool instead of all starting on the first account.
+	rotate := s.resolver.concurrencyValue() > 1
+	accounts := s.accounts.ResolveOrder(rotate)
 	if len(accounts) == 0 {
 		s.logJob(LogError, jobID, "没有可用的 PikPak 账号")
 		s.failJob(jobID, errors.New("no PikPak accounts are available"))
@@ -706,6 +750,18 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 			return
 		}
 
+		// A CDK traffic overdraw is deterministic and not the account's fault:
+		// retrying on other accounts would just repeat the expensive transfer and
+		// hit the same refusal. Fail the job terminally instead.
+		var overdraw errCDKOverdraw
+		if errors.As(err, &overdraw) {
+			s.accounts.MarkAvailable(account.ID)
+			s.finishAccountAttempt(jobID, account.ID, "failed", overdraw.Error())
+			s.logJob(LogWarn, jobID, "文件大小超过 CDK 剩余流量，已拒绝", overdraw.Error())
+			s.failJob(jobID, overdraw)
+			return
+		}
+
 		// A global-budget timeout (or cancellation) is not the account's fault,
 		// so don't mark it failed — just stop and let the next job run.
 		if ctx.Err() != nil {
@@ -720,8 +776,9 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 	}
 
 	if ctx.Err() != nil {
-		s.logJob(LogError, jobID, "解析超时，已自动跳过", "上限："+s.resolver.timeout.String())
-		s.failJob(jobID, fmt.Errorf("解析超时：%s 内未完成", s.resolver.timeout))
+		budget := s.resolver.currentTimeout()
+		s.logJob(LogError, jobID, "解析超时，已自动跳过", "上限："+budget.String())
+		s.failJob(jobID, fmt.Errorf("解析超时：%s 内未完成", budget))
 		return
 	}
 
@@ -839,7 +896,29 @@ func (s *Server) finishWithItems(ctx context.Context, jobID string, account Acco
 		s.logJob(LogWarn, jobID, fmt.Sprintf("检测到 %d 个可用文件，需要选择目标文件", len(items)), sampleItemDetail(items))
 		return s.requestSelection(jobID, StageResultSelection, "choose which file should become the final link", items, account.ID)
 	}
+	if err := s.cdkOverdrawError(jobID, items[0]); err != nil {
+		return err
+	}
 	return s.completeJob(ctx, jobID, account, items[0])
+}
+
+// cdkOverdrawError returns a typed error when a CDK job's resolved file is
+// larger than the CDK's remaining traffic. Non-CDK jobs and lookups that fail
+// never block (the charge step still clamps at zero as a backstop).
+func (s *Server) cdkOverdrawError(jobID string, item DownloadItem) error {
+	cdkCode := mustJob(s.jobs.get(jobID)).CDKCode
+	if cdkCode == "" {
+		return nil
+	}
+	size := parseBytes(item.Size)
+	c, ok, err := s.cdk.get(cdkCode)
+	if err != nil || !ok {
+		return nil
+	}
+	if size > c.RemainingBytes {
+		return errCDKOverdraw{size: size, remaining: c.RemainingBytes}
+	}
+	return nil
 }
 
 func (s *Server) requestSelection(jobID string, stage JobStage, message string, items []DownloadItem, accountID string) error {
@@ -872,32 +951,26 @@ func (s *Server) resolveExistingFile(ctx context.Context, jobID string, item Dow
 	}
 }
 
+// resolveExistingFiles is the multi-select counterpart of resolveExistingFile:
+// it resolves a fresh link for each chosen file and stores them as Job.Results.
+func (s *Server) resolveExistingFiles(ctx context.Context, jobID string, items []DownloadItem) {
+	job := mustJob(s.jobs.get(jobID))
+	account, ok := s.accounts.Get(job.AccountID)
+	if !ok {
+		s.failJob(jobID, errors.New("job account is no longer available"))
+		return
+	}
+
+	if err := s.completeJobBatch(ctx, jobID, account, items); err != nil {
+		s.accounts.MarkFailed(account.ID, err)
+		s.failJob(jobID, err)
+	}
+}
+
 func (s *Server) completeJob(ctx context.Context, jobID string, account AccountRuntime, item DownloadItem) error {
-	s.updateJobState(jobID, JobRunning, StageTransfer, "requesting a fresh direct link", "")
-	s.logJob(LogInfo, jobID, "开始解析所选文件的下载链接 ...", itemLogDetails(item)...)
-	file, err := account.Client.GetFile(ctx, item.ID)
+	result, err := s.resolveFileLink(ctx, jobID, account, item)
 	if err != nil {
 		return err
-	}
-
-	directURL := file.BestDownloadURL()
-	if directURL == "" {
-		return errors.New("PikPak returned an empty download URL")
-	}
-	s.logJob(LogSuccess, jobID, "直链获取成功", itemLogDetails(item)...)
-
-	item.MimeType = firstNonEmpty(item.MimeType, file.MimeType)
-	item.Size = firstNonEmpty(item.Size, file.Size)
-
-	proxyToken := newJobID()
-	result := &JobResult{
-		File:       item,
-		DirectURL:  directURL,
-		ProxyURL:   strings.TrimRight(mustJob(s.jobs.get(jobID)).BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken,
-		ProxyToken: proxyToken,
-	}
-	if expiresAt := file.ExpireAt(); !expiresAt.IsZero() {
-		result.ExpiresAt = expiresAt.Format(time.RFC3339)
 	}
 
 	s.updateJobState(jobID, JobRunning, StageTransfer, "cleaning temporary PikPak files", "")
@@ -918,7 +991,94 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 		return nil
 	})
 	if err == nil {
-		s.logJob(LogSuccess, jobID, "解析任务完成", "文件："+firstNonEmpty(item.Name, item.Path))
+		s.logJob(LogSuccess, jobID, "解析任务完成", "文件："+firstNonEmpty(result.File.Name, result.File.Path))
+		// The direct link has now been delivered, so the resource's size counts
+		// against this account's monthly downstream budget (and the CDK's traffic
+		// allowance, when the job came from a CDK user).
+		size := parseBytes(result.File.Size)
+		s.accounts.AddTraffic(account.ID, size)
+		if cdkCode := mustJob(s.jobs.get(jobID)).CDKCode; cdkCode != "" {
+			_ = s.cdk.charge(cdkCode, size)
+		}
+		s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(size))
+	}
+	return err
+}
+
+// resolveFileLink fetches a fresh direct link for a single already-transferred
+// file and builds its JobResult (direct + proxy URL). It performs no job-state
+// mutation, cleanup, or traffic charging, so it can back both the single-file
+// completeJob and the multi-file batch path.
+func (s *Server) resolveFileLink(ctx context.Context, jobID string, account AccountRuntime, item DownloadItem) (*JobResult, error) {
+	s.updateJobState(jobID, JobRunning, StageTransfer, "requesting a fresh direct link", "")
+	s.logJob(LogInfo, jobID, "开始解析所选文件的下载链接 ...", itemLogDetails(item)...)
+	file, err := account.Client.GetFile(ctx, item.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	directURL := file.BestDownloadURL()
+	if directURL == "" {
+		return nil, errors.New("PikPak returned an empty download URL")
+	}
+	s.logJob(LogSuccess, jobID, "直链获取成功", itemLogDetails(item)...)
+
+	item.MimeType = firstNonEmpty(item.MimeType, file.MimeType)
+	item.Size = firstNonEmpty(item.Size, file.Size)
+
+	proxyToken := newJobID()
+	result := &JobResult{
+		File:       item,
+		DirectURL:  directURL,
+		ProxyURL:   strings.TrimRight(mustJob(s.jobs.get(jobID)).BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken,
+		ProxyToken: proxyToken,
+	}
+	if expiresAt := file.ExpireAt(); !expiresAt.IsZero() {
+		result.ExpiresAt = expiresAt.Format(time.RFC3339)
+	}
+	return result, nil
+}
+
+// completeJobBatch resolves a direct link for each selected file, accumulates
+// them into Job.Results, cleans up once, and charges the CDK the summed size.
+// It backs the CDK-user multi-select flow. A single GetFile failure aborts the
+// whole batch (the job fails) rather than delivering a partial set.
+func (s *Server) completeJobBatch(ctx context.Context, jobID string, account AccountRuntime, items []DownloadItem) error {
+	results := make([]JobResult, 0, len(items))
+	var totalSize int64
+	for _, item := range items {
+		result, err := s.resolveFileLink(ctx, jobID, account, item)
+		if err != nil {
+			return err
+		}
+		results = append(results, *result)
+		totalSize += parseBytes(result.File.Size)
+	}
+
+	s.updateJobState(jobID, JobRunning, StageTransfer, "cleaning temporary PikPak files", "")
+	s.logJob(LogInfo, jobID, "开始清理 PikPak 临时文件 ...")
+	if err := s.cleanupJobFiles(ctx, jobID, account, ""); err != nil {
+		return fmt.Errorf("direct links were created, but cleanup failed: %w", err)
+	}
+	s.logJob(LogSuccess, jobID, "PikPak 临时文件已清理")
+
+	_, err := s.jobs.update(jobID, func(job *Job) error {
+		job.Status = JobCompleted
+		job.Stage = StageComplete
+		job.Message = "ready"
+		job.Error = ""
+		job.Items = nil
+		job.AccountID = account.ID
+		job.Results = results
+		return nil
+	})
+	if err == nil {
+		s.logJob(LogSuccess, jobID, fmt.Sprintf("解析任务完成，共 %d 个文件", len(results)))
+		s.accounts.AddTraffic(account.ID, totalSize)
+		if cdkCode := mustJob(s.jobs.get(jobID)).CDKCode; cdkCode != "" {
+			_ = s.cdk.charge(cdkCode, totalSize)
+		}
+		s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(totalSize))
 	}
 	return err
 }
@@ -1149,11 +1309,6 @@ func (s *Server) updateJobState(jobID string, status JobStatus, stage JobStage, 
 
 func (s *Server) failJob(jobID string, err error) {
 	s.updateJobState(jobID, JobFailed, StageFailed, "", err.Error())
-	// A CDK-originated parse only "costs" a credit when it succeeds, so refund
-	// the reservation made at submit time.
-	if job, ok := s.jobs.get(jobID); ok && job.CDKCode != "" {
-		_ = s.cdk.refund(job.CDKCode)
-	}
 }
 
 func (s *Server) baseURL(r *http.Request) string {
@@ -1205,9 +1360,12 @@ func (s *Server) authStatusResponse(authenticated bool) configResponse {
 	failed := 0
 	available := 0
 	for _, account := range accounts {
-		if account.Status == AccountFailed {
+		switch {
+		case account.Status == AccountFailed:
 			failed++
-		} else {
+		case account.TrafficLimited:
+			// Counted as neither available nor failed: it's a temporary monthly cap.
+		default:
 			available++
 		}
 	}
@@ -1221,6 +1379,16 @@ func (s *Server) authStatusResponse(authenticated bool) configResponse {
 		Authenticated:         authenticated,
 		PasswordFixed:         s.config.HasFixedPassword(),
 	}
+}
+
+// parseBytes parses a byte-count string (as PikPak reports file sizes). Empty or
+// malformed values yield 0, so a missing size simply counts as no traffic.
+func parseBytes(s string) int64 {
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 func serveEmbeddedFile(w http.ResponseWriter, _ *http.Request, files fs.FS, name, contentType string) {

@@ -7,7 +7,8 @@ const logoutButton = document.getElementById('logoutButton');
 const metricAccountCount = document.getElementById('metricAccountCount');
 const metricAvailableCount = document.getElementById('metricAvailableCount');
 const metricFailedCount = document.getElementById('metricFailedCount');
-const metricRootFolder = document.getElementById('metricRootFolder');
+const metricRunningCount = document.getElementById('metricRunningCount');
+const metricWaitingCount = document.getElementById('metricWaitingCount');
 
 const resolveForm = document.getElementById('resolveForm');
 const resourceInput = document.getElementById('resourceInput');
@@ -40,6 +41,7 @@ const proxyValue = document.getElementById('proxyValue');
 const accountForm = document.getElementById('accountForm');
 const accountUsername = document.getElementById('accountUsername');
 const accountPassword = document.getElementById('accountPassword');
+const accountTrafficLimit = document.getElementById('accountTrafficLimit');
 const accountSubmitButton = document.getElementById('accountSubmitButton');
 const accountFormError = document.getElementById('accountFormError');
 const accountList = document.getElementById('accountList');
@@ -51,6 +53,12 @@ const confirmPassword = document.getElementById('confirmPassword');
 const passwordSubmitButton = document.getElementById('passwordSubmitButton');
 const passwordFormError = document.getElementById('passwordFormError');
 const passwordFixedNote = document.getElementById('passwordFixedNote');
+
+const concurrencyForm = document.getElementById('concurrencyForm');
+const concurrencyInput = document.getElementById('concurrencyInput');
+const concurrencyState = document.getElementById('concurrencyState');
+const concurrencySubmitButton = document.getElementById('concurrencySubmitButton');
+const concurrencyFormError = document.getElementById('concurrencyFormError');
 
 const clearLogsButton = document.getElementById('clearLogsButton');
 const logList = document.getElementById('logList');
@@ -95,11 +103,13 @@ const state = {
   authenticated: false,
   update: null,
   cdks: [],
+  queue: { running: 0, waiting: 0 },
 };
 
 let currentJobId = null;
 let pollTimer = null;
 let logPollTimer = null;
+let queuePollTimer = null;
 let updatePollTimer = null;
 let updateStatusTimer = null;
 let updateRestartPending = false;
@@ -128,6 +138,7 @@ function bindActions() {
   resolveForm.addEventListener('submit', onResolveSubmit);
   accountForm.addEventListener('submit', onAccountSubmit);
   passwordForm.addEventListener('submit', onChangePassword);
+  concurrencyForm?.addEventListener('submit', onSaveConcurrency);
   logoutButton?.addEventListener('click', onLogout);
   clearLogsButton.addEventListener('click', clearLogs);
   checkUpdateButton.addEventListener('click', onCheckUpdate);
@@ -165,6 +176,9 @@ function showPage(page) {
   if (page === 'cdk') {
     fetchCDKs();
   }
+  if (page === 'settings') {
+    fetchSettings();
+  }
 }
 
 async function refreshAppState() {
@@ -187,6 +201,7 @@ async function refreshAppState() {
     renderAvailability();
     renderAuthUI();
     ensureLogPolling();
+    ensureQueuePolling();
   } catch (error) {
     if (error.message.includes('authentication required')) {
       redirectToGate();
@@ -204,7 +219,7 @@ function renderMetrics() {
   animateCount(metricAccountCount, total);
   animateCount(metricAvailableCount, available);
   animateCount(metricFailedCount, failed);
-  metricRootFolder.textContent = state.config?.root_folder || '-';
+  renderQueueMetrics();
 
   if (total === 0) {
     resolveHint.textContent = '请先添加账号';
@@ -215,6 +230,42 @@ function renderMetrics() {
   } else {
     resolveHint.textContent = `${available}/${total} 个可用`;
     resolveHint.className = 'status-pill success';
+  }
+}
+
+// renderQueueMetrics paints the live resolution counters (running / waiting) in
+// the global status bar. The data is kept fresh by ensureQueuePolling.
+function renderQueueMetrics() {
+  animateCount(metricRunningCount, Number(state.queue?.running) || 0);
+  animateCount(metricWaitingCount, Number(state.queue?.waiting) || 0);
+}
+
+async function fetchQueueMetrics() {
+  try {
+    const settings = await api('/api/settings');
+    state.queue = { running: settings.running || 0, waiting: settings.waiting || 0 };
+    renderQueueMetrics();
+  } catch {
+    // Transient errors (e.g. a momentary 401 during logout) just skip a tick.
+  }
+}
+
+function startQueuePolling() {
+  stopQueuePolling();
+  fetchQueueMetrics();
+  queuePollTimer = window.setInterval(fetchQueueMetrics, 3000);
+}
+
+function ensureQueuePolling() {
+  if (queuePollTimer === null) {
+    startQueuePolling();
+  }
+}
+
+function stopQueuePolling() {
+  if (queuePollTimer !== null) {
+    window.clearInterval(queuePollTimer);
+    queuePollTimer = null;
   }
 }
 
@@ -229,8 +280,9 @@ function renderAccounts() {
 
   accountList.className = 'account-list';
   for (const account of state.accounts) {
+    const cardTone = account.status === 'failed' ? 'danger' : (account.traffic_limited ? 'warn' : 'success');
     const card = document.createElement('article');
-    card.className = `account-card ${account.status === 'failed' ? 'danger' : 'success'}`;
+    card.className = `account-card ${cardTone}`;
 
     const main = document.createElement('div');
     main.className = 'account-main';
@@ -256,6 +308,12 @@ function renderAccounts() {
       heading.appendChild(createStatusPill(`到期 ${premiumUntil}`, 'neutral', true));
     }
 
+    heading.appendChild(createStatusPill(
+      `本月下行 ${formatBytes(account.traffic_used)} / ${formatBytes(account.traffic_limit)}`,
+      account.traffic_limited ? 'warn' : 'neutral',
+      true,
+    ));
+
     text.appendChild(heading);
 
     const meta = document.createElement('div');
@@ -274,7 +332,24 @@ function renderAccounts() {
 
     const side = document.createElement('div');
     side.className = 'account-side';
-    side.appendChild(createStatusPill(account.status === 'failed' ? '失败' : '可用', account.status === 'failed' ? 'danger' : 'success'));
+    const [statusLabel, statusTone] = account.status === 'failed'
+      ? ['失败', 'danger']
+      : (account.traffic_limited ? ['到达限行流量', 'warn'] : ['可用', 'success']);
+    side.appendChild(createStatusPill(statusLabel, statusTone));
+
+    // Inline editor for the monthly traffic limit (in GB).
+    const limitEdit = document.createElement('div');
+    limitEdit.className = 'mini-actions';
+    const limitGB = Math.max(1, Math.round((Number(account.traffic_limit) || 0) / (1024 ** 3)));
+    const limitField = cdkNumberField('上限GB', limitGB, 1);
+    const saveLimitButton = document.createElement('button');
+    saveLimitButton.type = 'button';
+    saveLimitButton.className = 'secondary compact';
+    setButtonContent(saveLimitButton, '改额度', 'check');
+    saveLimitButton.addEventListener('click', () => saveAccountLimit(account.id, Number(limitField.input.value), saveLimitButton));
+    limitEdit.appendChild(limitField.wrap);
+    limitEdit.appendChild(saveLimitButton);
+    side.appendChild(limitEdit);
 
     const actions = document.createElement('div');
     actions.className = 'mini-actions';
@@ -387,6 +462,79 @@ function hidePasswordError() {
   passwordFormError.classList.add('hidden');
 }
 
+function renderSettings(settings) {
+  if (!settings) return;
+  if (document.activeElement !== concurrencyInput) {
+    concurrencyInput.value = settings.concurrency;
+  }
+  concurrencyInput.max = settings.max_concurrency || 32;
+  const timeout = settings.parallel ? settings.parallel_timeout_seconds : settings.serial_timeout_seconds;
+  const mode = settings.parallel ? `并行 ×${settings.concurrency}` : '串行';
+  concurrencyState.textContent = `${mode} · 单任务超时 ${formatSeconds(timeout)}`;
+  // Keep the global status-bar counters in sync with whatever this response saw.
+  state.queue = { running: settings.running || 0, waiting: settings.waiting || 0 };
+  renderQueueMetrics();
+}
+
+function formatSeconds(seconds) {
+  const s = Number(seconds) || 0;
+  if (s % 60 === 0) return `${s / 60} 分钟`;
+  if (s < 60) return `${s} 秒`;
+  return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+}
+
+async function fetchSettings() {
+  hideConcurrencyError();
+  try {
+    const settings = await api('/api/settings');
+    renderSettings(settings);
+  } catch (error) {
+    showConcurrencyError(error.message);
+  }
+}
+
+async function onSaveConcurrency(event) {
+  event.preventDefault();
+  hideConcurrencyError();
+
+  const value = Number(concurrencyInput.value);
+  const max = Number(concurrencyInput.max) || 32;
+  if (!Number.isInteger(value) || value < 1) {
+    showConcurrencyError('并发数至少为 1');
+    return;
+  }
+  if (value > max) {
+    showConcurrencyError(`并发数最多为 ${max}`);
+    return;
+  }
+
+  concurrencySubmitButton.disabled = true;
+  setButtonLabel(concurrencySubmitButton, '保存中...');
+  try {
+    const settings = await api('/api/settings', {
+      method: 'PUT',
+      body: JSON.stringify({ concurrency: value }),
+    });
+    renderSettings(settings);
+    showToast(settings.parallel ? `已开启并行解析（×${settings.concurrency}）` : '已切换为串行解析', 'success');
+  } catch (error) {
+    showConcurrencyError(error.message);
+  } finally {
+    concurrencySubmitButton.disabled = false;
+    setButtonLabel(concurrencySubmitButton, '保存设置');
+  }
+}
+
+function showConcurrencyError(message) {
+  concurrencyFormError.textContent = message;
+  concurrencyFormError.classList.remove('hidden');
+}
+
+function hideConcurrencyError() {
+  concurrencyFormError.textContent = '';
+  concurrencyFormError.classList.add('hidden');
+}
+
 async function onAccountSubmit(event) {
   event.preventDefault();
   setAccountBusy(true);
@@ -398,6 +546,7 @@ async function onAccountSubmit(event) {
       body: JSON.stringify({
         username: accountUsername.value.trim(),
         password: accountPassword.value,
+        traffic_limit_gb: Math.max(1, Number(accountTrafficLimit.value) || 700),
       }),
     });
     accountPassword.value = '';
@@ -434,6 +583,27 @@ async function resetAccount(id) {
     showToast('账号状态已重置', 'success');
   } catch (error) {
     showAccountError(error.message);
+  }
+}
+
+async function saveAccountLimit(id, gb, button) {
+  if (!(gb >= 1)) {
+    showToast('流量额度至少为 1G', 'error');
+    return;
+  }
+  button.disabled = true;
+  setButtonContent(button, '保存中', 'check');
+  try {
+    await api(`/api/accounts/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ traffic_limit_gb: Math.round(gb) }),
+    });
+    await refreshAppState();
+    showToast('流量额度已更新', 'success');
+  } catch (error) {
+    showToast(error.message, 'error');
+    button.disabled = false;
+    setButtonContent(button, '改额度', 'check');
   }
 }
 
@@ -1037,10 +1207,10 @@ async function onGenerateCDKs(event) {
   hideCdkGenError();
 
   const count = Number(cdkCount.value);
-  const remaining = Number(cdkRemaining.value);
+  const trafficGB = Number(cdkRemaining.value);
   const days = Number(cdkDays.value);
   if (!(count >= 1)) { showCdkGenError('分发数量至少为 1'); return; }
-  if (!(remaining >= 1)) { showCdkGenError('可解析次数至少为 1'); return; }
+  if (!(trafficGB >= 1)) { showCdkGenError('流量额度至少为 1G'); return; }
   if (!(days >= 1)) { showCdkGenError('到期天数至少为 1'); return; }
 
   cdkGenSubmit.disabled = true;
@@ -1048,7 +1218,7 @@ async function onGenerateCDKs(event) {
   try {
     const payload = await api('/api/cdks', {
       method: 'POST',
-      body: JSON.stringify({ count, remaining, days }),
+      body: JSON.stringify({ count, traffic_gb: trafficGB, days }),
     });
     const generated = payload.cdks || [];
     await fetchCDKs();
@@ -1072,9 +1242,9 @@ async function onGenerateCDKs(event) {
   }
 }
 
-async function saveCDK(code, remaining, days, button) {
-  if (!(remaining >= 0) || !(days >= 1)) {
-    showToast('次数不能为负，天数至少为 1', 'error');
+async function saveCDK(code, trafficGB, days, button) {
+  if (!(trafficGB >= 0) || !(days >= 1)) {
+    showToast('流量额度不能为负，天数至少为 1', 'error');
     return;
   }
   button.disabled = true;
@@ -1083,7 +1253,7 @@ async function saveCDK(code, remaining, days, button) {
   try {
     await api(`/api/cdks/${encodeURIComponent(code)}`, {
       method: 'PATCH',
-      body: JSON.stringify({ remaining, days }),
+      body: JSON.stringify({ traffic_gb: trafficGB, days }),
     });
     await fetchCDKs();
     showToast('CDK 已更新', 'success');
@@ -1136,7 +1306,7 @@ function buildCDKCard(cdk) {
   code.textContent = cdk.code;
   const meta = document.createElement('div');
   meta.className = 'muted';
-  meta.textContent = `已用 ${cdk.used} 次 · 创建于 ${formatDateTime(cdk.created_at)}`;
+  meta.textContent = `剩余 ${cdk.remaining_label} · 已用 ${cdk.used_label} · 创建于 ${formatDateTime(cdk.created_at)}`;
   text.appendChild(code);
   text.appendChild(meta);
   id.appendChild(stub);
@@ -1149,7 +1319,8 @@ function buildCDKCard(cdk) {
 
   const edit = document.createElement('div');
   edit.className = 'cdk-edit';
-  const remField = cdkNumberField('剩余次数', cdk.remaining, 0);
+  const remGB = Math.round((Number(cdk.remaining_bytes) || 0) / (1024 ** 3));
+  const remField = cdkNumberField('剩余流量(GB)', remGB, 0);
   const dayField = cdkNumberField('到期天数', cdk.expired ? 1 : cdk.days_left, 1);
   const saveBtn = document.createElement('button');
   saveBtn.type = 'button';
@@ -1390,6 +1561,7 @@ function logGlyph(level) {
 
 function redirectToGate() {
   stopLogPolling();
+  stopQueuePolling();
   stopPolling();
   stopUpdatePolling();
   stopUpdateStatusPolling();

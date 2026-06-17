@@ -7,20 +7,30 @@
   <title>PikPak 直链工具 · 用户</title>
   <link rel="stylesheet" href="/styles.css">
   <style>
-    .portal { max-width: 780px; margin: 0 auto; padding: 26px 18px 64px; display: grid; gap: 22px; }
+    .portal { width: 100%; max-width: 1600px; margin: 0 auto; padding: 24px 32px 64px; display: grid; gap: 20px; }
     .portal-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
     .portal-brand { display: flex; align-items: center; gap: 12px; }
     .portal-logo { width: 46px; height: 46px; border-radius: 15px; display: grid; place-items: center; background: var(--primary); color: #fff; box-shadow: 0 16px 28px rgba(11,107,255,.28); }
     .portal-logo .ui-icon { width: 24px; height: 24px; }
     .portal-title { font-size: 18px; font-weight: 850; color: var(--text-primary); }
-    .portal-sub { color: var(--text-muted); font-size: 12.5px; font-weight: 700; }
-    .cdk-status { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .portal-sub { color: var(--text-muted); font-size: 12.5px; font-weight: 700; font-family: Consolas, "SFMono-Regular", monospace; letter-spacing: .5px; }
+    .cdk-status { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; justify-content: flex-end; }
     .gate-wrap { min-height: 86vh; display: grid; place-items: center; padding: 20px; }
     .gate-card { width: 100%; max-width: 430px; text-align: center; }
     .gate-card .panel-head { justify-content: center; margin-bottom: 14px; }
     .gate-card .field { margin-top: 8px; text-align: left; }
     .cdk-input { text-transform: uppercase; letter-spacing: 1px; font-family: Consolas, "SFMono-Regular", monospace; }
-    .resolver-form.portal-form { grid-template-columns: 1fr; }
+    /* Resolve card: magnet input on the left, controls stacked on the right. */
+    .resolver-form.portal-form { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 18px; align-items: stretch; }
+    .portal-form .resource-field { margin: 0; }
+    .portal-form .resource-field textarea { height: 100%; min-height: 168px; }
+    .portal-form .resolver-side { display: flex; flex-direction: column; gap: 12px; }
+    .portal-form .resolver-side .mode-group { margin-top: auto; }
+    @media (max-width: 820px) {
+      .portal { padding: 20px 16px 56px; }
+      .resolver-form.portal-form { grid-template-columns: 1fr; }
+      .portal-form .resource-field textarea { min-height: 132px; }
+    }
   </style>
 </head>
 <body>
@@ -33,9 +43,11 @@
     <symbol id="icon-open" viewBox="0 0 24 24"><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M20 14v4.5A1.5 1.5 0 0 1 18.5 20h-13A1.5 1.5 0 0 1 4 18.5v-13A1.5 1.5 0 0 1 5.5 4H10"/></symbol>
     <symbol id="icon-copy" viewBox="0 0 24 24"><path d="M8 8h10.2a1.8 1.8 0 0 1 1.8 1.8V20a1.8 1.8 0 0 1-1.8 1.8H8A1.8 1.8 0 0 1 6.2 20V9.8A1.8 1.8 0 0 1 8 8Z"/><path d="M4 15.8V5.8A1.8 1.8 0 0 1 5.8 4h10"/></symbol>
     <symbol id="icon-file" viewBox="0 0 24 24"><path d="M14 3.5H7A2.5 2.5 0 0 0 4.5 6v12A2.5 2.5 0 0 0 7 20.5h10A2.5 2.5 0 0 0 19.5 18V9l-5.5-5.5Z"/><path d="M14 3.5V9h5.5"/></symbol>
+    <symbol id="icon-folder" viewBox="0 0 24 24"><path d="M3.6 7.2a2 2 0 0 1 2-2h4.3l2 2h6.5a2 2 0 0 1 2 2v8.6a2 2 0 0 1-2 2H5.6a2 2 0 0 1-2-2V7.2Z"/></symbol>
     <symbol id="icon-lock" viewBox="0 0 24 24"><path d="M7 10V8a5 5 0 0 1 10 0v2"/><path d="M6.4 10h11.2A2.4 2.4 0 0 1 20 12.4v6.2a2.4 2.4 0 0 1-2.4 2.4H6.4A2.4 2.4 0 0 1 4 18.6v-6.2A2.4 2.4 0 0 1 6.4 10Z"/><path d="M12 15v2"/></symbol>
     <symbol id="icon-logout" viewBox="0 0 24 24"><path d="M9 20H5.8A2.8 2.8 0 0 1 3 17.2V6.8A2.8 2.8 0 0 1 5.8 4H9"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></symbol>
     <symbol id="icon-ticket" viewBox="0 0 24 24"><path d="M4 8.5A1.5 1.5 0 0 1 5.5 7h13A1.5 1.5 0 0 1 20 8.5v2a2 2 0 0 0 0 4v2A1.5 1.5 0 0 1 18.5 17h-13A1.5 1.5 0 0 1 4 15.5v-2a2 2 0 0 0 0-4Z"/><path d="M13 7v10"/></symbol>
+    <symbol id="icon-chevron" viewBox="0 0 24 24"><path d="m8 10 4 4 4-4"/></symbol>
   </svg>
 
   <!-- CDK gate -->
@@ -71,7 +83,7 @@
         <span class="portal-logo" aria-hidden="true"><svg class="ui-icon"><use href="#icon-brand"></use></svg></span>
         <div>
           <div class="portal-title">PikPak 直链工具</div>
-          <div class="portal-sub">CDK 用户</div>
+          <div id="cdkCodeLabel" class="portal-sub">CDK 用户</div>
         </div>
       </div>
       <div class="cdk-status">
@@ -90,15 +102,15 @@
           <span class="title-icon blue" aria-hidden="true"><svg class="ui-icon"><use href="#icon-link"></use></svg></span>
           <div>
             <h2>链接解析</h2>
-            <p>粘贴磁力链接或 PikPak 分享链接，生成直链或代理链接</p>
+            <p>粘贴磁力链接或 PikPak 分享链接，解析后勾选文件生成下载链接</p>
           </div>
         </div>
         <span id="jobBadge" class="status-pill neutral">空闲</span>
       </div>
 
       <form id="resolveForm" class="resolver-form portal-form">
-        <label class="field">
-          <textarea id="resourceInput" rows="6" placeholder="magnet:?xt=urn:btih:...&#10;或&#10;https://mypikpak.com/s/..."></textarea>
+        <label class="field resource-field">
+          <textarea id="resourceInput" rows="5" placeholder="magnet:?xt=urn:btih:...&#10;或&#10;https://mypikpak.com/s/..."></textarea>
         </label>
         <div class="resolver-side">
           <label class="field floating">
@@ -132,43 +144,31 @@
           <div><h2>选择文件</h2><p id="selectionHint" class="muted"></p></div>
         </div>
       </div>
-      <div id="selectionList" class="selection-list"></div>
+      <div class="tree-toolbar">
+        <label class="tree-check-all">
+          <input id="selectAll" type="checkbox">
+          <span>全选</span>
+        </label>
+        <span id="selectionSummary" class="muted">已选 0 项</span>
+      </div>
+      <div id="selectionTree" class="selection-tree"></div>
+      <div class="tree-actions">
+        <button id="generateButton" type="button" class="primary button-large" disabled>
+          <svg class="ui-icon"><use href="#icon-link"></use></svg>
+          <span class="button-label">生成下载链接</span>
+        </button>
+      </div>
     </section>
 
     <section id="resultPanel" class="panel result-panel hidden">
       <div class="panel-head">
         <div class="section-title compact-title">
           <span class="title-icon green" aria-hidden="true"><svg class="ui-icon"><use href="#icon-link"></use></svg></span>
-          <div><h2>解析结果</h2><p>复制链接到下载器，或直接打开验证</p></div>
+          <div><h2>下载链接</h2><p>复制链接到下载器，或直接打开验证</p></div>
         </div>
-        <span id="resultMode" class="status-pill neutral"></span>
+        <span id="resultCount" class="status-pill success"></span>
       </div>
-      <dl class="result-grid">
-        <div><dt>文件名</dt><dd id="resultName">-</dd></div>
-        <div><dt>路径</dt><dd id="resultPath">-</dd></div>
-        <div><dt>大小</dt><dd id="resultSize">-</dd></div>
-        <div><dt>过期时间</dt><dd id="resultExpire">-</dd></div>
-      </dl>
-      <div class="link-block">
-        <div class="link-row">
-          <span class="link-tag direct">直链</span>
-          <div class="link-actions">
-            <a id="directOpen" class="secondary-link compact" href="#" target="_blank" rel="noreferrer noopener"><svg class="ui-icon"><use href="#icon-open"></use></svg>打开</a>
-            <button id="directCopy" type="button" class="secondary compact"><svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span></button>
-          </div>
-        </div>
-        <input id="directValue" class="link-input" type="text" readonly>
-      </div>
-      <div class="link-block">
-        <div class="link-row">
-          <span class="link-tag proxy">代理链接</span>
-          <div class="link-actions">
-            <a id="proxyOpen" class="secondary-link compact" href="#" target="_blank" rel="noreferrer noopener"><svg class="ui-icon"><use href="#icon-open"></use></svg>打开</a>
-            <button id="proxyCopy" type="button" class="secondary compact"><svg class="ui-icon"><use href="#icon-copy"></use></svg><span class="button-label">复制</span></button>
-          </div>
-        </div>
-        <input id="proxyValue" class="link-input" type="text" readonly>
-      </div>
+      <div id="resultList" class="result-list"></div>
     </section>
   </div>
 

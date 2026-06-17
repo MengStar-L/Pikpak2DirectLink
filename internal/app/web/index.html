@@ -165,10 +165,17 @@
           </div>
         </article>
         <article class="metric-card metric-card-orange">
-          <span class="metric-icon" aria-hidden="true"><svg class="ui-icon"><use href="#icon-folder"></use></svg></span>
+          <span class="metric-icon" aria-hidden="true"><svg class="ui-icon"><use href="#icon-bolt"></use></svg></span>
           <div class="metric-body">
-            <span class="metric-label">PikPak 根目录</span>
-            <strong id="metricRootFolder" class="metric-text">-</strong>
+            <span class="metric-label">进行中</span>
+            <strong id="metricRunningCount" data-count="0">0</strong>
+          </div>
+        </article>
+        <article class="metric-card metric-card-violet">
+          <span class="metric-icon" aria-hidden="true"><svg class="ui-icon"><use href="#icon-logs"></use></svg></span>
+          <div class="metric-body">
+            <span class="metric-label">排队</span>
+            <strong id="metricWaitingCount" data-count="0">0</strong>
           </div>
         </article>
       </section>
@@ -329,6 +336,10 @@
               <input id="accountPassword" name="password" type="password" autocomplete="current-password" placeholder=" ">
               <span class="floating-label">PikPak 密码</span>
             </label>
+            <label class="field floating">
+              <input id="accountTrafficLimit" name="traffic_limit_gb" type="number" min="1" step="1" value="700" inputmode="numeric" placeholder=" ">
+              <span class="floating-label">最大流量(GB)</span>
+            </label>
             <button id="accountSubmitButton" type="submit" class="primary button-large">
               <svg class="ui-icon"><use href="#icon-users"></use></svg>
               <span class="button-label">添加并登录</span>
@@ -426,6 +437,30 @@
       </section>
 
       <section id="settingsPage" class="page-view">
+        <section class="panel">
+          <div class="panel-head">
+            <div class="section-title compact-title">
+              <span class="title-icon orange" aria-hidden="true"><svg class="ui-icon"><use href="#icon-bolt"></use></svg></span>
+              <div>
+                <h2>并行解析</h2>
+                <p>设置同时解析的任务数量。串行（1）逐个解析；并行（&gt;1）可同时处理多个链接，并自动轮询可用账号</p>
+              </div>
+            </div>
+          </div>
+          <form id="concurrencyForm" class="concurrency-form">
+            <label class="field floating">
+              <input id="concurrencyInput" name="concurrency" type="number" min="1" step="1" inputmode="numeric" placeholder=" ">
+              <span class="floating-label">并发解析数（1 为串行）</span>
+            </label>
+            <button id="concurrencySubmitButton" type="submit" class="primary button-large">
+              <svg class="ui-icon"><use href="#icon-bolt"></use></svg>
+              <span class="button-label">保存设置</span>
+            </button>
+            <p id="concurrencyNote" class="muted concurrency-note">当前：<span id="concurrencyState">-</span></p>
+            <p id="concurrencyFormError" class="status-error hidden"></p>
+          </form>
+        </section>
+
         <section class="panel password-panel">
           <div class="panel-head">
             <div class="section-title compact-title">
@@ -479,8 +514,8 @@
               <span class="floating-label">分发数量</span>
             </label>
             <label class="field floating">
-              <input id="cdkRemaining" name="remaining" type="number" min="1" value="10" placeholder=" ">
-              <span class="floating-label">可解析次数</span>
+              <input id="cdkRemaining" name="remaining" type="number" min="1" value="2" placeholder=" ">
+              <span class="floating-label">流量额度(GB)</span>
             </label>
             <label class="field floating">
               <input id="cdkDays" name="days" type="number" min="1" value="30" placeholder=" ">
