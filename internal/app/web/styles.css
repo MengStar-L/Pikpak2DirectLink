@@ -100,7 +100,6 @@ h3 { font-size: 15px; line-height: 1.25; font-weight: 800; }
   top: 26px;
   width: 78px;
   height: calc(100vh - 58px);
-  max-height: 920px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -201,8 +200,8 @@ h3 { font-size: 15px; line-height: 1.25; font-weight: 800; }
 
 .workspace {
   min-width: 0;
-  display: grid;
-  align-content: start;
+  display: flex;
+  flex-direction: column;
   gap: 24px;
 }
 
@@ -902,6 +901,26 @@ button:disabled {
 .console-shell {
   overflow: hidden;
 }
+
+/* Logs page fills the workspace column so the panel's bottom edge lines up with
+   the sidebar's bottom edge, instead of stopping at the log content height. */
+#logsPage.page-view.active {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+#logsPage .console-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+#logsPage .console-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
 .console-head {
   min-height: 82px;
   padding: 20px 24px;
@@ -1030,7 +1049,9 @@ button:disabled {
   opacity: 0;
   transform: translateY(18px);
   transition: opacity 260ms var(--ease), transform 260ms var(--ease);
-  z-index: 2000;
+  /* Above the aria2 config overlay (2200) so the "测试连接" result toast stays
+     readable on top of the dimmed modal instead of hiding behind it. */
+  z-index: 2400;
 }
 .toast.show {
   opacity: 1;
@@ -1042,14 +1063,99 @@ button:disabled {
 
 .hidden { display: none !important; }
 
+/* --- aria2 push integration --- */
+.aria2-push-btn:not(:disabled):hover {
+  color: var(--green);
+  border-color: var(--green-line);
+  background: var(--green-soft);
+}
+.aria2-push-btn .ui-icon { width: 16px; height: 16px; }
+
+.aria2-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2200;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(20, 30, 48, 0.42);
+  backdrop-filter: blur(3px);
+  animation: view-enter 0.22s var(--ease) both;
+}
+.aria2-overlay.closing {
+  animation: view-exit 0.2s var(--ease) both;
+}
+.aria2-overlay.closing .aria2-modal {
+  animation: modal-exit 0.2s var(--ease) both;
+}
+.aria2-modal {
+  width: 100%;
+  max-width: 480px;
+  display: grid;
+  gap: 14px;
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: #fff;
+  box-shadow: var(--shadow-lift);
+}
+.aria2-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.aria2-close {
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: var(--text-muted);
+}
+.aria2-close .ui-icon { width: 18px; height: 18px; }
+.aria2-modal-hint { font-size: 12.5px; }
+.aria2-modal-hint code {
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--surface-tint);
+  border: 1px solid var(--border);
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 11.5px;
+  word-break: break-all;
+}
+.aria2-field { margin: 0; }
+.aria2-modal .status-error { margin: 0; }
+.aria2-modal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+
 /* View transition for the CDK gate <-> app swap on the user portal. */
 @keyframes view-enter {
   from { opacity: 0; transform: translateY(12px) scale(0.99); }
   to   { opacity: 1; transform: none; }
 }
+@keyframes view-exit {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+@keyframes modal-exit {
+  from { opacity: 1; transform: none; }
+  to   { opacity: 0; transform: translateY(10px) scale(0.98); }
+}
 .view-enter { animation: view-enter 0.32s cubic-bezier(0.22, 1, 0.36, 1) both; }
 @media (prefers-reduced-motion: reduce) {
   .view-enter { animation: none; }
+  .aria2-overlay,
+  .aria2-overlay.closing,
+  .aria2-overlay.closing .aria2-modal { animation: none; }
 }
 
 /* --- CDK user portal: file tree + multi-link results --- */

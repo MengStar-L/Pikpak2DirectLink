@@ -339,3 +339,39 @@ func TestResolveOrderExcludesOverLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestIsResourceUnavailableError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "copyright takedown", err: errors.New("Involving copyright or harmful content,no longer available"), want: true},
+		{name: "no longer available", err: errors.New("File no longer available"), want: true},
+		{name: "harmful content", err: errors.New("harmful content detected"), want: true},
+		{name: "nil", err: nil, want: false},
+		{name: "ordinary account failure", err: errors.New("login failed: bad password"), want: false},
+		{name: "timeout", err: errors.New("context deadline exceeded"), want: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isResourceUnavailableError(tc.err); got != tc.want {
+				t.Fatalf("isResourceUnavailableError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFriendlyPikPakMessageResourceUnavailable(t *testing.T) {
+	t.Parallel()
+
+	msg := friendlyPikPakError(errors.New("Involving copyright or harmful content,no longer available"))
+	if msg == "" || msg == "Involving copyright or harmful content,no longer available" {
+		t.Fatalf("expected a friendly Chinese message, got %q", msg)
+	}
+}

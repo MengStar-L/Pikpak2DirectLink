@@ -674,5 +674,26 @@ func friendlyPikPakMessage(message string) string {
 		strings.Contains(lower, "value:\"review\"") {
 		return "PikPak 触发登录风控，请先在官方客户端完成验证后再重试。"
 	}
+	if isResourceUnavailableMessage(lower) {
+		return "该资源涉及版权或违规内容，或已失效，已被 PikPak 下架，无法解析。"
+	}
 	return message
+}
+
+// isResourceUnavailableError reports whether an error is a deterministic
+// resource-level refusal (the magnet/share was taken down for copyright or
+// harmful content, or otherwise no longer exists). Such an error is NOT the
+// account's fault — every account would hit the same refusal — so the caller
+// must not blacklist the account over it.
+func isResourceUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isResourceUnavailableMessage(strings.ToLower(err.Error()))
+}
+
+func isResourceUnavailableMessage(lower string) bool {
+	return strings.Contains(lower, "copyright") ||
+		strings.Contains(lower, "harmful content") ||
+		strings.Contains(lower, "no longer available")
 }

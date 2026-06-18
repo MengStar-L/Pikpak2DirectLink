@@ -34,6 +34,9 @@ let currentJobId = null;
 let pollTimer = null;
 let statusTimer = null;
 let resolveBusy = false;
+// Latest resolved links, tracked so the aria2 "push all" button can read them.
+let lastResults = [];
+let aria2PushAll = null;
 
 // Selection state for the current selection_required job. checkboxByItemId maps
 // a file's item id to its <input> so select-all and tristate folders can drive
@@ -51,6 +54,7 @@ async function boot() {
   resolveForm.addEventListener('submit', onResolveSubmit);
   selectAll.addEventListener('change', onSelectAll);
   generateButton.addEventListener('click', onGenerate);
+  mountAria2();
 
   const presetCode = new URLSearchParams(location.search).get('code');
   if (presetCode) {
@@ -76,6 +80,44 @@ function showGate() {
   gateView.classList.remove('hidden');
   playViewEnter(gateView);
   cdkInput.focus();
+}
+
+// mountAria2 adds the aria2 config button to the always-visible status bar and a
+// "push all" button to the result panel head. Per-link push buttons are added by
+// buildLinkRow. Safe to call once at boot; no-ops if the helper failed to load.
+function mountAria2() {
+  if (!window.Aria2) return;
+
+  const status = document.querySelector('.cdk-status');
+  if (status && logoutButton) {
+    status.insertBefore(window.Aria2.configButton(), logoutButton);
+  }
+
+  const head = document.querySelector('#resultPanel .panel-head');
+  if (head) {
+    aria2PushAll = document.createElement('button');
+    aria2PushAll.type = 'button';
+    aria2PushAll.className = 'secondary compact aria2-push-btn hidden';
+    aria2PushAll.innerHTML =
+      '<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 3 3 10.5l6.2 2.3L21 3Z"/><path d="m21 3-7.7 18-2.3-6.2"/></svg><span class="button-label">全部推送 aria2</span>';
+    aria2PushAll.addEventListener('click', () => window.Aria2.pushMany(collectPushItems()));
+    head.appendChild(aria2PushAll);
+  }
+}
+
+// collectPushItems returns one link per resolved file (direct preferred).
+function collectPushItems() {
+  const items = [];
+  for (const result of lastResults || []) {
+    const url = result.direct_url || result.proxy_url;
+    if (url) items.push({ url, name: result.file?.name });
+  }
+  return items;
+}
+
+function refreshAria2PushAll() {
+  if (!aria2PushAll) return;
+  aria2PushAll.classList.toggle('hidden', collectPushItems().length < 2);
 }
 
 function enterApp(status) {
@@ -547,6 +589,7 @@ async function chooseSingle(jobId, itemId, button) {
 // proxy link. For a batch job the cards are grouped by their top-level folder so
 // each link's files sit under their own sibling section.
 function renderResults(job, results) {
+  lastResults = results || [];
   resultPanel.classList.remove('hidden');
   const batch = job.batch;
   resultCount.textContent = batch
@@ -593,19 +636,20 @@ function renderResults(job, results) {
       card.appendChild(head);
 
       if (result.direct_url) {
-        card.appendChild(buildLinkRow('直链', 'direct', result.direct_url));
+        card.appendChild(buildLinkRow('直链', 'direct', result.direct_url, result.file?.name));
       }
       if (result.proxy_url) {
-        card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url));
+        card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url, result.file?.name));
       }
       resultList.appendChild(card);
     }
   }
 
   requestAnimationFrame(() => resultPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
+  refreshAria2PushAll();
 }
 
-function buildLinkRow(tagText, tagClass, url) {
+function buildLinkRow(tagText, tagClass, url, name) {
   const block = document.createElement('div');
   block.className = 'link-block';
 
@@ -631,6 +675,9 @@ function buildLinkRow(tagText, tagClass, url) {
   copy.addEventListener('click', () => copyText(url, copy));
   actions.appendChild(open);
   actions.appendChild(copy);
+  if (window.Aria2) {
+    actions.appendChild(window.Aria2.pushButton(url, name));
+  }
   row.appendChild(actions);
   block.appendChild(row);
 
@@ -649,6 +696,8 @@ function clearJobUI() {
   selectionJobId = null;
   selectionStage = '';
   checkboxByItemId = new Map();
+  lastResults = [];
+  refreshAria2PushAll();
   hide(jobError);
   selectionPanel.classList.add('hidden');
   selectionTree.innerHTML = '';

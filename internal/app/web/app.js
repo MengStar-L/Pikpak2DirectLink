@@ -110,6 +110,13 @@ const state = {
 
 let currentJobId = null;
 let pollTimer = null;
+// Latest resolved links, tracked so the aria2 "push all" button can read them.
+let lastResults = null;
+let lastSingleResult = null;
+// The aria2 "push all" button, created by mountAria2. Declared here (above the
+// boot() call) so the synchronous mountAria2() invocation can assign it without
+// hitting a temporal-dead-zone error.
+let aria2PushAll = null;
 let logPollTimer = null;
 let queuePollTimer = null;
 let updatePollTimer = null;
@@ -124,12 +131,69 @@ boot();
 
 async function boot() {
   bindActions();
+  mountAria2();
   clearJobUI();
   await refreshAppState();
   showPage('resolve');
   if (state.authenticated) {
     startUpdateStatusPolling();
   }
+}
+
+// mountAria2 wires the shared aria2 helper into the resolve page: a config
+// button in the status cluster (usable any time, even before resolving) and
+// push buttons on the static single-result link rows. The result-tree push
+// buttons are added inline by buildLinkRow.
+function mountAria2() {
+  if (!window.Aria2) return;
+
+  const cluster = document.querySelector('#resolvePage .status-cluster');
+  if (cluster) {
+    cluster.insertBefore(window.Aria2.configButton(), cluster.firstChild);
+  }
+
+  // Single-result view: push buttons next to the existing copy buttons.
+  directCopy?.parentElement?.appendChild(
+    window.Aria2.pushButton(() => directValue.value, () => resultName.textContent),
+  );
+  proxyCopy?.parentElement?.appendChild(
+    window.Aria2.pushButton(() => proxyValue.value, () => resultName.textContent),
+  );
+
+  // "Push all" lives in the result panel head; it pushes every resolved link
+  // (preferring direct over proxy per file).
+  if (resultMode?.parentElement) {
+    aria2PushAll = document.createElement('button');
+    aria2PushAll.type = 'button';
+    aria2PushAll.className = 'secondary compact aria2-push-btn hidden';
+    aria2PushAll.innerHTML =
+      '<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 3 3 10.5l6.2 2.3L21 3Z"/><path d="m21 3-7.7 18-2.3-6.2"/></svg><span class="button-label">全部推送 aria2</span>';
+    aria2PushAll.addEventListener('click', () => window.Aria2.pushMany(collectPushItems()));
+    resultMode.parentElement.appendChild(aria2PushAll);
+  }
+}
+
+// collectPushItems gathers one link per resolved file (direct preferred) from
+// whichever result shape the current job produced.
+function collectPushItems() {
+  const items = [];
+  const push = (result) => {
+    if (!result) return;
+    const url = result.direct_url || result.proxy_url;
+    if (url) items.push({ url, name: result.file?.name });
+  };
+  if (lastResults && lastResults.length) {
+    lastResults.forEach(push);
+  } else if (lastSingleResult) {
+    push(lastSingleResult);
+  }
+  return items;
+}
+
+function refreshAria2PushAll() {
+  if (!aria2PushAll) return;
+  const count = collectPushItems().length;
+  aria2PushAll.classList.toggle('hidden', count < 2);
 }
 
 function bindActions() {
@@ -819,6 +883,8 @@ async function chooseItem(jobId, itemId, button) {
 
 function renderResult(job) {
   const result = job.result;
+  lastResults = null;
+  lastSingleResult = result;
   resultPanel.classList.remove('hidden');
   resultSingle.classList.remove('hidden');
   resultTree.classList.add('hidden');
@@ -838,6 +904,7 @@ function renderResult(job) {
   directCopy.disabled = !result.direct_url;
   proxyCopy.disabled = !result.proxy_url;
 
+  refreshAria2PushAll();
   requestAnimationFrame(() => {
     resultPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   });
@@ -847,6 +914,8 @@ function renderResult(job) {
 // link's files live under their own sibling top-level folder (the server already
 // prefixes result paths with "链接N ..."), so the tree groups them naturally.
 function renderResultTree(job, results) {
+  lastResults = results;
+  lastSingleResult = null;
   resultPanel.classList.remove('hidden');
   resultSingle.classList.add('hidden');
   resultTree.classList.remove('hidden');
@@ -866,6 +935,7 @@ function renderResultTree(job, results) {
     resultTree.appendChild(renderResultNode(node));
   }
 
+  refreshAria2PushAll();
   requestAnimationFrame(() => {
     resultPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   });
@@ -960,17 +1030,18 @@ function renderResultNode(node) {
   card.appendChild(head);
 
   if (result.direct_url) {
-    card.appendChild(buildLinkRow('直链', 'direct', result.direct_url));
+    card.appendChild(buildLinkRow('直链', 'direct', result.direct_url, result.file?.name));
   }
   if (result.proxy_url) {
-    card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url));
+    card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url, result.file?.name));
   }
   return card;
 }
 
 // buildLinkRow is the compact open/copy block used for each link in the result
-// tree.
-function buildLinkRow(tagText, tagClass, url) {
+// tree. When aria2 is available it also gets a "推送" button that sends this
+// link straight to the user's aria2 RPC endpoint.
+function buildLinkRow(tagText, tagClass, url, name) {
   const block = document.createElement('div');
   block.className = 'link-block';
 
@@ -996,6 +1067,9 @@ function buildLinkRow(tagText, tagClass, url) {
   copy.addEventListener('click', () => copyText(url, copy));
   actions.appendChild(open);
   actions.appendChild(copy);
+  if (window.Aria2) {
+    actions.appendChild(window.Aria2.pushButton(url, name));
+  }
   row.appendChild(actions);
   block.appendChild(row);
 
@@ -1032,7 +1106,6 @@ async function fetchLogs() {
     const payload = await api(`/api/logs?after=${state.lastLogId}`);
     const nextLogs = payload.logs || [];
     if (nextLogs.length === 0) {
-      renderLogs();
       return;
     }
 
@@ -1043,12 +1116,70 @@ async function fetchLogs() {
     if (state.logs.length > 500) {
       state.logs = state.logs.slice(-500);
     }
-    renderLogs();
+    if (state.currentPage === 'logs') {
+      appendLogs(nextLogs);
+    }
   } catch {
     stopLogPolling();
   }
 }
 
+// True when the viewport is at (or within a hair of) the bottom of the list.
+function logsAtBottom() {
+  return logList.scrollHeight - logList.scrollTop - logList.clientHeight < 40;
+}
+
+function createLogRow(entry) {
+  const row = document.createElement('article');
+  row.className = `console-entry ${entry.level || 'info'}`;
+
+  const glyph = document.createElement('span');
+  glyph.className = 'console-glyph';
+  glyph.textContent = logGlyph(entry.level);
+  row.appendChild(glyph);
+
+  const body = document.createElement('div');
+  body.className = 'console-entry-body';
+
+  const line = document.createElement('div');
+  line.className = 'console-line';
+
+  if (entry.job_id) {
+    const job = document.createElement('span');
+    job.className = 'console-job';
+    job.textContent = `[${entry.job_id}]`;
+    line.appendChild(job);
+  }
+
+  const message = document.createElement('span');
+  message.className = 'console-message';
+  message.textContent = entry.message || '-';
+  line.appendChild(message);
+  body.appendChild(line);
+
+  if (entry.details?.length) {
+    const details = document.createElement('div');
+    details.className = 'console-details';
+    for (const detailText of entry.details) {
+      const detail = document.createElement('span');
+      detail.textContent = detailText;
+      details.appendChild(detail);
+    }
+    body.appendChild(details);
+  }
+
+  const time = document.createElement('time');
+  time.className = 'console-time';
+  time.dateTime = entry.time || '';
+  time.textContent = formatLogTime(entry.time);
+
+  row.appendChild(body);
+  row.appendChild(time);
+  return row;
+}
+
+// Full rebuild — used on page navigation and after clearing. Always lands at
+// the bottom since this is an explicit (re)entry into the log view.
 function renderLogs() {
   logList.innerHTML = '';
 
@@ -1060,56 +1191,41 @@ function renderLogs() {
     return;
   }
 
+  const fragment = document.createDocumentFragment();
   for (const entry of state.logs) {
-    const row = document.createElement('article');
-    row.className = `console-entry ${entry.level || 'info'}`;
+    fragment.appendChild(createLogRow(entry));
+  }
+  logList.appendChild(fragment);
+  logList.scrollTop = logList.scrollHeight;
+}
 
-    const glyph = document.createElement('span');
-    glyph.className = 'console-glyph';
-    glyph.textContent = logGlyph(entry.level);
-    row.appendChild(glyph);
-
-    const body = document.createElement('div');
-    body.className = 'console-entry-body';
-
-    const line = document.createElement('div');
-    line.className = 'console-line';
-
-    if (entry.job_id) {
-      const job = document.createElement('span');
-      job.className = 'console-job';
-      job.textContent = `[${entry.job_id}]`;
-      line.appendChild(job);
-    }
-
-    const message = document.createElement('span');
-    message.className = 'console-message';
-    message.textContent = entry.message || '-';
-    line.appendChild(message);
-    body.appendChild(line);
-
-    if (entry.details?.length) {
-      const details = document.createElement('div');
-      details.className = 'console-details';
-      for (const detailText of entry.details) {
-        const detail = document.createElement('span');
-        detail.textContent = detailText;
-        details.appendChild(detail);
-      }
-      body.appendChild(details);
-    }
-
-    const time = document.createElement('time');
-    time.className = 'console-time';
-    time.dateTime = entry.time || '';
-    time.textContent = formatLogTime(entry.time);
-
-    row.appendChild(body);
-    row.appendChild(time);
-    logList.appendChild(row);
+// Incremental append — only the new rows are created, so existing rows never
+// re-render (no flicker). Scroll follows the tail only when the user was
+// already at the bottom; otherwise their scroll position is preserved.
+function appendLogs(entries) {
+  if (!entries.length) {
+    return;
   }
 
-  if (state.currentPage === 'logs') {
+  const placeholder = logList.querySelector('.console-empty');
+  if (placeholder) {
+    placeholder.remove();
+  }
+
+  const stick = logsAtBottom();
+
+  const fragment = document.createDocumentFragment();
+  for (const entry of entries) {
+    fragment.appendChild(createLogRow(entry));
+  }
+  logList.appendChild(fragment);
+
+  // Keep the DOM in sync with the 500-entry cap on state.logs.
+  while (logList.children.length > 500) {
+    logList.removeChild(logList.firstElementChild);
+  }
+
+  if (stick) {
     logList.scrollTop = logList.scrollHeight;
   }
 }
@@ -1563,6 +1679,9 @@ function hideCdkGenError() {
 function clearJobUI() {
   stopPolling();
   currentJobId = null;
+  lastResults = null;
+  lastSingleResult = null;
+  refreshAria2PushAll();
   hideJobError();
   selectionPanel.classList.add('hidden');
   selectionList.innerHTML = '';
