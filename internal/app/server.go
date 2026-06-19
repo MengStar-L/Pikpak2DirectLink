@@ -648,7 +648,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	job, ok := s.jobs.get(jobID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "job not found")
+		writeError(w, http.StatusNotFound, proxyInvalidLinkError)
 		return
 	}
 
@@ -662,12 +662,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if job.Result != nil && job.Result.ProxyToken == "" {
 			result = job.Result
 		} else {
-			writeError(w, http.StatusForbidden, "invalid or missing proxy token")
+			writeError(w, http.StatusForbidden, proxyInvalidLinkError)
 			return
 		}
 	}
 	if result.File.ID == "" {
-		writeError(w, http.StatusConflict, "job is not ready")
+		writeError(w, http.StatusConflict, proxyNotReadyError)
 		return
 	}
 
@@ -681,12 +681,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			accountID = job.AccountID
 		}
 		if accountID == "" {
-			writeError(w, http.StatusConflict, "job account is missing")
+			s.writeProxyFailure(w, http.StatusConflict, jobID, fmt.Errorf("job account is missing"))
 			return
 		}
 		account, ok := s.accounts.Get(accountID)
 		if !ok {
-			writeError(w, http.StatusConflict, "job account is no longer available")
+			s.writeProxyFailure(w, http.StatusConflict, jobID, fmt.Errorf("job account %q is no longer available", accountID))
 			return
 		}
 
@@ -695,13 +695,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		file, err := account.Client.GetFile(ctx, result.File.ID)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			s.writeProxyFailure(w, http.StatusBadGateway, jobID, err)
 			return
 		}
 		sourceURL = file.BestDownloadURL()
 	}
 	if sourceURL == "" {
-		writeError(w, http.StatusBadGateway, "download URL is empty")
+		s.writeProxyFailure(w, http.StatusBadGateway, jobID, errors.New("download URL is empty"))
 		return
 	}
 
@@ -712,7 +712,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	proxyReq, err := http.NewRequestWithContext(r.Context(), upstreamMethod, sourceURL, nil)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		s.writeProxyFailure(w, http.StatusBadGateway, jobID, err)
 		return
 	}
 	copyHeaderIfPresent(proxyReq.Header, r.Header, "Range")
@@ -722,7 +722,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := http.DefaultClient.Do(proxyReq)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		s.writeProxyFailure(w, http.StatusBadGateway, jobID, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -748,6 +748,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = io.Copy(w, resp.Body)
+}
+
+const (
+	proxyInvalidLinkError    = "代理链接无效或已过期"
+	proxyNotReadyError       = "代理链接暂不可用，请稍后重试"
+	proxyDownloadFailedError = "代理下载失败，请稍后重试；如多次失败请联系管理员。"
+)
+
+func (s *Server) writeProxyFailure(w http.ResponseWriter, status int, jobID string, err error) {
+	if err != nil {
+		s.logJob(LogError, jobID, "代理下载失败", err.Error())
+	}
+	writeError(w, status, proxyDownloadFailedError)
 }
 
 func (s *Server) processJob(ctx context.Context, jobID string) {

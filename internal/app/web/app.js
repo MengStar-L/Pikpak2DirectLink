@@ -180,7 +180,7 @@ function collectPushItems() {
   const push = (result) => {
     if (!result) return;
     const url = result.direct_url || result.proxy_url;
-    if (url) items.push({ url, name: result.file?.name });
+    if (url) items.push({ url, name: result.file?.path || result.file?.name });
   };
   if (lastResults && lastResults.length) {
     lastResults.forEach(push);
@@ -1030,10 +1030,10 @@ function renderResultNode(node) {
   card.appendChild(head);
 
   if (result.direct_url) {
-    card.appendChild(buildLinkRow('直链', 'direct', result.direct_url, result.file?.name));
+    card.appendChild(buildLinkRow('直链', 'direct', result.direct_url, result.file?.path || result.file?.name));
   }
   if (result.proxy_url) {
-    card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url, result.file?.name));
+    card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url, result.file?.path || result.file?.name));
   }
   return card;
 }

@@ -113,14 +113,41 @@
     return payload?.result;
   }
 
-  // addUri pushes one download URL to aria2. The optional file name becomes
-  // aria2's "out" option so the saved file keeps a sensible name; the configured
-  // dir (if any) becomes "dir".
+  // sanitizeOutPath turns a resolved file's relative path into a safe value for
+  // aria2's "out" option. aria2 writes the file to <dir>/<out>, will create
+  // sub-directories from any "/" in out and even follow "../" out of the download
+  // dir, and on Windows silently truncates a name at an illegal character such as
+  // ':' or '?'. So we keep "/" as a sub-directory separator but, per segment, drop
+  // ""/"."/".." (so a crafted share name can't escape the dir), replace
+  // filesystem-reserved characters with "_", and trim trailing dots/spaces that
+  // Windows forbids. Returns "" when nothing usable remains.
+  function sanitizeOutPath(raw) {
+    // Windows treats these as device names (a file called "NUL" silently discards
+    // its bytes — aria2 reports success but writes nothing), so prefix any segment
+    // that is one, with or without an extension.
+    const reserved = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+    const segments = String(raw == null ? '' : raw).replace(/\\/g, '/').split('/');
+    const safe = [];
+    for (let seg of segments) {
+      seg = seg.replace(/[\x00-\x1f<>:"|?*]/g, '_').replace(/[ .]+$/, '').trim();
+      if (seg === '' || seg === '.' || seg === '..') continue;
+      if (reserved.test(seg)) seg = '_' + seg;
+      safe.push(seg);
+    }
+    return safe.join('/');
+  }
+
+  // addUri pushes one download URL to aria2. The name argument is the file's
+  // relative path; it becomes aria2's "out" option (sanitized) so the saved file
+  // keeps its real name and, for a file inside a resolved folder, its
+  // sub-directory — which also stops same-named files in different folders from
+  // overwriting each other. The configured dir (if any) becomes "dir".
   function addUri(url, name, cfg) {
     cfg = cfg || loadConfig();
     const options = {};
     if (cfg.dir) options.dir = cfg.dir;
-    if (name) options.out = name;
+    const out = sanitizeOutPath(name);
+    if (out) options.out = out;
     return rpc('aria2.addUri', [[url], options], cfg);
   }
 
@@ -146,6 +173,8 @@
   }
 
   // pushMany sends a list of {url, name} items, reporting an aggregate result.
+  let pushManyBusy = false;
+
   async function pushMany(items) {
     const list = (items || []).filter((it) => it && it.url);
     if (list.length === 0) {
@@ -157,15 +186,27 @@
       openConfig();
       return;
     }
+    if (pushManyBusy) return;
+
+    pushManyBusy = true;
+    showPushOverlay(list.length);
     let ok = 0;
     const failures = [];
-    for (const it of list) {
-      try {
-        await addUri(it.url, it.name);
-        ok += 1;
-      } catch (e) {
-        failures.push(e.message);
+    try {
+      for (let i = 0; i < list.length; i++) {
+        const it = list[i];
+        updatePushOverlay(i, list.length, it.name);
+        try {
+          await addUri(it.url, it.name);
+          ok += 1;
+        } catch (e) {
+          failures.push(e.message);
+        }
+        updatePushOverlay(i + 1, list.length, it.name);
       }
+    } finally {
+      await hidePushOverlay();
+      pushManyBusy = false;
     }
     if (failures.length === 0) {
       toast(`已推送 ${ok} 个链接到 aria2`, 'success');
@@ -174,6 +215,77 @@
     } else {
       toast('推送失败：' + (failures[0] || '未知错误'), 'error');
     }
+  }
+
+  let pushOverlay = null;
+
+  function buildPushOverlay() {
+    if (pushOverlay) return pushOverlay;
+    pushOverlay = document.createElement('div');
+    pushOverlay.className = 'aria2-push-overlay hidden';
+    pushOverlay.setAttribute('role', 'status');
+    pushOverlay.setAttribute('aria-live', 'polite');
+    pushOverlay.setAttribute('aria-busy', 'false');
+    pushOverlay.innerHTML = `
+      <div class="aria2-push-panel">
+        <div class="aria2-push-spinner" aria-hidden="true"></div>
+        <div class="aria2-push-copy">
+          <h2>正在推送到 aria2</h2>
+          <p class="aria2-push-progress">准备中</p>
+          <p class="aria2-push-detail">请保持此页面打开</p>
+        </div>
+      </div>`;
+    document.body.appendChild(pushOverlay);
+    return pushOverlay;
+  }
+
+  function pushOverlayEls() {
+    buildPushOverlay();
+    return {
+      progress: pushOverlay.querySelector('.aria2-push-progress'),
+      detail: pushOverlay.querySelector('.aria2-push-detail'),
+    };
+  }
+
+  function showPushOverlay(total) {
+    const els = pushOverlayEls();
+    els.progress.textContent = `0 / ${total}`;
+    els.detail.textContent = '正在连接 aria2...';
+    pushOverlay.classList.remove('closing');
+    pushOverlay.classList.remove('hidden');
+    pushOverlay.setAttribute('aria-busy', 'true');
+  }
+
+  function updatePushOverlay(done, total, name) {
+    if (!pushOverlay || pushOverlay.classList.contains('hidden')) return;
+    const els = pushOverlayEls();
+    els.progress.textContent = `${done} / ${total}`;
+    const cleanName = String(name || '').trim();
+    els.detail.textContent = cleanName ? `正在推送：${cleanName}` : '正在推送链接...';
+  }
+
+  function hidePushOverlay() {
+    if (!pushOverlay || pushOverlay.classList.contains('hidden')) {
+      return Promise.resolve();
+    }
+    pushOverlay.setAttribute('aria-busy', 'false');
+    pushOverlay.classList.add('closing');
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        pushOverlay.classList.add('hidden');
+        pushOverlay.classList.remove('closing');
+        resolve();
+      };
+      pushOverlay.addEventListener('animationend', function handler(e) {
+        if (e.target !== pushOverlay) return;
+        pushOverlay.removeEventListener('animationend', handler);
+        finish();
+      });
+      window.setTimeout(finish, 320);
+    });
   }
 
   // --- Config modal ---
@@ -364,4 +476,3 @@
     pushButton,
   };
 })();
-

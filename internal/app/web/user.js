@@ -110,7 +110,7 @@ function collectPushItems() {
   const items = [];
   for (const result of lastResults || []) {
     const url = result.direct_url || result.proxy_url;
-    if (url) items.push({ url, name: result.file?.name });
+    if (url) items.push({ url, name: result.file?.path || result.file?.name });
   }
   return items;
 }
@@ -636,10 +636,10 @@ function renderResults(job, results) {
       card.appendChild(head);
 
       if (result.direct_url) {
-        card.appendChild(buildLinkRow('直链', 'direct', result.direct_url, result.file?.name));
+        card.appendChild(buildLinkRow('直链', 'direct', result.direct_url, result.file?.path || result.file?.name));
       }
       if (result.proxy_url) {
-        card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url, result.file?.name));
+        card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url, result.file?.path || result.file?.name));
       }
       resultList.appendChild(card);
     }

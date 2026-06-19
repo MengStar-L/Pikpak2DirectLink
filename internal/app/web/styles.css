@@ -1137,6 +1137,71 @@ button:disabled {
   margin-top: 4px;
 }
 
+.aria2-push-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2300;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(20, 30, 48, 0.46);
+  backdrop-filter: blur(4px);
+  animation: view-enter 0.22s var(--ease) both;
+}
+.aria2-push-overlay.closing {
+  animation: view-exit 0.22s var(--ease) both;
+}
+.aria2-push-overlay.closing .aria2-push-panel {
+  animation: modal-exit 0.22s var(--ease) both;
+}
+.aria2-push-panel {
+  width: min(360px, 100%);
+  display: grid;
+  justify-items: center;
+  gap: 18px;
+  padding: 28px 26px;
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  border-radius: var(--radius-lg);
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: var(--shadow-lift);
+  text-align: center;
+  animation: rise-in 0.28s var(--ease) both;
+}
+.aria2-push-spinner {
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  border: 4px solid var(--green-soft);
+  border-top-color: var(--green);
+  border-right-color: var(--primary);
+  animation: aria2-spin 0.9s linear infinite;
+}
+.aria2-push-copy {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.aria2-push-copy h2 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.25;
+}
+.aria2-push-progress {
+  margin: 0;
+  color: var(--primary);
+  font-size: 15px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+.aria2-push-detail {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 750;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
 /* View transition for the CDK gate <-> app swap on the user portal. */
 @keyframes view-enter {
   from { opacity: 0; transform: translateY(12px) scale(0.99); }
@@ -1150,12 +1215,19 @@ button:disabled {
   from { opacity: 1; transform: none; }
   to   { opacity: 0; transform: translateY(10px) scale(0.98); }
 }
+@keyframes aria2-spin {
+  to { transform: rotate(360deg); }
+}
 .view-enter { animation: view-enter 0.32s cubic-bezier(0.22, 1, 0.36, 1) both; }
 @media (prefers-reduced-motion: reduce) {
   .view-enter { animation: none; }
   .aria2-overlay,
   .aria2-overlay.closing,
-  .aria2-overlay.closing .aria2-modal { animation: none; }
+  .aria2-overlay.closing .aria2-modal,
+  .aria2-push-overlay,
+  .aria2-push-overlay.closing,
+  .aria2-push-overlay.closing .aria2-push-panel,
+  .aria2-push-spinner { animation: none; }
 }
 
 /* --- CDK user portal: file tree + multi-link results --- */
