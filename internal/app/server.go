@@ -43,6 +43,8 @@ type Server struct {
 	batches      map[string]*batchState
 }
 
+const resourceParseErrorThreshold = 2
+
 type configResponse struct {
 	Configured            bool   `json:"configured"`
 	AccountCount          int    `json:"account_count"`
@@ -66,7 +68,8 @@ type createJobRequest struct {
 }
 
 type selectItemRequest struct {
-	ItemID string `json:"item_id"`
+	ItemIDs []string `json:"item_ids"`
+	ItemID  string   `json:"item_id"`
 }
 
 type loginRequest struct {
@@ -159,7 +162,14 @@ func NewServer(cfg Config) (*Server, error) {
 	// switches the per-job budget from the snappy serial timeout to the longer
 	// parallel one.
 	initialConcurrency := server.settings.getInt(settingKeyConcurrency, cfg.ResolveConcurrency)
-	server.resolver = newResolveQueue(cfg.QueueTimeout, cfg.ParallelTimeout, initialConcurrency, server.failJob)
+	serialTimeout := cfg.QueueTimeout
+	parallelTimeout := cfg.ParallelTimeout
+	if savedTimeout := server.settings.getInt(settingKeyTaskTimeoutSeconds, 0); savedTimeout >= minTaskTimeoutSeconds && savedTimeout <= maxTaskTimeoutSeconds {
+		timeout := time.Duration(savedTimeout) * time.Second
+		serialTimeout = timeout
+		parallelTimeout = timeout
+	}
+	server.resolver = newResolveQueue(serialTimeout, parallelTimeout, initialConcurrency, server.failJob)
 	go server.resolver.run()
 
 	server.mux.Handle("GET /app.js", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -636,7 +646,12 @@ func (s *Server) handleSelectItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updatedJob, status, msg := s.applyItemSelection(r.PathValue("id"), req.ItemID)
+	ids := req.ItemIDs
+	if len(ids) == 0 && req.ItemID != "" {
+		ids = []string{req.ItemID}
+	}
+
+	updatedJob, status, msg := s.applyItemsSelection(r.PathValue("id"), ids)
 	if status != 0 {
 		writeError(w, status, msg)
 		return
@@ -775,6 +790,7 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 	}
 
 	var failures []string
+	parseErrors := 0
 	for _, account := range accounts {
 		// Stop as soon as the global per-job budget (the resolve queue's hard
 		// timeout) is spent — the next queued job should get its turn.
@@ -820,6 +836,23 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 			return
 		}
 
+		// "record not found" is a bad-resource parse failure, not proof that the
+		// account is broken. Two independent account hits are enough signal to
+		// stop this link while leaving the rest of a multi-link batch running.
+		if isResourceParseError(err) {
+			parseErrors++
+			message := friendlyPikPakError(err)
+			s.accounts.MarkAvailable(account.ID)
+			s.accounts.RecordParseError(account.ID, jobID, message)
+			s.finishAccountAttempt(jobID, account.ID, "failed", message)
+			s.logJob(LogWarn, jobID, fmt.Sprintf("资源解析错误（%d/%d），账号不禁用", parseErrors, resourceParseErrorThreshold), message)
+			if parseErrors >= resourceParseErrorThreshold {
+				s.failJob(jobID, errors.New(badResourceParseUserError))
+				return
+			}
+			continue
+		}
+
 		// A global-budget timeout (or cancellation) is not the account's fault,
 		// so don't mark it failed — just stop and let the next job run.
 		if ctx.Err() != nil {
@@ -837,6 +870,12 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 		budget := s.resolver.currentTimeout()
 		s.logJob(LogError, jobID, "解析超时，已自动跳过", "上限："+budget.String())
 		s.failJob(jobID, fmt.Errorf("解析超时：%s 内未完成", budget))
+		return
+	}
+
+	if parseErrors > 0 && len(failures) == 0 {
+		s.logJob(LogWarn, jobID, "资源解析错误，已终止解析", badResourceParseUserError)
+		s.failJob(jobID, errors.New(badResourceParseUserError))
 		return
 	}
 

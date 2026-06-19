@@ -253,7 +253,20 @@
               </div>
             </div>
           </div>
-          <div id="selectionList" class="selection-list"></div>
+          <div class="tree-toolbar">
+            <label class="tree-check-all">
+              <input id="selectAll" type="checkbox">
+              <span>全选文件</span>
+            </label>
+            <span id="selectionSummary" class="muted">已选 0 项</span>
+          </div>
+          <div id="selectionTree" class="selection-tree"></div>
+          <div class="tree-actions">
+            <button id="generateButton" type="button" class="primary button-large" disabled>
+              <svg class="ui-icon"><use href="#icon-play"></use></svg>
+              <span class="button-label">生成下载链接</span>
+            </button>
+          </div>
         </section>
 
         <section id="resultPanel" class="panel result-panel hidden">
@@ -450,7 +463,7 @@
               <span class="title-icon orange" aria-hidden="true"><svg class="ui-icon"><use href="#icon-bolt"></use></svg></span>
               <div>
                 <h2>并行解析</h2>
-                <p>设置同时解析的任务数量。串行（1）逐个解析；并行（&gt;1）可同时处理多个链接，并自动轮询可用账号</p>
+                <p>设置同时解析的任务数量和新任务超时时间。串行（1）逐个解析；并行（&gt;1）可同时处理多个链接</p>
               </div>
             </div>
           </div>
@@ -458,6 +471,10 @@
             <label class="field floating">
               <input id="concurrencyInput" name="concurrency" type="number" min="1" step="1" inputmode="numeric" placeholder=" ">
               <span class="floating-label">并发解析数（1 为串行）</span>
+            </label>
+            <label class="field floating">
+              <input id="taskTimeoutInput" name="task_timeout_minutes" type="number" min="1" max="720" step="1" inputmode="numeric" placeholder=" ">
+              <span class="floating-label">任务超时（分钟）</span>
             </label>
             <button id="concurrencySubmitButton" type="submit" class="primary button-large">
               <svg class="ui-icon"><use href="#icon-bolt"></use></svg>

@@ -559,7 +559,7 @@ type userJobView struct {
 	UpdatedAt  time.Time      `json:"updated_at"`
 }
 
-// genericUserJobError is the only failure text a CDK user ever sees. Internal
+// genericUserJobError is the fallback failure text a CDK user sees. Internal
 // errors are deliberately collapsed into it because the raw error can embed
 // platform secrets — most notably the PikPak account usernames, which
 // processJob concatenates into the "all accounts failed" error. CDK users must
@@ -587,9 +587,16 @@ func toUserJobView(job *Job) userJobView {
 		UpdatedAt: job.UpdatedAt,
 	}
 	if job.Status == JobFailed || job.Error != "" {
-		view.Error = genericUserJobError
+		view.Error = safeUserError(job.Error)
 	}
 	return view
+}
+
+func safeUserError(message string) string {
+	if isBadResourceUserError(message) {
+		return badResourceParseUserError
+	}
+	return genericUserJobError
 }
 
 // safeUserMessage derives a CDK-user-facing progress string purely from the

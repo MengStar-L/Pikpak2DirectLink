@@ -205,6 +205,14 @@ func TestUserJobViewHidesAccountInfo(t *testing.T) {
 	if weird.Error != genericUserJobError {
 		t.Fatalf("stray error not scrubbed, got %q", weird.Error)
 	}
+
+	badResource := toUserJobView(&Job{ID: "job4", Status: JobFailed, Error: badResourceParseUserError})
+	if badResource.Error != badResourceParseUserError {
+		t.Fatalf("bad resource error should be user-visible, got %q", badResource.Error)
+	}
+	if contains(badResource.Error, "@") {
+		t.Fatalf("bad resource error leaked account info: %q", badResource.Error)
+	}
 }
 
 func contains(haystack, needle string) bool {

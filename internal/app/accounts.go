@@ -57,6 +57,8 @@ type AccountSummary struct {
 	TrafficLimited   bool          `json:"traffic_limited"`
 	LastError        string        `json:"last_error,omitempty"`
 	LastFailedAt     string        `json:"last_failed_at,omitempty"`
+	ParseErrorCount  int           `json:"parse_error_count"`
+	ParseErrors      []ParseError  `json:"parse_errors,omitempty"`
 	CreatedAt        time.Time     `json:"created_at"`
 	UpdatedAt        time.Time     `json:"updated_at"`
 }
@@ -83,8 +85,15 @@ type accountRecord struct {
 	TrafficPeriod    string        `json:"traffic_period,omitempty"`
 	LastError        string        `json:"last_error,omitempty"`
 	LastFailedAt     string        `json:"last_failed_at,omitempty"`
+	ParseErrors      []ParseError  `json:"parse_errors,omitempty"`
 	CreatedAt        time.Time     `json:"created_at"`
 	UpdatedAt        time.Time     `json:"updated_at"`
+}
+
+type ParseError struct {
+	Time    string `json:"time"`
+	JobID   string `json:"job_id,omitempty"`
+	Message string `json:"message"`
 }
 
 type accountState struct {
@@ -101,6 +110,8 @@ type AccountPool struct {
 }
 
 const premiumRefreshInterval = 30 * time.Minute
+
+const badResourceParseUserError = "该磁链连续遇到解析错误，请不要反复重试此链接。"
 
 func NewAccountPool(cfg AccountPoolConfig) (*AccountPool, error) {
 	cfg.AccountsFile = strings.TrimSpace(cfg.AccountsFile)
@@ -162,6 +173,7 @@ func (p *AccountPool) Add(ctx context.Context, username, password string, traffi
 	// Re-adding an existing account keeps its accrued usage for the month.
 	if existed {
 		record.TrafficUsed = existingState.record.TrafficUsed
+		record.ParseErrors = append([]ParseError(nil), existingState.record.ParseErrors...)
 		if existingState.record.TrafficPeriod != "" {
 			record.TrafficPeriod = existingState.record.TrafficPeriod
 		}
@@ -437,6 +449,28 @@ func (p *AccountPool) MarkAvailable(id string) {
 	_ = p.saveLocked()
 }
 
+func (p *AccountPool) RecordParseError(id, jobID, message string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state := p.accounts[id]
+	if state == nil {
+		return
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "record not found"
+	}
+	now := time.Now()
+	state.record.ParseErrors = append(state.record.ParseErrors, ParseError{
+		Time:    now.Format(time.RFC3339),
+		JobID:   strings.TrimSpace(jobID),
+		Message: message,
+	})
+	state.record.UpdatedAt = now
+	_ = p.saveLocked()
+}
+
 // SetTrafficLimit updates an account's monthly downstream budget (in bytes).
 func (p *AccountPool) SetTrafficLimit(id string, limitBytes int64) error {
 	if limitBytes <= 0 {
@@ -571,6 +605,8 @@ func (p *AccountPool) summaryLocked(id string) AccountSummary {
 		TrafficLimited:   accountTrafficLimited(state.record, now),
 		LastError:        friendlyPikPakMessage(state.record.LastError),
 		LastFailedAt:     state.record.LastFailedAt,
+		ParseErrorCount:  len(state.record.ParseErrors),
+		ParseErrors:      append([]ParseError(nil), state.record.ParseErrors...),
 		CreatedAt:        state.record.CreatedAt,
 		UpdatedAt:        state.record.UpdatedAt,
 	}
@@ -696,4 +732,21 @@ func isResourceUnavailableMessage(lower string) bool {
 	return strings.Contains(lower, "copyright") ||
 		strings.Contains(lower, "harmful content") ||
 		strings.Contains(lower, "no longer available")
+}
+
+// isResourceParseError reports whether PikPak rejected this specific resource
+// while the account/session itself should stay healthy.
+func isResourceParseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isResourceParseMessage(strings.ToLower(err.Error()))
+}
+
+func isResourceParseMessage(lower string) bool {
+	return strings.Contains(lower, "record not found")
+}
+
+func isBadResourceUserError(message string) bool {
+	return strings.TrimSpace(message) == badResourceParseUserError
 }

@@ -22,6 +22,7 @@ type batchState struct {
 	done      int
 	succeeded int
 	results   []JobResult
+	failures  []BatchFailure
 }
 
 func (s *Server) registerBatch(bs *batchState) {
@@ -164,9 +165,15 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 			bs.results = append(bs.results, merged)
 		}
 		bs.succeeded++
+	} else if ok && child.Status == JobFailed && isBadResourceUserError(child.Error) {
+		bs.failures = append(bs.failures, BatchFailure{
+			Label: label,
+			Error: badResourceParseUserError,
+		})
 	}
 	done, total, succeeded := bs.done, bs.total, bs.succeeded
 	results := append([]JobResult(nil), bs.results...)
+	failures := append([]BatchFailure(nil), bs.failures...)
 
 	final := done >= total
 	_, _ = s.jobs.update(parentID, func(p *Job) error {
@@ -176,6 +183,7 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 		p.Batch.Total = total
 		p.Batch.Succeeded = succeeded
 		p.Batch.Failed = done - succeeded
+		p.Batch.Failures = failures
 		if !final {
 			p.Status = JobRunning
 			p.Message = fmt.Sprintf("解析中：%d/%d 条完成", done, total)

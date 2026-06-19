@@ -161,11 +161,32 @@ func (q *resolveQueue) setConcurrency(n int) int {
 	return q.concurrency
 }
 
+func (q *resolveQueue) setTaskTimeout(timeout time.Duration) time.Duration {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.serialTimeout = timeout
+	q.parallelTimeout = timeout
+	return timeout
+}
+
 // concurrencyValue reports the current parallel-slot limit.
 func (q *resolveQueue) concurrencyValue() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.concurrency
+}
+
+func (q *resolveQueue) timeoutSnapshot() (serial, parallel, current time.Duration) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	serial = q.serialTimeout
+	parallel = q.parallelTimeout
+	if q.concurrency > 1 {
+		current = q.parallelTimeout
+	} else {
+		current = q.serialTimeout
+	}
+	return serial, parallel, current
 }
 
 // currentTimeout returns the per-job budget for the current mode: the shorter

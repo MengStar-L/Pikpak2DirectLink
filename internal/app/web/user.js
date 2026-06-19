@@ -37,6 +37,8 @@ let resolveBusy = false;
 // Latest resolved links, tracked so the aria2 "push all" button can read them.
 let lastResults = [];
 let aria2PushAll = null;
+let resourceWarningOverlay = null;
+let lastResourceWarningJobId = null;
 
 // Selection state for the current selection_required job. checkboxByItemId maps
 // a file's item id to its <input> so select-all and tristate folders can drive
@@ -45,6 +47,9 @@ let aria2PushAll = null;
 let checkboxByItemId = new Map();
 let selectionStage = '';
 let selectionJobId = null;
+
+const BAD_RESOURCE_PARSE_MESSAGE = '该磁链连续遇到解析错误，请不要反复重试此链接。';
+const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 boot();
 
@@ -296,8 +301,10 @@ function renderJob(job) {
 
   if (job.error) {
     showError(jobError, job.error);
+    maybeShowResourceWarning(job);
   } else {
     hide(jobError);
+    maybeShowResourceWarning(job);
   }
 
   if (job.status === 'selection_required') {
@@ -593,7 +600,7 @@ function renderResults(job, results) {
   resultPanel.classList.remove('hidden');
   const batch = job.batch;
   resultCount.textContent = batch
-    ? `${batch.succeeded || 0}/${batch.total || 0} 条 · ${results.length} 个文件`
+    ? `${batch.succeeded || 0}/${batch.total || 0} 条${(Number(batch.failed) || 0) > 0 ? ` · 失败 ${Number(batch.failed) || 0} 条` : ''} · ${results.length} 个文件`
     : `${results.length} 个文件`;
   resultList.innerHTML = '';
 
@@ -693,6 +700,7 @@ function buildLinkRow(tagText, tagClass, url, name) {
 function clearJobUI() {
   stopPolling();
   currentJobId = null;
+  lastResourceWarningJobId = null;
   selectionJobId = null;
   selectionStage = '';
   checkboxByItemId = new Map();
@@ -724,6 +732,107 @@ async function copyText(value, button) {
     setButtonLabel(button, '复制失败');
   }
   window.setTimeout(() => setButtonLabel(button, original), 1200);
+}
+
+function maybeShowResourceWarning(job) {
+  const labels = badResourceFailureLabels(job);
+  const hasWarning = job.error === BAD_RESOURCE_PARSE_MESSAGE || labels.length > 0;
+  if (!hasWarning || job.id === lastResourceWarningJobId) {
+    return;
+  }
+  lastResourceWarningJobId = job.id;
+  showResourceWarning(labels);
+}
+
+function badResourceFailureLabels(job) {
+  const failures = Array.isArray(job.batch?.failures) ? job.batch.failures : [];
+  return failures
+    .filter((failure) => failure.error === BAD_RESOURCE_PARSE_MESSAGE)
+    .map((failure) => failure.label)
+    .filter(Boolean);
+}
+
+function showResourceWarning(labels = []) {
+  const overlay = ensureResourceWarningOverlay();
+  const detail = overlay.querySelector('.resource-warning-detail');
+  if (detail) {
+    detail.textContent = labels.length ? `失败链接：${labels.join('、')}` : '';
+    detail.classList.toggle('hidden', labels.length === 0);
+  }
+  overlay.classList.remove('closing');
+  overlay.classList.remove('hidden');
+}
+
+function ensureResourceWarningOverlay() {
+  if (resourceWarningOverlay) return resourceWarningOverlay;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'resource-warning-overlay hidden';
+
+  const modal = document.createElement('div');
+  modal.className = 'resource-warning-modal';
+  modal.setAttribute('role', 'alertdialog');
+  modal.setAttribute('aria-modal', 'true');
+  modal.setAttribute('aria-label', '链接解析失败提醒');
+
+  const mark = document.createElement('div');
+  mark.className = 'resource-warning-mark';
+  mark.textContent = '!';
+
+  const title = document.createElement('h2');
+  title.textContent = '此链接解析失败';
+  const message = document.createElement('p');
+  message.className = 'resource-warning-message';
+  message.textContent = BAD_RESOURCE_PARSE_MESSAGE;
+  const detail = document.createElement('p');
+  detail.className = 'resource-warning-detail hidden';
+
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'primary';
+  setButtonLabel(close, '知道了');
+  close.addEventListener('click', closeResourceWarning);
+
+  modal.appendChild(mark);
+  modal.appendChild(title);
+  modal.appendChild(message);
+  modal.appendChild(detail);
+  modal.appendChild(close);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) {
+      closeResourceWarning();
+    }
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !overlay.classList.contains('hidden')) {
+      closeResourceWarning();
+    }
+  });
+
+  resourceWarningOverlay = overlay;
+  return overlay;
+}
+
+function closeResourceWarning() {
+  const overlay = resourceWarningOverlay;
+  if (!overlay || overlay.classList.contains('hidden') || overlay.classList.contains('closing')) {
+    return;
+  }
+  overlay.classList.add('closing');
+  if (prefersReducedMotion) {
+    overlay.classList.add('hidden');
+    overlay.classList.remove('closing');
+    return;
+  }
+  overlay.addEventListener('animationend', function handler(event) {
+    if (event.target !== overlay) return;
+    overlay.removeEventListener('animationend', handler);
+    overlay.classList.add('hidden');
+    overlay.classList.remove('closing');
+  });
 }
 
 function humanizeStatus(status) {

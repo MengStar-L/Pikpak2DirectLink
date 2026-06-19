@@ -187,6 +187,39 @@ func TestBatchChildDoneAllFailed(t *testing.T) {
 	}
 }
 
+func TestBatchChildDoneRecordsBadResourceFailure(t *testing.T) {
+	t.Parallel()
+
+	s := &Server{jobs: newJobStore(50), batches: make(map[string]*batchState)}
+	parentID := "parentBad"
+	s.jobs.create(&Job{ID: parentID, Kind: ResourceBatch, Status: JobRunning, Batch: &BatchProgress{Total: 2}})
+	s.registerBatch(&batchState{parentID: parentID, baseURL: "https://h", total: 2})
+	s.jobs.create(&Job{
+		ID:     "ok",
+		Status: JobCompleted,
+		Results: []JobResult{{
+			File:       DownloadItem{Name: "ok.mkv", Path: "ok.mkv"},
+			DirectURL:  "https://direct/ok",
+			ProxyToken: "tok",
+		}},
+	})
+	s.jobs.create(&Job{ID: "bad", Status: JobFailed, Error: badResourceParseUserError})
+
+	s.batchChildDone(parentID, "bad", "链接1 Bad")
+	s.batchChildDone(parentID, "ok", "链接2 OK")
+
+	parent, _ := s.jobs.get(parentID)
+	if parent.Status != JobCompleted {
+		t.Fatalf("status = %q, want completed", parent.Status)
+	}
+	if len(parent.Batch.Failures) != 1 {
+		t.Fatalf("failures = %+v, want one", parent.Batch.Failures)
+	}
+	if parent.Batch.Failures[0].Label != "链接1 Bad" || parent.Batch.Failures[0].Error != badResourceParseUserError {
+		t.Fatalf("failure entry = %+v", parent.Batch.Failures[0])
+	}
+}
+
 func keysOf(m map[string]JobResult) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

@@ -24,7 +24,10 @@ const jobError = document.getElementById('jobError');
 const attemptList = document.getElementById('attemptList');
 const selectionPanel = document.getElementById('selectionPanel');
 const selectionHint = document.getElementById('selectionHint');
-const selectionList = document.getElementById('selectionList');
+const selectionTree = document.getElementById('selectionTree');
+const selectAll = document.getElementById('selectAll');
+const selectionSummary = document.getElementById('selectionSummary');
+const generateButton = document.getElementById('generateButton');
 const resultPanel = document.getElementById('resultPanel');
 const resultMode = document.getElementById('resultMode');
 const resultSingle = document.getElementById('resultSingle');
@@ -58,6 +61,7 @@ const passwordFixedNote = document.getElementById('passwordFixedNote');
 
 const concurrencyForm = document.getElementById('concurrencyForm');
 const concurrencyInput = document.getElementById('concurrencyInput');
+const taskTimeoutInput = document.getElementById('taskTimeoutInput');
 const concurrencyState = document.getElementById('concurrencyState');
 const concurrencySubmitButton = document.getElementById('concurrencySubmitButton');
 const concurrencyFormError = document.getElementById('concurrencyFormError');
@@ -124,8 +128,15 @@ let updateStatusTimer = null;
 let updateRestartPending = false;
 let updateServerWentDown = false;
 let updateRestartDeadline = 0;
+let accountErrorOverlay = null;
+let resourceWarningOverlay = null;
+let lastResourceWarningJobId = null;
+let checkboxByItemId = new Map();
+let selectionStage = '';
+let selectionJobId = null;
 
 const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const BAD_RESOURCE_PARSE_MESSAGE = '该磁链连续遇到解析错误，请不要反复重试此链接。';
 
 boot();
 
@@ -205,6 +216,8 @@ function bindActions() {
   accountForm.addEventListener('submit', onAccountSubmit);
   passwordForm.addEventListener('submit', onChangePassword);
   concurrencyForm?.addEventListener('submit', onSaveConcurrency);
+  selectAll?.addEventListener('change', onSelectAll);
+  generateButton?.addEventListener('click', onGenerateSelection);
   logoutButton?.addEventListener('click', onLogout);
   clearLogsButton.addEventListener('click', clearLogs);
   checkUpdateButton.addEventListener('click', onCheckUpdate);
@@ -383,8 +396,23 @@ function renderAccounts() {
     text.appendChild(heading);
 
     const meta = document.createElement('div');
-    meta.className = 'muted';
-    meta.textContent = account.logged_in ? 'session 已保存，可直接用于解析' : '将使用账号密码重新登录';
+    meta.className = 'muted account-meta-line';
+    const metaText = document.createElement('span');
+    metaText.textContent = account.logged_in ? 'session 已保存，可直接用于解析' : '将使用账号密码重新登录';
+    meta.appendChild(metaText);
+    const parseErrorCount = Number(account.parse_error_count) || 0;
+    if (parseErrorCount > 0) {
+      const parseButton = document.createElement('button');
+      parseButton.type = 'button';
+      parseButton.className = 'account-parse-error-pill';
+      parseButton.title = '查看解析错误';
+      parseButton.appendChild(createIcon('alert'));
+      const label = document.createElement('span');
+      label.textContent = `收到 ${parseErrorCount} 条解析错误`;
+      parseButton.appendChild(label);
+      parseButton.addEventListener('click', () => showAccountParseErrors(account));
+      meta.appendChild(parseButton);
+    }
     text.appendChild(meta);
 
     if (account.last_error) {
@@ -440,6 +468,215 @@ function renderAccounts() {
     card.appendChild(side);
     accountList.appendChild(card);
   }
+}
+
+function showAccountParseErrors(account) {
+  const overlay = ensureAccountErrorOverlay();
+  const title = overlay.querySelector('.account-error-modal-title');
+  const subtitle = overlay.querySelector('.account-error-modal-subtitle');
+  const list = overlay.querySelector('.account-error-history');
+  const errors = Array.isArray(account.parse_errors) ? account.parse_errors : [];
+
+  title.textContent = '解析错误记录';
+  subtitle.textContent = account.username || '未命名账号';
+  list.innerHTML = '';
+
+  if (errors.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'account-error-history-empty';
+    empty.textContent = '暂无错误详情';
+    list.appendChild(empty);
+  } else {
+    for (const entry of errors) {
+      const item = document.createElement('li');
+      const meta = document.createElement('span');
+      meta.className = 'account-error-history-meta';
+      meta.textContent = [formatDateTime(entry.time), entry.job_id ? `任务 ${entry.job_id}` : ''].filter(Boolean).join(' · ');
+      const message = document.createElement('strong');
+      message.textContent = entry.message || 'record not found';
+      item.appendChild(meta);
+      item.appendChild(message);
+      list.appendChild(item);
+    }
+  }
+
+  overlay.classList.remove('closing');
+  overlay.classList.remove('hidden');
+}
+
+function ensureAccountErrorOverlay() {
+  if (accountErrorOverlay) return accountErrorOverlay;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'account-error-overlay hidden';
+
+  const modal = document.createElement('div');
+  modal.className = 'account-error-modal';
+  modal.setAttribute('role', 'dialog');
+  modal.setAttribute('aria-modal', 'true');
+  modal.setAttribute('aria-label', '账号解析错误记录');
+
+  const head = document.createElement('div');
+  head.className = 'account-error-modal-head';
+  const titleWrap = document.createElement('div');
+  const title = document.createElement('h2');
+  title.className = 'account-error-modal-title';
+  const subtitle = document.createElement('p');
+  subtitle.className = 'muted account-error-modal-subtitle';
+  titleWrap.appendChild(title);
+  titleWrap.appendChild(subtitle);
+
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'account-error-modal-close';
+  close.setAttribute('aria-label', '关闭');
+  close.textContent = '×';
+
+  head.appendChild(titleWrap);
+  head.appendChild(close);
+
+  const list = document.createElement('ul');
+  list.className = 'account-error-history';
+
+  modal.appendChild(head);
+  modal.appendChild(list);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) {
+      closeAccountErrorOverlay();
+    }
+  });
+  close.addEventListener('click', closeAccountErrorOverlay);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !overlay.classList.contains('hidden')) {
+      closeAccountErrorOverlay();
+    }
+  });
+
+  accountErrorOverlay = overlay;
+  return overlay;
+}
+
+function closeAccountErrorOverlay() {
+  const overlay = accountErrorOverlay;
+  if (!overlay || overlay.classList.contains('hidden') || overlay.classList.contains('closing')) {
+    return;
+  }
+  overlay.classList.add('closing');
+  if (prefersReducedMotion) {
+    overlay.classList.add('hidden');
+    overlay.classList.remove('closing');
+    return;
+  }
+  overlay.addEventListener('animationend', function handler(event) {
+    if (event.target !== overlay) return;
+    overlay.removeEventListener('animationend', handler);
+    overlay.classList.add('hidden');
+    overlay.classList.remove('closing');
+  });
+}
+
+function maybeShowResourceWarning(job) {
+  const labels = badResourceFailureLabels(job);
+  const hasWarning = job.error === BAD_RESOURCE_PARSE_MESSAGE || labels.length > 0;
+  if (!hasWarning || job.id === lastResourceWarningJobId) {
+    return;
+  }
+  lastResourceWarningJobId = job.id;
+  showResourceWarning(labels);
+}
+
+function badResourceFailureLabels(job) {
+  const failures = Array.isArray(job.batch?.failures) ? job.batch.failures : [];
+  return failures
+    .filter((failure) => failure.error === BAD_RESOURCE_PARSE_MESSAGE)
+    .map((failure) => failure.label)
+    .filter(Boolean);
+}
+
+function showResourceWarning(labels = []) {
+  const overlay = ensureResourceWarningOverlay();
+  const detail = overlay.querySelector('.resource-warning-detail');
+  if (detail) {
+    detail.textContent = labels.length ? `失败链接：${labels.join('、')}` : '';
+    detail.classList.toggle('hidden', labels.length === 0);
+  }
+  overlay.classList.remove('closing');
+  overlay.classList.remove('hidden');
+}
+
+function ensureResourceWarningOverlay() {
+  if (resourceWarningOverlay) return resourceWarningOverlay;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'resource-warning-overlay hidden';
+
+  const modal = document.createElement('div');
+  modal.className = 'resource-warning-modal';
+  modal.setAttribute('role', 'alertdialog');
+  modal.setAttribute('aria-modal', 'true');
+  modal.setAttribute('aria-label', '链接解析失败提醒');
+
+  const mark = document.createElement('div');
+  mark.className = 'resource-warning-mark';
+  mark.textContent = '!';
+
+  const title = document.createElement('h2');
+  title.textContent = '此链接解析失败';
+  const message = document.createElement('p');
+  message.className = 'resource-warning-message';
+  message.textContent = BAD_RESOURCE_PARSE_MESSAGE;
+  const detail = document.createElement('p');
+  detail.className = 'resource-warning-detail hidden';
+
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'primary';
+  setButtonLabel(close, '知道了');
+  close.addEventListener('click', closeResourceWarning);
+
+  modal.appendChild(mark);
+  modal.appendChild(title);
+  modal.appendChild(message);
+  modal.appendChild(detail);
+  modal.appendChild(close);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) {
+      closeResourceWarning();
+    }
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !overlay.classList.contains('hidden')) {
+      closeResourceWarning();
+    }
+  });
+
+  resourceWarningOverlay = overlay;
+  return overlay;
+}
+
+function closeResourceWarning() {
+  const overlay = resourceWarningOverlay;
+  if (!overlay || overlay.classList.contains('hidden') || overlay.classList.contains('closing')) {
+    return;
+  }
+  overlay.classList.add('closing');
+  if (prefersReducedMotion) {
+    overlay.classList.add('hidden');
+    overlay.classList.remove('closing');
+    return;
+  }
+  overlay.addEventListener('animationend', function handler(event) {
+    if (event.target !== overlay) return;
+    overlay.removeEventListener('animationend', handler);
+    overlay.classList.add('hidden');
+    overlay.classList.remove('closing');
+  });
 }
 
 function createPremiumBadge(account) {
@@ -534,9 +771,14 @@ function renderSettings(settings) {
     concurrencyInput.value = settings.concurrency;
   }
   concurrencyInput.max = settings.max_concurrency || 32;
-  const timeout = settings.parallel ? settings.parallel_timeout_seconds : settings.serial_timeout_seconds;
+  const timeout = Number(settings.task_timeout_seconds) ||
+    (settings.parallel ? settings.parallel_timeout_seconds : settings.serial_timeout_seconds);
+  if (document.activeElement !== taskTimeoutInput) {
+    taskTimeoutInput.value = Math.max(1, Math.round((timeout || 60) / 60));
+  }
+  taskTimeoutInput.max = Math.max(1, Math.floor((Number(settings.max_task_timeout_seconds) || 43200) / 60));
   const mode = settings.parallel ? `并行 ×${settings.concurrency}` : '串行';
-  concurrencyState.textContent = `${mode} · 单任务超时 ${formatSeconds(timeout)}`;
+  concurrencyState.textContent = `${mode} · 任务超时 ${formatSeconds(timeout)}`;
   // Keep the global status-bar counters in sync with whatever this response saw.
   state.queue = { running: settings.running || 0, waiting: settings.waiting || 0 };
   renderQueueMetrics();
@@ -565,6 +807,8 @@ async function onSaveConcurrency(event) {
 
   const value = Number(concurrencyInput.value);
   const max = Number(concurrencyInput.max) || 32;
+  const timeoutMinutes = Number(taskTimeoutInput.value);
+  const maxTimeoutMinutes = Number(taskTimeoutInput.max) || 720;
   if (!Number.isInteger(value) || value < 1) {
     showConcurrencyError('并发数至少为 1');
     return;
@@ -573,16 +817,28 @@ async function onSaveConcurrency(event) {
     showConcurrencyError(`并发数最多为 ${max}`);
     return;
   }
+  if (!Number.isInteger(timeoutMinutes) || timeoutMinutes < 1) {
+    showConcurrencyError('任务超时时间至少为 1 分钟');
+    return;
+  }
+  if (timeoutMinutes > maxTimeoutMinutes) {
+    showConcurrencyError(`任务超时时间最多为 ${maxTimeoutMinutes} 分钟`);
+    return;
+  }
 
   concurrencySubmitButton.disabled = true;
   setButtonLabel(concurrencySubmitButton, '保存中...');
   try {
     const settings = await api('/api/settings', {
       method: 'PUT',
-      body: JSON.stringify({ concurrency: value }),
+      body: JSON.stringify({
+        concurrency: value,
+        task_timeout_seconds: timeoutMinutes * 60,
+      }),
     });
     renderSettings(settings);
-    showToast(settings.parallel ? `已开启并行解析（×${settings.concurrency}）` : '已切换为串行解析', 'success');
+    const mode = settings.parallel ? `并行解析 ×${settings.concurrency}` : '串行解析';
+    showToast(`${mode} · 超时 ${formatSeconds(settings.task_timeout_seconds)}`, 'success');
   } catch (error) {
     showConcurrencyError(error.message);
   } finally {
@@ -756,15 +1012,20 @@ function renderJob(job) {
 
   if (job.error) {
     showJobError(job.error);
+    maybeShowResourceWarning(job);
   } else {
     hideJobError();
+    maybeShowResourceWarning(job);
   }
 
   if (job.status === 'selection_required') {
     renderSelection(job);
   } else {
     selectionPanel.classList.add('hidden');
-    selectionList.innerHTML = '';
+    selectionTree.innerHTML = '';
+    selectionJobId = null;
+    selectionStage = '';
+    checkboxByItemId = new Map();
   }
 
   // A batch job (or any job carrying several results) renders a folder tree where
@@ -825,42 +1086,243 @@ function renderAttempts(attempts) {
 }
 
 function renderSelection(job) {
+  if (selectionJobId === job.id && selectionStage === job.stage) {
+    return;
+  }
+  selectionJobId = job.id;
+  selectionStage = job.stage;
   selectionPanel.classList.remove('hidden');
-  selectionHint.textContent = job.stage === 'source_selection'
-    ? '先选择要转存的项目'
-    : '选择最终生成链接的文件';
-  selectionList.innerHTML = '';
+  checkboxByItemId = new Map();
+  selectionTree.innerHTML = '';
 
-  for (const item of job.items || []) {
-    const row = document.createElement('article');
-    row.className = 'selection-item neutral';
+  const items = job.items || [];
+  const single = job.stage === 'source_selection';
+  selectionHint.textContent = single
+    ? '该分享含多个项目，请选择要转存的一项'
+    : '勾选需要生成下载链接的文件，可多选';
+  selectAll.closest('.tree-toolbar').classList.toggle('hidden', single);
+  generateButton.parentElement.classList.toggle('hidden', single);
 
-    const info = document.createElement('div');
-    info.className = 'selection-info';
+  const root = buildSelectionTree(items);
+  for (const node of root.children) {
+    selectionTree.appendChild(renderSelectionNode(node, single));
+  }
+  selectAll.checked = false;
+  selectAll.indeterminate = false;
+  updateSelectionSummary();
+}
 
-    const title = document.createElement('strong');
-    title.textContent = item.name || '未命名项目';
-    info.appendChild(title);
+function buildSelectionTree(items) {
+  const root = { name: '', children: [], childMap: new Map(), isFolder: true };
+  for (const item of items) {
+    const parts = (item.path || item.name || '').split('/').filter(Boolean);
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const seg = parts[i];
+      let next = node.childMap.get(seg);
+      if (!next) {
+        next = { name: seg, children: [], childMap: new Map(), isFolder: true };
+        node.childMap.set(seg, next);
+        node.children.push(next);
+      }
+      node = next;
+    }
+    const leafName = parts.length ? parts[parts.length - 1] : (item.name || '未命名');
+    const leaf = { name: leafName, item, children: [], childMap: new Map(), isFolder: false };
+    node.childMap.set(leafName + ':' + item.id, leaf);
+    node.children.push(leaf);
+  }
+  return root;
+}
 
-    const meta = document.createElement('div');
-    meta.className = 'muted';
-    const kind = item.kind && item.kind.toLowerCase().includes('folder') ? '文件夹' : '文件';
-    meta.textContent = [item.path || item.name, kind, formatBytes(item.size)].filter(Boolean).join(' · ');
-    info.appendChild(meta);
+function renderSelectionNode(node, single) {
+  if (node.isFolder) {
+    const wrap = document.createElement('div');
+    wrap.className = 'tree-folder';
 
+    const row = document.createElement('div');
+    row.className = 'tree-row tree-folder-row';
+
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'tree-toggle';
+    toggle.innerHTML = '<svg class="ui-icon"><use href="#icon-chevron"></use></svg>';
+
+    const childrenWrap = document.createElement('div');
+    childrenWrap.className = 'tree-children';
+    const childrenInner = document.createElement('div');
+    childrenInner.className = 'tree-children-inner';
+    childrenWrap.appendChild(childrenInner);
+
+    let open = true;
+    toggle.addEventListener('click', () => {
+      open = !open;
+      childrenWrap.classList.toggle('collapsed', !open);
+      toggle.classList.toggle('collapsed', !open);
+    });
+
+    const label = document.createElement('span');
+    label.className = 'tree-label';
+    label.innerHTML = '<svg class="ui-icon tree-folder-icon"><use href="#icon-folder"></use></svg>';
+    const folderName = document.createElement('span');
+    folderName.textContent = node.name;
+    label.appendChild(folderName);
+
+    row.appendChild(toggle);
+    if (!single) {
+      const folderCheck = document.createElement('input');
+      folderCheck.type = 'checkbox';
+      folderCheck.className = 'tree-checkbox';
+      folderCheck.addEventListener('change', () => {
+        popCheckbox(folderCheck);
+        setSubtreeChecked(node, folderCheck.checked);
+        refreshFolderStates();
+        updateSelectionSummary();
+      });
+      row.appendChild(folderCheck);
+    }
+    row.appendChild(label);
+    wrap.appendChild(row);
+
+    for (const child of node.children) {
+      childrenInner.appendChild(renderSelectionNode(child, single));
+    }
+    wrap.appendChild(childrenWrap);
+    return wrap;
+  }
+
+  const row = document.createElement('div');
+  row.className = 'tree-row tree-file-row';
+  const label = document.createElement('label');
+  label.className = 'tree-label tree-file-label';
+
+  if (single) {
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = 'secondary';
-    setButtonContent(button, job.stage === 'source_selection' ? '转存这一项' : '生成链接', 'play');
-    button.addEventListener('click', () => chooseItem(job.id, item.id, button));
-
-    row.appendChild(info);
+    button.className = 'secondary compact';
+    setButtonLabel(button, '转存这一项');
+    button.addEventListener('click', () => chooseSelectionItem(selectionJobId, node.item.id, button));
+    const meta = document.createElement('span');
+    meta.className = 'tree-file-meta';
+    meta.textContent = formatBytes(node.item.size);
+    label.innerHTML = '<svg class="ui-icon tree-file-icon"><use href="#icon-file"></use></svg>';
+    const name = document.createElement('span');
+    name.className = 'tree-file-name';
+    name.textContent = node.name;
+    label.appendChild(name);
+    row.appendChild(label);
+    row.appendChild(meta);
     row.appendChild(button);
-    selectionList.appendChild(row);
+    return row;
+  }
+
+  const check = document.createElement('input');
+  check.type = 'checkbox';
+  check.className = 'tree-checkbox';
+  check.addEventListener('change', () => {
+    popCheckbox(check);
+    refreshFolderStates();
+    updateSelectionSummary();
+  });
+  checkboxByItemId.set(node.item.id, check);
+
+  label.innerHTML = '<svg class="ui-icon tree-file-icon"><use href="#icon-file"></use></svg>';
+  const name = document.createElement('span');
+  name.className = 'tree-file-name';
+  name.textContent = node.name;
+  label.appendChild(name);
+
+  const meta = document.createElement('span');
+  meta.className = 'tree-file-meta';
+  meta.textContent = formatBytes(node.item.size);
+
+  row.appendChild(check);
+  row.appendChild(label);
+  row.appendChild(meta);
+  return row;
+}
+
+function popCheckbox(box) {
+  box.classList.remove('pop');
+  void box.offsetWidth;
+  box.classList.add('pop');
+}
+
+function setSubtreeChecked(node, checked) {
+  for (const child of node.children) {
+    if (child.isFolder) {
+      setSubtreeChecked(child, checked);
+    } else {
+      const cb = checkboxByItemId.get(child.item.id);
+      if (cb) cb.checked = checked;
+    }
   }
 }
 
-async function chooseItem(jobId, itemId, button) {
+function refreshFolderStates() {
+  const folders = selectionTree.querySelectorAll('.tree-folder');
+  folders.forEach((el) => {
+    const checks = el.querySelectorAll('.tree-file-row .tree-checkbox');
+    const folderCheck = el.querySelector(':scope > .tree-folder-row .tree-checkbox');
+    if (!folderCheck) return;
+    let total = 0;
+    let on = 0;
+    checks.forEach((c) => { total += 1; if (c.checked) on += 1; });
+    folderCheck.checked = total > 0 && on === total;
+    folderCheck.indeterminate = on > 0 && on < total;
+  });
+
+  const all = [...checkboxByItemId.values()];
+  const on = all.filter((c) => c.checked).length;
+  selectAll.checked = all.length > 0 && on === all.length;
+  selectAll.indeterminate = on > 0 && on < all.length;
+}
+
+function onSelectAll() {
+  for (const cb of checkboxByItemId.values()) cb.checked = selectAll.checked;
+  selectAll.indeterminate = false;
+  refreshFolderStates();
+  updateSelectionSummary();
+}
+
+function selectedItemIds() {
+  const ids = [];
+  for (const [id, cb] of checkboxByItemId) {
+    if (cb.checked) ids.push(id);
+  }
+  return ids;
+}
+
+function updateSelectionSummary() {
+  const count = selectedItemIds().length;
+  selectionSummary.textContent = `已选 ${count} 项`;
+  generateButton.disabled = count === 0;
+}
+
+async function onGenerateSelection() {
+  const ids = selectedItemIds();
+  if (!ids.length || !selectionJobId) return;
+  generateButton.disabled = true;
+  setButtonLabel(generateButton, '生成中...');
+  try {
+    const job = await api(`/api/jobs/${selectionJobId}/select`, {
+      method: 'POST',
+      body: JSON.stringify({ item_ids: ids }),
+    });
+    currentJobId = job.id;
+    selectionPanel.classList.add('hidden');
+    renderJob(job);
+    setResolveBusy(true);
+    startPolling();
+  } catch (error) {
+    showJobError(error.message);
+    generateButton.disabled = false;
+  } finally {
+    setButtonLabel(generateButton, '生成下载链接');
+  }
+}
+
+async function chooseSelectionItem(jobId, itemId, button) {
   const previousText = getButtonLabel(button);
   button.disabled = true;
   setButtonLabel(button, '处理中...');
@@ -868,10 +1330,12 @@ async function chooseItem(jobId, itemId, button) {
   try {
     const job = await api(`/api/jobs/${jobId}/select`, {
       method: 'POST',
-      body: JSON.stringify({ item_id: itemId }),
+      body: JSON.stringify({ item_ids: [itemId] }),
     });
     renderJob(job);
     currentJobId = job.id;
+    selectionPanel.classList.add('hidden');
+    setResolveBusy(true);
     startPolling();
   } catch (error) {
     showJobError(error.message);
@@ -923,7 +1387,10 @@ function renderResultTree(job, results) {
 
   const batch = job.batch;
   if (batch) {
-    resultMode.textContent = `解析成功 ${batch.succeeded || 0}/${batch.total || 0} 条`;
+    const failed = Number(batch.failed) || 0;
+    resultMode.textContent = failed > 0
+      ? `解析成功 ${batch.succeeded || 0}/${batch.total || 0} 条 · 失败 ${failed} 条`
+      : `解析成功 ${batch.succeeded || 0}/${batch.total || 0} 条`;
     resultMode.className = `status-pill ${(batch.succeeded || 0) > 0 ? 'success' : 'danger'}`;
   } else {
     resultMode.textContent = `${results.length} 个文件`;
@@ -1679,12 +2146,16 @@ function hideCdkGenError() {
 function clearJobUI() {
   stopPolling();
   currentJobId = null;
+  lastResourceWarningJobId = null;
   lastResults = null;
   lastSingleResult = null;
   refreshAria2PushAll();
   hideJobError();
   selectionPanel.classList.add('hidden');
-  selectionList.innerHTML = '';
+  selectionTree.innerHTML = '';
+  selectionJobId = null;
+  selectionStage = '';
+  checkboxByItemId = new Map();
   resultPanel.classList.add('hidden');
   if (resultTree) resultTree.innerHTML = '';
   renderAttempts([]);

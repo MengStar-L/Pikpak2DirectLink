@@ -229,4 +229,15 @@ func TestResolveQueueTimeoutTracksMode(t *testing.T) {
 	if got := q.setConcurrency(0); got != 1 {
 		t.Fatalf("setConcurrency floor = %d, want 1", got)
 	}
+	unified := 9 * time.Minute
+	if got := q.setTaskTimeout(unified); got != unified {
+		t.Fatalf("setTaskTimeout = %s, want %s", got, unified)
+	}
+	if got := q.currentTimeout(); got != unified {
+		t.Fatalf("unified serial timeout = %s, want %s", got, unified)
+	}
+	q.setConcurrency(3)
+	if got := q.currentTimeout(); got != unified {
+		t.Fatalf("unified parallel timeout = %s, want %s", got, unified)
+	}
 }

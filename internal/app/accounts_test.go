@@ -310,6 +310,32 @@ func TestAccountSetTrafficLimit(t *testing.T) {
 	}
 }
 
+func TestRecordParseErrorKeepsAccountAvailable(t *testing.T) {
+	t.Parallel()
+	pool := newTrafficTestPool(t)
+	pool.injectAccount(accountRecord{ID: "a", Username: "a@example.com", Status: AccountAvailable, TrafficLimit: 700 * bytesPerGB, TrafficPeriod: monthKey(time.Now())})
+
+	pool.RecordParseError("a", "job1", "record not found")
+
+	summaries := pool.List()
+	if len(summaries) != 1 {
+		t.Fatalf("summaries len = %d, want 1", len(summaries))
+	}
+	got := summaries[0]
+	if got.Status != AccountAvailable {
+		t.Fatalf("status = %q, want available", got.Status)
+	}
+	if got.LastError != "" {
+		t.Fatalf("last error = %q, want empty", got.LastError)
+	}
+	if got.ParseErrorCount != 1 || len(got.ParseErrors) != 1 {
+		t.Fatalf("parse errors = count %d list %+v, want one", got.ParseErrorCount, got.ParseErrors)
+	}
+	if got.ParseErrors[0].JobID != "job1" || got.ParseErrors[0].Message != "record not found" {
+		t.Fatalf("parse error entry = %+v", got.ParseErrors[0])
+	}
+}
+
 func TestResolveOrderExcludesOverLimit(t *testing.T) {
 	t.Parallel()
 	pool := newTrafficTestPool(t)
@@ -362,6 +388,32 @@ func TestIsResourceUnavailableError(t *testing.T) {
 			t.Parallel()
 			if got := isResourceUnavailableError(tc.err); got != tc.want {
 				t.Fatalf("isResourceUnavailableError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsResourceParseError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "record not found", err: errors.New("record not found"), want: true},
+		{name: "wrapped api response", err: errors.New("pikpak api failed: record not found"), want: true},
+		{name: "nil", err: nil, want: false},
+		{name: "ordinary auth failure", err: errors.New("login failed"), want: false},
+		{name: "copyright takedown", err: errors.New("no longer available"), want: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isResourceParseError(tc.err); got != tc.want {
+				t.Fatalf("isResourceParseError(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}

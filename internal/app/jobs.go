@@ -68,9 +68,15 @@ type JobResult struct {
 // BatchProgress is the parent-job rollup for a multi-line submission, surfaced to
 // the front-end so it can show "解析成功 x/x 条".
 type BatchProgress struct {
-	Total     int `json:"total"`
-	Succeeded int `json:"succeeded"`
-	Failed    int `json:"failed"`
+	Total     int            `json:"total"`
+	Succeeded int            `json:"succeeded"`
+	Failed    int            `json:"failed"`
+	Failures  []BatchFailure `json:"failures,omitempty"`
+}
+
+type BatchFailure struct {
+	Label string `json:"label"`
+	Error string `json:"error"`
 }
 
 type AccountAttempt struct {
@@ -220,6 +226,9 @@ func cloneJob(job *Job) *Job {
 	}
 	if job.Batch != nil {
 		batchCopy := *job.Batch
+		if len(job.Batch.Failures) > 0 {
+			batchCopy.Failures = append([]BatchFailure(nil), job.Batch.Failures...)
+		}
 		copyJob.Batch = &batchCopy
 	}
 	return &copyJob

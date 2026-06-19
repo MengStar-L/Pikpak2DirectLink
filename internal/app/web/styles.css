@@ -890,6 +890,32 @@ button:disabled {
   gap: 8px;
   flex-wrap: wrap;
 }
+.account-meta-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.account-parse-error-pill {
+  min-height: 26px;
+  padding: 0 10px;
+  gap: 6px;
+  color: #d83c75;
+  background: var(--pink-soft);
+  border-color: var(--pink-line);
+  font-size: 12px;
+  font-weight: 850;
+  box-shadow: none;
+}
+.account-parse-error-pill:not(:disabled):hover {
+  color: #c92d66;
+  background: #ffe7f3;
+  border-color: #ffc1dd;
+}
+.account-parse-error-pill .ui-icon {
+  width: 14px;
+  height: 14px;
+}
 .account-side {
   display: flex;
   align-items: center;
@@ -1063,6 +1089,159 @@ button:disabled {
 
 .hidden { display: none !important; }
 
+.account-error-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2200;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(20, 30, 48, 0.42);
+  backdrop-filter: blur(3px);
+  animation: view-enter 0.22s var(--ease) both;
+}
+.account-error-overlay.closing {
+  animation: view-exit 0.2s var(--ease) both;
+}
+.account-error-overlay.closing .account-error-modal {
+  animation: modal-exit 0.2s var(--ease) both;
+}
+.account-error-modal {
+  width: min(560px, 100%);
+  max-height: min(680px, calc(100vh - 40px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 14px;
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: #fff;
+  box-shadow: var(--shadow-lift);
+}
+.account-error-modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+.account-error-modal-head h2 {
+  margin: 0;
+  font-size: 18px;
+}
+.account-error-modal-subtitle {
+  margin: 5px 0 0;
+  word-break: break-word;
+}
+.account-error-modal-close {
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  color: var(--text-muted);
+}
+.account-error-history {
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+  overflow: auto;
+  list-style: none;
+}
+.account-error-history li {
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--pink-line);
+  border-radius: var(--radius-sm);
+  background: var(--pink-soft);
+}
+.account-error-history strong {
+  color: #d83c75;
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.account-error-history-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.4;
+  word-break: break-word;
+}
+.account-error-history-empty {
+  color: var(--text-muted);
+  background: var(--surface-soft) !important;
+  border-color: var(--border) !important;
+}
+
+.resource-warning-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2250;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(20, 30, 48, 0.46);
+  backdrop-filter: blur(4px);
+  animation: view-enter 0.22s var(--ease) both;
+}
+.resource-warning-overlay.closing {
+  animation: view-exit 0.2s var(--ease) both;
+}
+.resource-warning-overlay.closing .resource-warning-modal {
+  animation: modal-exit 0.2s var(--ease) both;
+}
+.resource-warning-modal {
+  width: min(420px, 100%);
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+  padding: 26px 24px 24px;
+  border: 1px solid var(--pink-line);
+  border-radius: var(--radius-lg);
+  background: #fff;
+  box-shadow: var(--shadow-lift);
+  text-align: center;
+}
+.resource-warning-mark {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: #d83c75;
+  background: var(--pink-soft);
+  border: 1px solid var(--pink-line);
+  font-size: 24px;
+  font-weight: 950;
+  line-height: 1;
+}
+.resource-warning-modal h2 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 20px;
+}
+.resource-warning-modal p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 750;
+  line-height: 1.65;
+}
+.resource-warning-detail {
+  max-width: 100%;
+  color: #d83c75 !important;
+  font-size: 12.5px !important;
+  word-break: break-word;
+}
+.resource-warning-modal button {
+  min-width: 120px;
+  margin-top: 4px;
+}
+
 /* --- aria2 push integration --- */
 .aria2-push-btn:not(:disabled):hover {
   color: var(--green);
@@ -1221,6 +1400,12 @@ button:disabled {
 .view-enter { animation: view-enter 0.32s cubic-bezier(0.22, 1, 0.36, 1) both; }
 @media (prefers-reduced-motion: reduce) {
   .view-enter { animation: none; }
+  .account-error-overlay,
+  .account-error-overlay.closing,
+  .account-error-overlay.closing .account-error-modal,
+  .resource-warning-overlay,
+  .resource-warning-overlay.closing,
+  .resource-warning-overlay.closing .resource-warning-modal,
   .aria2-overlay,
   .aria2-overlay.closing,
   .aria2-overlay.closing .aria2-modal,
@@ -1526,7 +1711,7 @@ button:disabled {
 /* Parallel-resolve setting: input on the left, save button on the right. */
 .concurrency-form {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
   gap: 14px;
   align-items: center;
 }
