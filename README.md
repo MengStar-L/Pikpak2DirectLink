@@ -1,32 +1,37 @@
-# PikPak2DirectLink
+<h1 align="center">PikPak2DirectLink</h1>
 
 <p align="center">
-  <strong>把磁力链接和 PikPak 分享链接解析成可下载直链的轻量 Web 工具。</strong>
+  <strong>把磁力链接和 PikPak 分享链接，安静、可靠地转换成你的下载链接。</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/MengStar-L/Pikpak2DirectLink/releases"><img alt="Releases" src="https://img.shields.io/github/v/release/MengStar-L/Pikpak2DirectLink?label=release"></a>
-  <img alt="Go" src="https://img.shields.io/badge/Go-1.26.2-00ADD8">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-linux%20%7C%20darwin%20%7C%20windows-34495e">
-  <img alt="Use" src="https://img.shields.io/badge/usage-personal%20deployment-4b5563">
+  <a href="https://github.com/MengStar-L/Pikpak2DirectLink/releases/latest">
+    <img alt="Release" src="https://img.shields.io/github/v/release/MengStar-L/Pikpak2DirectLink?style=for-the-badge&label=release&color=ff6b35">
+  </a>
+  <img alt="Go" src="https://img.shields.io/badge/go-1.26.2-334155?style=for-the-badge&logo=go&logoColor=white">
+  <img alt="Self Hosted" src="https://img.shields.io/badge/self--hosted-prod-111827?style=for-the-badge">
+  <img alt="Proxy" src="https://img.shields.io/badge/proxy-token-0ea5e9?style=for-the-badge">
 </p>
 
-PikPak2DirectLink 通过 PikPak 账号的离线下载、分享转存和文件下载能力，把 `magnet:?xt=...` 磁力链接或 PikPak 分享链接转换为下载链接。它提供管理后台、账号池、并行解析队列、代理链接、CDK 用户入口、在线更新和 aria2 推送，适合部署在自己的服务器上作为私有解析面板使用。
+<p align="center">
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-linux%20amd64%20%7C%20linux%20arm64%20%7C%20windows%20amd64%20%7C%20darwin-14b8a6?style=for-the-badge">
+</p>
+
+<p align="center">
+  PikPak2DirectLink 是一个轻量的私有直链面板。它通过 PikPak 账号的离线下载、分享转存和文件下载能力，把磁力链接或 PikPak 分享链接解析为直链或服务端代理链接，并提供账号池、并行队列、CDK 用户入口、在线更新和 aria2 推送。
+</p>
+
+<p align="center">
+  <a href="https://github.com/MengStar-L/Pikpak2DirectLink/releases/latest">下载最新版</a>
+  ·
+  <a href="CHANGELOG.md">查看发布记录</a>
+  ·
+  <a href="https://github.com/MengStar-L/Pikpak2DirectLink/issues">反馈问题</a>
+</p>
+
+---
 
 > 本项目依赖 PikPak 非官方接口行为。请只解析你有权访问的资源，并妥善保护自己的账号、密码和服务器。
-
-## 目录
-
-- [快速开始](#快速开始)
-- [功能概览](#功能概览)
-- [安装与部署](#安装与部署)
-- [使用方式](#使用方式)
-- [代理链接](#代理链接)
-- [配置项](#配置项)
-- [安全建议](#安全建议)
-- [在线更新](#在线更新)
-- [数据保存](#数据保存)
-- [说明](#说明)
 
 ## 快速开始
 
