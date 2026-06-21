@@ -45,10 +45,11 @@ func (s *Server) removeBatch(parentID string) {
 
 // childSpec is one validated line of a batch submission.
 type childSpec struct {
-	input string
-	kind  ResourceKind
-	share *ShareState
-	label string
+	input    string
+	kind     ResourceKind
+	share    *ShareState
+	passCode string
+	label    string
 }
 
 // createBatchJob validates every line, then creates a parent job plus one child
@@ -56,7 +57,7 @@ type childSpec struct {
 // and are enqueued at the given priority so they fan out across the resolve queue
 // under the admin's concurrency limit. It returns the parent job, or an HTTP
 // status + message when a line cannot be recognized (status 0 means success).
-func (s *Server) createBatchJob(lines []string, mode, cdkCode string, priority int, baseURL string) (*Job, int, string) {
+func (s *Server) createBatchJob(lines []string, mode, defaultPassCode, cdkCode string, priority int, baseURL string) (*Job, int, string) {
 	specs := make([]childSpec, 0, len(lines))
 	for i, line := range lines {
 		kind, err := detectResourceKind(line)
@@ -65,11 +66,12 @@ func (s *Server) createBatchJob(lines []string, mode, cdkCode string, priority i
 		}
 		spec := childSpec{input: line, kind: kind, label: batchLinkLabel(i+1, line, kind)}
 		if kind == ResourceShare {
-			shareID, tailID, err := parseShareLink(line)
+			share, passCode, err := shareStateAndPassCode(line, defaultPassCode)
 			if err != nil {
 				return nil, 400, fmt.Sprintf("第 %d 行分享链接无效：%s", i+1, err.Error())
 			}
-			spec.share = &ShareState{ShareID: shareID, TailID: tailID}
+			spec.share = share
+			spec.passCode = passCode
 		}
 		specs = append(specs, spec)
 	}
@@ -109,6 +111,7 @@ func (s *Server) createBatchJob(lines []string, mode, cdkCode string, priority i
 			Kind:       spec.kind,
 			Mode:       mode,
 			Input:      spec.input,
+			PassCode:   spec.passCode,
 			Status:     JobQueued,
 			Stage:      StageTransfer,
 			Message:    "queued",

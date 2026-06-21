@@ -429,7 +429,7 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 	// A multi-line submission fans out into one child job per link, parallelized
 	// through the resolve queue under the same concurrency limit.
 	if lines := splitResourceLines(req.Input); len(lines) > 1 {
-		parent, status, msg := s.createBatchJob(lines, req.Mode, c.Code, priorityUser, s.baseURL(r))
+		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, c.Code, priorityUser, s.baseURL(r))
 		if status != 0 {
 			writeError(w, status, msg)
 			return
@@ -449,12 +449,13 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 
 	var share *ShareState
 	if kind == ResourceShare {
-		shareID, tailID, err := parseShareLink(req.Input)
+		var passCode string
+		share, passCode, err = shareStateAndPassCode(req.Input, req.PassCode)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		share = &ShareState{ShareID: shareID, TailID: tailID}
+		req.PassCode = passCode
 	}
 
 	job := &Job{

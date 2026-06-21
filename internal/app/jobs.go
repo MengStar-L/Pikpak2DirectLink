@@ -4,7 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"regexp"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -278,31 +278,120 @@ func splitResourceLines(input string) []string {
 	return lines
 }
 
-var shareLinkPattern = regexp.MustCompile(`(?i)/s/([^/?#]+)(?:/(.*))?$`)
+type parsedShareLink struct {
+	ShareID  string
+	TailID   string
+	PassCode string
+}
 
 func parseShareLink(input string) (shareID, tailID string, err error) {
-	matches := shareLinkPattern.FindStringSubmatch(strings.TrimSpace(input))
-	if len(matches) < 2 {
-		return "", "", errors.New("invalid PikPak share link")
+	parts, err := parseShareLinkParts(input)
+	if err != nil {
+		return "", "", err
+	}
+	return parts.ShareID, parts.TailID, nil
+}
+
+func parseShareLinkParts(input string) (parsedShareLink, error) {
+	raw := strings.TrimSpace(input)
+	if raw == "" {
+		return parsedShareLink{}, errors.New("invalid PikPak share link")
 	}
 
-	shareID = strings.TrimSpace(matches[1])
-	if shareID == "" {
-		return "", "", errors.New("invalid PikPak share link")
+	u, err := url.Parse(raw)
+	if err != nil {
+		return parsedShareLink{}, errors.New("invalid PikPak share link")
 	}
 
-	if len(matches) >= 3 && matches[2] != "" {
-		chunks := strings.Split(matches[2], "/")
-		for i := len(chunks) - 1; i >= 0; i-- {
-			part := strings.TrimSpace(chunks[i])
-			if part != "" {
-				tailID = part
-				break
+	pathParts := splitSharePath(u.Path)
+	if len(pathParts) == 0 {
+		// url.Parse treats "mypikpak.com/s/..." as a relative path, so u.Path
+		// already works. This fallback is mainly for malformed-but-pasted text
+		// that still contains a query/fragment after a valid share path.
+		pathParts = splitSharePath(trimURLSuffix(raw))
+	}
+	if len(pathParts) == 0 {
+		return parsedShareLink{}, errors.New("invalid PikPak share link")
+	}
+
+	parts := parsedShareLink{
+		ShareID:  pathParts[0],
+		PassCode: sharePassCodeFromQuery(u.Query()),
+	}
+	if len(pathParts) > 1 {
+		parts.TailID = pathParts[len(pathParts)-1]
+	}
+	return parts, nil
+}
+
+func shareStateAndPassCode(input, defaultPassCode string) (*ShareState, string, error) {
+	parts, err := parseShareLinkParts(input)
+	if err != nil {
+		return nil, "", err
+	}
+	passCode := strings.TrimSpace(defaultPassCode)
+	if passCode == "" {
+		passCode = parts.PassCode
+	}
+	return &ShareState{ShareID: parts.ShareID, TailID: parts.TailID}, passCode, nil
+}
+
+func splitSharePath(pathValue string) []string {
+	chunks := strings.Split(pathValue, "/")
+	for i, chunk := range chunks {
+		if !strings.EqualFold(strings.TrimSpace(chunk), "s") {
+			continue
+		}
+		if i+1 >= len(chunks) {
+			return nil
+		}
+
+		shareID := cleanPathPart(chunks[i+1])
+		if shareID == "" {
+			return nil
+		}
+		parts := []string{shareID}
+		for _, chunk := range chunks[i+2:] {
+			if part := cleanPathPart(chunk); part != "" {
+				parts = append(parts, part)
+			}
+		}
+		return parts
+	}
+	return nil
+}
+
+func cleanPathPart(part string) string {
+	part = strings.TrimSpace(part)
+	if part == "" {
+		return ""
+	}
+	if unescaped, err := url.PathUnescape(part); err == nil {
+		part = unescaped
+	}
+	return strings.TrimSpace(part)
+}
+
+func trimURLSuffix(input string) string {
+	if cut := strings.IndexAny(input, "?#"); cut >= 0 {
+		return input[:cut]
+	}
+	return input
+}
+
+func sharePassCodeFromQuery(query url.Values) string {
+	for key, values := range query {
+		normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "_", ""), "-", ""))
+		switch normalized {
+		case "pwd", "passcode", "password":
+			for _, value := range values {
+				if value = strings.TrimSpace(value); value != "" {
+					return value
+				}
 			}
 		}
 	}
-
-	return shareID, tailID, nil
+	return ""
 }
 
 func sortItems(items []DownloadItem) {

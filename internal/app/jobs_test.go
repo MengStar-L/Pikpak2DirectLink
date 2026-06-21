@@ -89,6 +89,22 @@ func TestParseShareLink(t *testing.T) {
 			wantTailID:  "VO8Ba45l-FRcCf559uZjwjFjo1",
 		},
 		{
+			name:        "root share with official query",
+			input:       "https://mypikpak.com/s/VO8BcRb-0fibD0Ncymp8nxSMo1?view=list&order=3",
+			wantShareID: "VO8BcRb-0fibD0Ncymp8nxSMo1",
+		},
+		{
+			name:        "share with child id and query",
+			input:       "https://mypikpak.com/s/VO8BcRb-0fibD0Ncymp8nxSMo1/VO8Ba45l-FRcCf559uZjwjFjo1?pwd=abcd#files",
+			wantShareID: "VO8BcRb-0fibD0Ncymp8nxSMo1",
+			wantTailID:  "VO8Ba45l-FRcCf559uZjwjFjo1",
+		},
+		{
+			name:        "scheme-less share with query",
+			input:       "mypikpak.com/s/VO8BcRb-0fibD0Ncymp8nxSMo1?pwd=abcd",
+			wantShareID: "VO8BcRb-0fibD0Ncymp8nxSMo1",
+		},
+		{
 			name:         "invalid",
 			input:        "https://mypikpak.com/",
 			expectErrors: true,
@@ -114,6 +130,60 @@ func TestParseShareLink(t *testing.T) {
 			}
 			if tailID != tt.wantTailID {
 				t.Fatalf("expected tailID %q, got %q", tt.wantTailID, tailID)
+			}
+		})
+	}
+}
+
+func TestShareStateAndPassCode(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		input           string
+		defaultPassCode string
+		wantShareID     string
+		wantTailID      string
+		wantPassCode    string
+	}{
+		{
+			name:         "uses pwd from link",
+			input:        "https://mypikpak.com/s/VO8BcRb-0fibD0Ncymp8nxSMo1?pwd=abcd",
+			wantShareID:  "VO8BcRb-0fibD0Ncymp8nxSMo1",
+			wantPassCode: "abcd",
+		},
+		{
+			name:         "uses pass_code from link",
+			input:        "https://mypikpak.com/s/VO8BcRb-0fibD0Ncymp8nxSMo1/VO8Ba45l-FRcCf559uZjwjFjo1?pass_code=efgh",
+			wantShareID:  "VO8BcRb-0fibD0Ncymp8nxSMo1",
+			wantTailID:   "VO8Ba45l-FRcCf559uZjwjFjo1",
+			wantPassCode: "efgh",
+		},
+		{
+			name:            "explicit pass code wins",
+			input:           "https://mypikpak.com/s/VO8BcRb-0fibD0Ncymp8nxSMo1?pwd=from-link",
+			defaultPassCode: "from-form",
+			wantShareID:     "VO8BcRb-0fibD0Ncymp8nxSMo1",
+			wantPassCode:    "from-form",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			share, passCode, err := shareStateAndPassCode(tt.input, tt.defaultPassCode)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if share.ShareID != tt.wantShareID {
+				t.Fatalf("expected shareID %q, got %q", tt.wantShareID, share.ShareID)
+			}
+			if share.TailID != tt.wantTailID {
+				t.Fatalf("expected tailID %q, got %q", tt.wantTailID, share.TailID)
+			}
+			if passCode != tt.wantPassCode {
+				t.Fatalf("expected pass code %q, got %q", tt.wantPassCode, passCode)
 			}
 		})
 	}

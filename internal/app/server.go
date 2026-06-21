@@ -571,7 +571,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	// through the resolve queue. A single line keeps the original single-job flow
 	// (multi-file resolution still pauses for a manual selection).
 	if lines := splitResourceLines(req.Input); len(lines) > 1 {
-		parent, status, msg := s.createBatchJob(lines, req.Mode, "", priorityAdmin, s.baseURL(r))
+		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, "", priorityAdmin, s.baseURL(r))
 		if status != 0 {
 			writeError(w, status, msg)
 			return
@@ -602,15 +602,13 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if kind == ResourceShare {
-		shareID, tailID, err := parseShareLink(req.Input)
+		share, passCode, err := shareStateAndPassCode(req.Input, req.PassCode)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		job.Share = &ShareState{
-			ShareID: shareID,
-			TailID:  tailID,
-		}
+		job.Share = share
+		job.PassCode = passCode
 	}
 
 	s.jobs.create(job)
