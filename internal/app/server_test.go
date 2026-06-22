@@ -1,10 +1,13 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"pikpak2directlink/internal/pikpak"
 )
@@ -100,5 +103,79 @@ func TestDownloadItemIDExists(t *testing.T) {
 	}
 	if downloadItemIDExists(items, " ") {
 		t.Fatal("blank id should not match")
+	}
+}
+
+func TestShareInitialParentIDUsesTailOnlyBeforeSelection(t *testing.T) {
+	t.Parallel()
+
+	share := &ShareState{ShareID: "share-id", TailID: "folder-id"}
+	if got := shareInitialParentID(share); got != "folder-id" {
+		t.Fatalf("initial parent id = %q, want folder-id", got)
+	}
+
+	share.SelectedIDs = []string{"file-id"}
+	if got := shareInitialParentID(share); got != "" {
+		t.Fatalf("selected share should not use tail as parent id, got %q", got)
+	}
+}
+
+func TestDecideShareSourceItemsTailFolderRequiresSelection(t *testing.T) {
+	t.Parallel()
+
+	job := &Job{
+		Kind:  ResourceShare,
+		Share: &ShareState{ShareID: "share-id", TailID: "folder-id"},
+	}
+	items := []DownloadItem{
+		{ID: "a", Name: "a.mp4"},
+		{ID: "b", Name: "b.mp4"},
+	}
+
+	decision, err := decideShareSourceItems(job, items, true)
+	if err != nil {
+		t.Fatalf("decideShareSourceItems: %v", err)
+	}
+	if len(decision.SelectedIDs) != 0 {
+		t.Fatalf("selected IDs = %v, want none before user selection", decision.SelectedIDs)
+	}
+	if len(decision.SelectionItems) != len(items) {
+		t.Fatalf("selection items = %v, want %v", decision.SelectionItems, items)
+	}
+
+	job.ResolveAll = true
+	if _, err := decideShareSourceItems(job, items, true); err == nil {
+		t.Fatal("batch share folder should require explicit selection instead of resolving every file")
+	}
+}
+
+func TestWaitForShareDirectURLsStopsOnCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	s := &Server{
+		config: Config{
+			ShareURLTimeout:   time.Second,
+			SharePollInterval: time.Millisecond,
+		},
+		logs: newLogStore(10),
+	}
+	_, err := s.waitForShareDirectURLs(ctx, "job-canceled", AccountRuntime{}, []DownloadItem{
+		{ID: "a", Name: "a.mp4"},
+		{ID: "b", Name: "b.mp4"},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+
+	for _, entry := range s.logs.list(0) {
+		if entry.Level == LogWarn {
+			t.Fatalf("canceled context should not emit per-file warnings, got %+v", entry)
+		}
+		if strings.Contains(entry.Message, "a.mp4") || strings.Contains(entry.Message, "b.mp4") {
+			t.Fatalf("canceled context logged a file-specific message: %+v", entry)
+		}
 	}
 }

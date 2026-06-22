@@ -1007,64 +1007,83 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 	shareCtx, cancelShare := context.WithTimeout(ctx, shareParseTimeout)
 	defer cancelShare()
 
-	shareInfo, err := account.Client.GetShareInfo(shareCtx, job.Share.ShareID, job.PassCode, "")
-	if err != nil {
-		if shareCtx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), "context deadline exceeded") {
-			return fmt.Errorf("分享链接解析超时（%v），可能触发 PikPak 风控", shareParseTimeout)
-		}
-		return err
-	}
-
-	_, err = s.jobs.update(jobID, func(current *Job) error {
-		if current.Share == nil {
-			current.Share = &ShareState{}
-		}
-		current.Share.PassCodeToken = shareInfo.PassCodeToken
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
 	selectedIDs := selectedShareIDs(job.Share)
-	tailID := strings.TrimSpace(job.Share.TailID)
+	parentID := ""
+	scopedByTail := false
+	shareInfo := &pikpak.ShareListResponse{PassCodeToken: strings.TrimSpace(job.Share.PassCodeToken)}
+	var err error
+	if len(selectedIDs) == 0 || shareInfo.PassCodeToken == "" {
+		parentID = shareInitialParentID(job.Share)
+		scopedByTail = parentID != ""
+		shareInfo, err = account.Client.GetShareInfo(shareCtx, job.Share.ShareID, job.PassCode, parentID)
+		if err != nil {
+			if parentID == "" || !shouldFallbackTailShareScope(nil, err) {
+				if shareCtx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), "context deadline exceeded") {
+					return fmt.Errorf("分享链接解析超时（%v），可能触发 PikPak 风控", shareParseTimeout)
+				}
+				return err
+			}
+			shareInfo, err = account.Client.GetShareInfo(shareCtx, job.Share.ShareID, job.PassCode, "")
+			if err != nil {
+				if shareCtx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), "context deadline exceeded") {
+					return fmt.Errorf("分享链接解析超时（%v），可能触发 PikPak 风控", shareParseTimeout)
+				}
+				return err
+			}
+			scopedByTail = false
+		}
+		if parentID != "" && shouldFallbackTailShareScope(shareInfo, nil) {
+			scopedByTail = false
+			shareInfo, err = account.Client.GetShareInfo(shareCtx, job.Share.ShareID, job.PassCode, "")
+			if err != nil {
+				if shareCtx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), "context deadline exceeded") {
+					return fmt.Errorf("分享链接解析超时（%v），可能触发 PikPak 风控", shareParseTimeout)
+				}
+				return err
+			}
+		}
+
+		if err := s.updateSharePassCodeToken(jobID, shareInfo.PassCodeToken); err != nil {
+			return err
+		}
+	}
+
 	restoreIDs := []string{}
 	var items []DownloadItem
 	if len(selectedIDs) == 0 {
-		items, err = s.collectShareItems(shareCtx, account, job.Share.ShareID, shareInfo.PassCodeToken, shareInfo.Files, "")
-		if err != nil {
-			if shareCtx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), "context deadline exceeded") {
-				return fmt.Errorf("分享链接解析超时（%v），可能触发 PikPak 风控", shareParseTimeout)
+		if parentID != "" && !scopedByTail {
+			item, found, err := s.findShareFileByID(shareCtx, account, job.Share.ShareID, shareInfo.PassCodeToken, shareInfo.Files, parentID, "")
+			if err != nil {
+				if shareCtx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), "context deadline exceeded") {
+					return fmt.Errorf("分享链接解析超时（%v），可能触发 PikPak 风控", shareParseTimeout)
+				}
+				return err
 			}
-			return err
-		}
-		if len(items) == 0 {
-			return errors.New("share link did not return any file or folder")
-		}
-		if tailID != "" {
-			if downloadItemIDExists(items, tailID) {
-				selectedIDs = []string{tailID}
-			} else {
-				s.logJob(LogWarn, jobID, "share link tail id was not found in the share file list", tailID)
-				s.addJobWarning(jobID, "Share link target was not exposed by PikPak; showing the share contents instead.")
+			if !found {
+				return errors.New("share link target was not found in the share file list")
 			}
+			selectedIDs = []string{item.ID}
+		} else {
+			items, err = s.collectShareItems(shareCtx, account, job.Share.ShareID, shareInfo.PassCodeToken, shareInfo.Files, "")
+			if err != nil {
+				if shareCtx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), "context deadline exceeded") {
+					return fmt.Errorf("分享链接解析超时（%v），可能触发 PikPak 风控", shareParseTimeout)
+				}
+				return err
+			}
+			decision, err := decideShareSourceItems(job, items, scopedByTail)
+			if err != nil {
+				return err
+			}
+			if len(decision.SelectionItems) > 0 {
+				s.logJob(LogWarn, jobID, fmt.Sprintf("分享链接包含 %d 个项目，需要选择目标", len(decision.SelectionItems)), sampleItemDetail(decision.SelectionItems))
+				return s.requestSelection(jobID, StageSourceSelection, "pick a file or folder from the share first", decision.SelectionItems, account.ID)
+			}
+			selectedIDs = decision.SelectedIDs
 		}
 	}
 	if len(selectedIDs) == 0 {
-		if len(items) > 1 {
-			// A batch child auto-restores every root item instead of pausing for a
-			// source selection, so it can resolve the whole share unattended.
-			if job.ResolveAll {
-				for _, item := range items {
-					selectedIDs = append(selectedIDs, item.ID)
-				}
-			} else {
-				s.logJob(LogWarn, jobID, fmt.Sprintf("分享链接包含 %d 个项目，需要选择目标", len(items)), sampleItemDetail(items))
-				return s.requestSelection(jobID, StageSourceSelection, "pick a file or folder from the share first", items, account.ID)
-			}
-		} else {
-			selectedIDs = []string{items[0].ID}
-		}
+		return errors.New("share link did not return any file or folder")
 	}
 	restoreIDs = selectedIDs
 
@@ -1093,6 +1112,109 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 	}
 	s.logJob(LogInfo, jobID, fmt.Sprintf("检测到 %d 个可用文件", len(items)), sampleItemDetail(items))
 	return s.finishWithItems(ctx, jobID, account, items)
+}
+
+func (s *Server) updateSharePassCodeToken(jobID, token string) error {
+	_, err := s.jobs.update(jobID, func(current *Job) error {
+		if current.Share == nil {
+			current.Share = &ShareState{}
+		}
+		current.Share.PassCodeToken = token
+		return nil
+	})
+	return err
+}
+
+func shareInitialParentID(share *ShareState) string {
+	if len(selectedShareIDs(share)) > 0 {
+		return ""
+	}
+	if share == nil {
+		return ""
+	}
+	return strings.TrimSpace(share.TailID)
+}
+
+func shouldFallbackTailShareScope(resp *pikpak.ShareListResponse, err error) bool {
+	if err != nil {
+		return isResourceParseError(err)
+	}
+	return resp == nil || len(resp.Files) == 0
+}
+
+type shareSourceDecision struct {
+	SelectedIDs    []string
+	SelectionItems []DownloadItem
+}
+
+func decideShareSourceItems(job *Job, items []DownloadItem, scopedByTail bool) (shareSourceDecision, error) {
+	var decision shareSourceDecision
+	if len(items) == 0 {
+		return decision, errors.New("share link did not return any file or folder")
+	}
+	if scopedByTail {
+		if job != nil && job.ResolveAll {
+			return decision, errors.New("share folder target requires a file selection; submit it separately instead of in a batch")
+		}
+		decision.SelectionItems = items
+		return decision, nil
+	}
+
+	tailID := ""
+	if job != nil && job.Share != nil {
+		tailID = strings.TrimSpace(job.Share.TailID)
+	}
+	if tailID != "" {
+		if downloadItemIDExists(items, tailID) {
+			decision.SelectedIDs = []string{tailID}
+			return decision, nil
+		}
+		return decision, errors.New("share link target was not found in the share file list")
+	}
+
+	if len(items) > 1 {
+		if job != nil && job.ResolveAll {
+			return decision, errors.New("share link contains multiple files; submit it separately and choose target files")
+		}
+		decision.SelectionItems = items
+		return decision, nil
+	}
+	decision.SelectedIDs = []string{items[0].ID}
+	return decision, nil
+}
+
+func (s *Server) findShareFileByID(ctx context.Context, account AccountRuntime, shareID, passCodeToken string, files []pikpak.FileEntry, targetID, prefix string) (DownloadItem, bool, error) {
+	targetID = strings.TrimSpace(targetID)
+	if targetID == "" {
+		return DownloadItem{}, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return DownloadItem{}, false, err
+	}
+	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return DownloadItem{}, false, err
+		}
+		currentPath := file.Name
+		if prefix != "" {
+			currentPath = path.Join(prefix, file.Name)
+		}
+		if file.ID == targetID && !file.IsFolder() {
+			return downloadItemFromFile(file, currentPath), true, nil
+		}
+		if !file.IsFolder() {
+			continue
+		}
+		resp, err := account.Client.GetShareFolder(ctx, shareID, passCodeToken, file.ID)
+		if err != nil {
+			return DownloadItem{}, false, err
+		}
+		item, found, err := s.findShareFileByID(ctx, account, shareID, passCodeToken, resp.Files, targetID, currentPath)
+		if err != nil || found {
+			return item, found, err
+		}
+	}
+	return DownloadItem{}, false, nil
 }
 
 func (s *Server) finishWithItems(ctx context.Context, jobID string, account AccountRuntime, items []DownloadItem) error {
@@ -1251,7 +1373,14 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 func (s *Server) resolveFileLink(ctx context.Context, jobID string, account AccountRuntime, item DownloadItem) (*JobResult, error) {
 	s.updateJobState(jobID, JobRunning, StageTransfer, "requesting a fresh direct link", "")
 	s.logJob(LogInfo, jobID, "开始解析所选文件的下载链接 ...", itemLogDetails(item)...)
-	file, err := account.Client.GetFile(ctx, item.ID)
+	job := mustJob(s.jobs.get(jobID))
+	var file *pikpak.FileEntry
+	var err error
+	if job.Kind == ResourceShare {
+		file, err = account.Client.WaitForFileDownloadURL(ctx, item.ID, s.config.ShareURLTimeout, s.config.SharePollInterval)
+	} else {
+		file, err = account.Client.GetFile(ctx, item.ID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1266,7 +1395,6 @@ func (s *Server) resolveFileLink(ctx context.Context, jobID string, account Acco
 	item.Size = firstNonEmpty(item.Size, file.Size)
 
 	proxyToken := newJobID()
-	job := mustJob(s.jobs.get(jobID))
 	result := &JobResult{
 		File:       item,
 		DirectURL:  directURL,
@@ -1544,14 +1672,23 @@ func (s *Server) waitForTransferredFiles(ctx context.Context, account AccountRun
 func (s *Server) waitForRestoredShareItems(ctx context.Context, jobID string, account AccountRuntime, fileIDs []string) ([]DownloadItem, error) {
 	var items []DownloadItem
 	for _, fileID := range uniqueStrings(fileIDs) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		file, err := s.waitForRestoredFileEntry(ctx, account, fileID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			s.logJob(LogWarn, jobID, "恢复后的分享文件暂不可用，已跳过", err.Error())
 			continue
 		}
 		if file.IsFolder() {
 			children, err := s.collectFiles(ctx, account, file.ID, file.Name)
 			if err != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
 				s.logJob(LogWarn, jobID, fmt.Sprintf("分享文件夹 %s 展开失败，已跳过", file.Name), err.Error())
 				continue
 			}
@@ -1564,7 +1701,7 @@ func (s *Server) waitForRestoredShareItems(ctx context.Context, jobID string, ac
 		return nil, errors.New("restored share did not produce any file")
 	}
 	sortItems(items)
-	return s.waitForShareDirectURLs(ctx, jobID, account, items)
+	return items, nil
 }
 
 func (s *Server) waitForRestoredFileEntry(ctx context.Context, account AccountRuntime, fileID string) (*pikpak.FileEntry, error) {
@@ -1611,8 +1748,14 @@ func (s *Server) waitForShareDirectURLs(ctx context.Context, jobID string, accou
 
 	readyItems := make([]DownloadItem, 0, len(items))
 	for _, item := range items {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		file, err := account.Client.WaitForFileDownloadURL(ctx, item.ID, s.config.ShareURLTimeout, s.config.SharePollInterval)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			s.logJob(LogWarn, jobID, fmt.Sprintf("文件 %s 直链获取失败，已跳过", item.Name), err.Error())
 			continue
 		}
@@ -1639,8 +1782,14 @@ func (s *Server) waitForShareDirectURLs(ctx context.Context, jobID string, accou
 }
 
 func (s *Server) collectShareItems(ctx context.Context, account AccountRuntime, shareID, passCodeToken string, files []pikpak.FileEntry, prefix string) ([]DownloadItem, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var items []DownloadItem
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		currentPath := file.Name
 		if prefix != "" {
 			currentPath = path.Join(prefix, file.Name)
@@ -1737,6 +1886,9 @@ func (s *Server) lookupTask(ctx context.Context, account AccountRuntime, taskID 
 }
 
 func (s *Server) collectFiles(ctx context.Context, account AccountRuntime, parentID, prefix string) ([]DownloadItem, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	files, err := account.Client.ListFiles(ctx, parentID)
 	if err != nil {
 		return nil, err
@@ -1744,6 +1896,9 @@ func (s *Server) collectFiles(ctx context.Context, account AccountRuntime, paren
 
 	var items []DownloadItem
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		currentPath := file.Name
 		if prefix != "" {
 			currentPath = path.Join(prefix, file.Name)
