@@ -85,9 +85,11 @@ func (s *Server) applyItemSelection(jobID, itemID string) (*Job, int, string) {
 			if current.Share == nil {
 				return selectionHTTPError(http.StatusConflict, "share context is missing")
 			}
+			var selected DownloadItem
 			found := false
 			for _, item := range current.Items {
 				if item.ID == itemID {
+					selected = item
 					found = true
 					break
 				}
@@ -98,6 +100,7 @@ func (s *Server) applyItemSelection(jobID, itemID string) (*Job, int, string) {
 			current.Items = nil
 			current.Share.SelectedID = itemID
 			current.Share.SelectedIDs = []string{itemID}
+			current.Share.SelectedItems = []DownloadItem{selected}
 			current.Stage = StageTransfer
 			current.ResolveSelected = true
 		case StageResultSelection:
@@ -147,6 +150,9 @@ func (s *Server) applyItemsSelection(jobID string, itemIDs []string) (*Job, int,
 	if len(ordered) == 0 {
 		return nil, http.StatusBadRequest, "请至少选择一个文件"
 	}
+	if len(ordered) > maxSelectedFilesPerResolve {
+		return nil, http.StatusBadRequest, fmt.Sprintf("单次最多解析 %d 个文件，请减少选择后重试", maxSelectedFilesPerResolve)
+	}
 
 	job, ok := s.jobs.get(jobID)
 	if !ok {
@@ -185,14 +191,17 @@ func (s *Server) applyItemsSelection(jobID string, itemIDs []string) (*Job, int,
 			if current.Share == nil {
 				return selectionHTTPError(http.StatusConflict, "share context is missing")
 			}
-			byID := make(map[string]struct{}, len(current.Items))
+			byID := make(map[string]DownloadItem, len(current.Items))
 			for _, item := range current.Items {
-				byID[item.ID] = struct{}{}
+				byID[item.ID] = item
 			}
+			selected := make([]DownloadItem, 0, len(ordered))
 			for _, id := range ordered {
-				if _, ok := byID[id]; !ok {
+				item, ok := byID[id]
+				if !ok {
 					return selectionHTTPError(http.StatusBadRequest, "selected item was not found in the current share")
 				}
+				selected = append(selected, item)
 			}
 			current.Status = JobQueued
 			current.Message = "queued"
@@ -200,6 +209,7 @@ func (s *Server) applyItemsSelection(jobID string, itemIDs []string) (*Job, int,
 			current.Items = nil
 			current.Share.SelectedID = ordered[0]
 			current.Share.SelectedIDs = append([]string(nil), ordered...)
+			current.Share.SelectedItems = selected
 			current.Stage = StageTransfer
 			current.ResolveSelected = true
 			return nil

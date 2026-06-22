@@ -3,14 +3,33 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"pikpak2directlink/internal/pikpak"
 )
+
+type fakeRestoredLister struct {
+	filesByParent map[string][]pikpak.FileEntry
+	calls         []string
+}
+
+func (f *fakeRestoredLister) ListFiles(ctx context.Context, parentID string) ([]pikpak.FileEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.calls = append(f.calls, parentID)
+	files, ok := f.filesByParent[parentID]
+	if !ok {
+		return nil, fmt.Errorf("unexpected ListFiles(%s)", parentID)
+	}
+	return append([]pikpak.FileEntry(nil), files...), nil
+}
 
 func TestBuildContentDispositionIncludesFallbackFilename(t *testing.T) {
 	t.Parallel()
@@ -149,6 +168,61 @@ func TestDecideShareSourceItemsTailFolderRequiresSelection(t *testing.T) {
 	}
 }
 
+func TestResolveRestoredSelectedItemsLocatesNestedFileByPath(t *testing.T) {
+	t.Parallel()
+
+	lister := &fakeRestoredLister{
+		filesByParent: map[string][]pikpak.FileEntry{
+			"root": {
+				{ID: "target-folder", Name: "Target", Kind: "drive#folder"},
+				{ID: "unrelated-folder", Name: "Unrelated", Kind: "drive#folder"},
+			},
+			"target-folder": {
+				{ID: "restored-file", Name: "episode.mkv", Kind: "drive#file", Size: "123"},
+			},
+		},
+	}
+	restored := []pikpak.FileEntry{{ID: "root", Name: "Show", Kind: "drive#folder"}}
+	selected := []DownloadItem{{ID: "share-file", Name: "episode.mkv", Path: "Show/Target/episode.mkv", Size: "123"}}
+
+	items, err := resolveRestoredSelectedItems(context.Background(), lister, restored, selected)
+	if err != nil {
+		t.Fatalf("resolveRestoredSelectedItems: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("resolved item count = %d, want 1", len(items))
+	}
+	if items[0].ID != "restored-file" || items[0].Path != "Show/Target/episode.mkv" {
+		t.Fatalf("resolved item = %+v, want restored-file with original path", items[0])
+	}
+	if got := strings.Join(lister.calls, ","); got != "root,target-folder" {
+		t.Fatalf("ListFiles calls = %s, want root,target-folder", got)
+	}
+}
+
+func TestResolveRestoredSelectedItemsStopsOnCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	lister := &fakeRestoredLister{
+		filesByParent: map[string][]pikpak.FileEntry{
+			"root": {{ID: "file", Name: "file.mkv", Kind: "drive#file"}},
+		},
+	}
+	restored := []pikpak.FileEntry{{ID: "root", Name: "Root", Kind: "drive#folder"}}
+	selected := []DownloadItem{{ID: "share-file", Name: "file.mkv", Path: "Root/file.mkv"}}
+
+	_, err := resolveRestoredSelectedItems(ctx, lister, restored, selected)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if len(lister.calls) != 0 {
+		t.Fatalf("canceled context should not list files, got calls %v", lister.calls)
+	}
+}
+
 func TestWaitForShareDirectURLsStopsOnCanceledContext(t *testing.T) {
 	t.Parallel()
 
@@ -177,5 +251,51 @@ func TestWaitForShareDirectURLsStopsOnCanceledContext(t *testing.T) {
 		if strings.Contains(entry.Message, "a.mp4") || strings.Contains(entry.Message, "b.mp4") {
 			t.Fatalf("canceled context logged a file-specific message: %+v", entry)
 		}
+	}
+}
+
+func TestFinishWithItemsLargeShareSelectionRequiresNarrowing(t *testing.T) {
+	t.Parallel()
+
+	s := &Server{
+		jobs: newJobStore(10),
+		logs: newLogStore(10),
+	}
+	s.jobs.create(&Job{
+		ID:              "job-share-large",
+		Kind:            ResourceShare,
+		Status:          JobRunning,
+		Stage:           StageTransfer,
+		ResolveSelected: true,
+	})
+
+	items := make([]DownloadItem, maxSelectedFilesPerResolve+1)
+	for i := range items {
+		items[i] = DownloadItem{ID: "file-" + strconv.Itoa(i), Name: "secret-name.mkv"}
+	}
+
+	if err := s.finishWithItems(context.Background(), "job-share-large", AccountRuntime{ID: "acct"}, items); err != nil {
+		t.Fatalf("finishWithItems: %v", err)
+	}
+
+	job, _ := s.jobs.get("job-share-large")
+	if job.Status != JobSelectionRequired || job.Stage != StageResultSelection {
+		t.Fatalf("job status/stage = %s/%s, want selection_required/result_selection", job.Status, job.Stage)
+	}
+	if len(job.Items) != len(items) {
+		t.Fatalf("selection item count = %d, want %d", len(job.Items), len(items))
+	}
+	for _, entry := range s.logs.list(0) {
+		if strings.Contains(strings.Join(entry.Details, " "), "secret-name.mkv") {
+			t.Fatalf("log leaked sample filename: %+v", entry)
+		}
+	}
+}
+
+func TestSampleItemDetailDoesNotExposeFilenames(t *testing.T) {
+	t.Parallel()
+
+	if got := sampleItemDetail([]DownloadItem{{Name: "private-video.mkv", Path: "folder/private-video.mkv"}}); got != "" {
+		t.Fatalf("sample detail = %q, want empty", got)
 	}
 }

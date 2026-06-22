@@ -273,3 +273,27 @@ func TestShareStateAndPassCode(t *testing.T) {
 		})
 	}
 }
+
+func TestCloneJobCopiesSelectedShareItems(t *testing.T) {
+	t.Parallel()
+
+	original := &Job{
+		ID: "job-share",
+		Share: &ShareState{
+			ShareID:       "share",
+			SelectedIDs:   []string{"share-file"},
+			SelectedItems: []DownloadItem{{ID: "share-file", Name: "file.mkv", Path: "folder/file.mkv"}},
+		},
+	}
+
+	cloned := cloneJob(original)
+	original.Share.SelectedIDs[0] = "mutated-id"
+	original.Share.SelectedItems[0].Path = "mutated/path.mkv"
+
+	if cloned.Share.SelectedIDs[0] != "share-file" {
+		t.Fatalf("cloned selected ids = %v, want share-file", cloned.Share.SelectedIDs)
+	}
+	if cloned.Share.SelectedItems[0].Path != "folder/file.mkv" {
+		t.Fatalf("cloned selected item path = %q, want folder/file.mkv", cloned.Share.SelectedItems[0].Path)
+	}
+}

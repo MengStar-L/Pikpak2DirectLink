@@ -22,6 +22,8 @@ const (
 	ResourceBatch ResourceKind = "batch"
 )
 
+const maxSelectedFilesPerResolve = 100
+
 type JobStatus string
 
 const (
@@ -102,11 +104,12 @@ type AccountAttempt struct {
 }
 
 type ShareState struct {
-	ShareID       string   `json:"share_id"`
-	TailID        string   `json:"tail_id,omitempty"`
-	PassCodeToken string   `json:"pass_code_token,omitempty"`
-	SelectedID    string   `json:"selected_id,omitempty"`
-	SelectedIDs   []string `json:"selected_ids,omitempty"`
+	ShareID       string         `json:"share_id"`
+	TailID        string         `json:"tail_id,omitempty"`
+	PassCodeToken string         `json:"pass_code_token,omitempty"`
+	SelectedID    string         `json:"selected_id,omitempty"`
+	SelectedIDs   []string       `json:"selected_ids,omitempty"`
+	SelectedItems []DownloadItem `json:"-"`
 }
 
 type Job struct {
@@ -257,6 +260,12 @@ func cloneJob(job *Job) *Job {
 	}
 	if job.Share != nil {
 		shareCopy := *job.Share
+		if len(job.Share.SelectedIDs) > 0 {
+			shareCopy.SelectedIDs = append([]string(nil), job.Share.SelectedIDs...)
+		}
+		if len(job.Share.SelectedItems) > 0 {
+			shareCopy.SelectedItems = append([]DownloadItem(nil), job.Share.SelectedItems...)
+		}
 		copyJob.Share = &shareCopy
 	}
 	if job.Result != nil {

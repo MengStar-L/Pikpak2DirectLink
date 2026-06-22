@@ -340,11 +340,15 @@ func TestApplyItemSelectionDuplicateSubmitOnlyQueuesOnce(t *testing.T) {
 		Status: JobSelectionRequired,
 		Stage:  StageSourceSelection,
 		Share:  &ShareState{ShareID: "share"},
-		Items:  []DownloadItem{{ID: "known", Name: "known"}},
+		Items:  []DownloadItem{{ID: "known", Name: "known", Path: "folder/known"}},
 	})
 
-	if _, status, msg := s.applyItemSelection("source-job", "known"); status != 0 {
+	updated, status, msg := s.applyItemSelection("source-job", "known")
+	if status != 0 {
 		t.Fatalf("first selection status=%d msg=%q, want success", status, msg)
+	}
+	if updated.Share == nil || len(updated.Share.SelectedItems) != 1 || updated.Share.SelectedItems[0].Path != "folder/known" {
+		t.Fatalf("selected source item = %+v, want path folder/known", updated.Share)
 	}
 	if _, status, msg := s.applyItemSelection("source-job", "known"); status != 409 {
 		t.Fatalf("second selection status=%d msg=%q, want 409", status, msg)
@@ -363,9 +367,9 @@ func TestApplyItemsSelectionAcceptsMultipleSourceItems(t *testing.T) {
 		Stage:  StageSourceSelection,
 		Share:  &ShareState{ShareID: "share"},
 		Items: []DownloadItem{
-			{ID: "a", Name: "a.bin", Size: itoa64(256 * 1024 * 1024)},
-			{ID: "b", Name: "b.bin", Size: itoa64(256 * 1024 * 1024)},
-			{ID: "c", Name: "c.bin", Size: itoa64(256 * 1024 * 1024)},
+			{ID: "a", Name: "a.bin", Path: "root/a.bin", Size: itoa64(256 * 1024 * 1024)},
+			{ID: "b", Name: "b.bin", Path: "root/b.bin", Size: itoa64(256 * 1024 * 1024)},
+			{ID: "c", Name: "c.bin", Path: "root/c.bin", Size: itoa64(256 * 1024 * 1024)},
 		},
 	})
 
@@ -379,6 +383,9 @@ func TestApplyItemsSelectionAcceptsMultipleSourceItems(t *testing.T) {
 	if updated.Share == nil || updated.Share.SelectedID != "b" || len(updated.Share.SelectedIDs) != 2 || updated.Share.SelectedIDs[0] != "b" || updated.Share.SelectedIDs[1] != "a" {
 		t.Fatalf("selected share ids = %+v, want [b a]", updated.Share)
 	}
+	if len(updated.Share.SelectedItems) != 2 || updated.Share.SelectedItems[0].Path != "root/b.bin" || updated.Share.SelectedItems[1].Path != "root/a.bin" {
+		t.Fatalf("selected source items = %+v, want paths [root/b.bin root/a.bin]", updated.Share.SelectedItems)
+	}
 	if !updated.ResolveSelected {
 		t.Fatal("source multi selection should mark the job to resolve selected files directly")
 	}
@@ -387,6 +394,18 @@ func TestApplyItemsSelectionAcceptsMultipleSourceItems(t *testing.T) {
 	}
 	if queued := noopResolver.queuedIDs(); len(queued) != 1 || queued[0] != "source-job" {
 		t.Fatalf("queued IDs = %v, want [source-job]", queued)
+	}
+}
+
+func TestApplyItemsSelectionRejectsTooManyItems(t *testing.T) {
+	ids := make([]string, maxSelectedFilesPerResolve+1)
+	for i := range ids {
+		ids[i] = "file-" + strconv.Itoa(i)
+	}
+
+	s := &Server{jobs: newJobStore(10)}
+	if _, status, msg := s.applyItemsSelection("job-any", ids); status != http.StatusBadRequest {
+		t.Fatalf("status=%d msg=%q, want 400", status, msg)
 	}
 }
 

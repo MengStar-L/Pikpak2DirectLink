@@ -1008,6 +1008,7 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 	defer cancelShare()
 
 	selectedIDs := selectedShareIDs(job.Share)
+	selectedItems := selectedShareItems(job.Share)
 	parentID := ""
 	scopedByTail := false
 	shareInfo := &pikpak.ShareListResponse{PassCodeToken: strings.TrimSpace(job.Share.PassCodeToken)}
@@ -1063,6 +1064,7 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 				return errors.New("share link target was not found in the share file list")
 			}
 			selectedIDs = []string{item.ID}
+			selectedItems = []DownloadItem{item}
 		} else {
 			items, err = s.collectShareItems(shareCtx, account, job.Share.ShareID, shareInfo.PassCodeToken, shareInfo.Files, "")
 			if err != nil {
@@ -1080,6 +1082,7 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 				return s.requestSelection(jobID, StageSourceSelection, "pick a file or folder from the share first", decision.SelectionItems, account.ID)
 			}
 			selectedIDs = decision.SelectedIDs
+			selectedItems = decision.SelectedItems
 		}
 	}
 	if len(selectedIDs) == 0 {
@@ -1106,7 +1109,7 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 	}
 
 	s.updateJobState(jobID, JobRunning, StageTransfer, "waiting for restored files to become ready", "")
-	items, err = s.waitForRestoredShareItems(ctx, jobID, account, restoredIDs)
+	items, err = s.waitForRestoredShareItems(ctx, jobID, account, restoredIDs, selectedItems)
 	if err != nil {
 		return err
 	}
@@ -1144,6 +1147,7 @@ func shouldFallbackTailShareScope(resp *pikpak.ShareListResponse, err error) boo
 
 type shareSourceDecision struct {
 	SelectedIDs    []string
+	SelectedItems  []DownloadItem
 	SelectionItems []DownloadItem
 }
 
@@ -1165,8 +1169,9 @@ func decideShareSourceItems(job *Job, items []DownloadItem, scopedByTail bool) (
 		tailID = strings.TrimSpace(job.Share.TailID)
 	}
 	if tailID != "" {
-		if downloadItemIDExists(items, tailID) {
+		if item, ok := downloadItemByID(items, tailID); ok {
 			decision.SelectedIDs = []string{tailID}
+			decision.SelectedItems = []DownloadItem{item}
 			return decision, nil
 		}
 		return decision, errors.New("share link target was not found in the share file list")
@@ -1180,6 +1185,7 @@ func decideShareSourceItems(job *Job, items []DownloadItem, scopedByTail bool) (
 		return decision, nil
 	}
 	decision.SelectedIDs = []string{items[0].ID}
+	decision.SelectedItems = []DownloadItem{items[0]}
 	return decision, nil
 }
 
@@ -1224,7 +1230,17 @@ func (s *Server) finishWithItems(ctx context.Context, jobID string, account Acco
 	job := mustJob(s.jobs.get(jobID))
 	// A batch child must never pause for a selection — resolve every file it
 	// found and let the batch coordinator merge the results.
-	if job.ResolveAll || (job.ResolveSelected && len(items) > 1) {
+	if job.ResolveAll {
+		if job.Kind == ResourceShare && len(items) > maxSelectedFilesPerResolve {
+			return fmt.Errorf("share link contains %d files; submit it separately and choose at most %d target files", len(items), maxSelectedFilesPerResolve)
+		}
+		return s.completeJobBatch(ctx, jobID, account, items)
+	}
+	if job.ResolveSelected && len(items) > 1 {
+		if len(items) > maxSelectedFilesPerResolve {
+			s.logJob(LogWarn, jobID, fmt.Sprintf("检测到 %d 个可用文件，需要缩小选择范围", len(items)))
+			return s.requestSelection(jobID, StageResultSelection, "choose fewer files to generate links", items, account.ID)
+		}
 		return s.completeJobBatch(ctx, jobID, account, items)
 	}
 	if len(items) > 1 {
@@ -1494,6 +1510,13 @@ func selectedShareIDs(share *ShareState) []string {
 	return uniqueStrings(ids)
 }
 
+func selectedShareItems(share *ShareState) []DownloadItem {
+	if share == nil || len(share.SelectedItems) == 0 {
+		return nil
+	}
+	return append([]DownloadItem(nil), share.SelectedItems...)
+}
+
 func (s *Server) recordTempResource(jobID, accountID string, ids ...string) {
 	cleanIDs := uniqueStrings(ids)
 	if len(cleanIDs) == 0 {
@@ -1669,8 +1692,12 @@ func (s *Server) waitForTransferredFiles(ctx context.Context, account AccountRun
 	}
 }
 
-func (s *Server) waitForRestoredShareItems(ctx context.Context, jobID string, account AccountRuntime, fileIDs []string) ([]DownloadItem, error) {
-	var items []DownloadItem
+type restoredFileLister interface {
+	ListFiles(ctx context.Context, parentID string) ([]pikpak.FileEntry, error)
+}
+
+func (s *Server) waitForRestoredShareItems(ctx context.Context, jobID string, account AccountRuntime, fileIDs []string, selectedItems []DownloadItem) ([]DownloadItem, error) {
+	var restored []pikpak.FileEntry
 	for _, fileID := range uniqueStrings(fileIDs) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -1683,25 +1710,289 @@ func (s *Server) waitForRestoredShareItems(ctx context.Context, jobID string, ac
 			s.logJob(LogWarn, jobID, "恢复后的分享文件暂不可用，已跳过", err.Error())
 			continue
 		}
-		if file.IsFolder() {
-			children, err := s.collectFiles(ctx, account, file.ID, file.Name)
-			if err != nil {
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
-				s.logJob(LogWarn, jobID, fmt.Sprintf("分享文件夹 %s 展开失败，已跳过", file.Name), err.Error())
-				continue
-			}
-			items = append(items, children...)
-			continue
-		}
-		items = append(items, downloadItemFromFile(*file, file.Name))
+		restored = append(restored, *file)
 	}
-	if len(items) == 0 {
+	if len(restored) == 0 {
 		return nil, errors.New("restored share did not produce any file")
+	}
+
+	if len(selectedItems) > 0 {
+		items, err := resolveRestoredSelectedItems(ctx, account.Client, restored, selectedItems)
+		if err != nil {
+			return nil, err
+		}
+		sortItems(items)
+		return items, nil
+	}
+
+	items := make([]DownloadItem, 0, len(restored))
+	for _, file := range restored {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if file.IsFolder() {
+			return nil, fmt.Errorf("restored share item %q is a folder; choose target files before resolving", file.Name)
+		}
+		items = append(items, downloadItemFromFile(file, file.Name))
 	}
 	sortItems(items)
 	return items, nil
+}
+
+func resolveRestoredSelectedItems(ctx context.Context, lister restoredFileLister, restored []pikpak.FileEntry, selectedItems []DownloadItem) ([]DownloadItem, error) {
+	if len(selectedItems) == 0 {
+		return nil, errors.New("selected share files are missing")
+	}
+	if len(restored) == len(selectedItems) && allRestoredEntriesAreFiles(restored) {
+		items := make([]DownloadItem, 0, len(selectedItems))
+		for i, file := range restored {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			items = append(items, restoredItemFromSelection(file, selectedItems[i]))
+		}
+		return items, nil
+	}
+
+	locator := newRestoredPathLocator(lister)
+	used := make(map[string]struct{}, len(selectedItems))
+	items := make([]DownloadItem, 0, len(selectedItems))
+	for _, selected := range selectedItems {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		item, ok, err := locateRestoredSelectedItem(ctx, locator, restored, selected, used)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("selected share file %q could not be found after restore", firstNonEmpty(selected.Path, selected.Name, selected.ID))
+		}
+		used[item.ID] = struct{}{}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func allRestoredEntriesAreFiles(restored []pikpak.FileEntry) bool {
+	if len(restored) == 0 {
+		return false
+	}
+	for _, file := range restored {
+		if file.IsFolder() {
+			return false
+		}
+	}
+	return true
+}
+
+func locateRestoredSelectedItem(ctx context.Context, locator *restoredPathLocator, restored []pikpak.FileEntry, selected DownloadItem, used map[string]struct{}) (DownloadItem, bool, error) {
+	for _, file := range restored {
+		if err := ctx.Err(); err != nil {
+			return DownloadItem{}, false, err
+		}
+		if file.IsFolder() || !restoredFileMatchesSelection(file, selected) {
+			continue
+		}
+		if _, ok := used[file.ID]; ok {
+			continue
+		}
+		return restoredItemFromSelection(file, selected), true, nil
+	}
+
+	for _, root := range restored {
+		if err := ctx.Err(); err != nil {
+			return DownloadItem{}, false, err
+		}
+		if !root.IsFolder() {
+			continue
+		}
+		for _, segments := range selectedPathCandidates(root.Name, selected) {
+			item, ok, err := locator.locate(ctx, root.ID, segments, selected)
+			if err != nil {
+				return DownloadItem{}, false, err
+			}
+			if !ok {
+				continue
+			}
+			if _, usedAlready := used[item.ID]; usedAlready {
+				continue
+			}
+			return item, true, nil
+		}
+	}
+	return DownloadItem{}, false, nil
+}
+
+func restoredFileMatchesSelection(file pikpak.FileEntry, selected DownloadItem) bool {
+	if file.IsFolder() {
+		return false
+	}
+	if selected.Name != "" && file.Name != "" && file.Name != selected.Name {
+		return false
+	}
+	if selected.Size != "" && file.Size != "" && file.Size != selected.Size {
+		return false
+	}
+	return selected.Name != "" || selected.Size != ""
+}
+
+func restoredItemFromSelection(file pikpak.FileEntry, selected DownloadItem) DownloadItem {
+	item := downloadItemFromFile(file, firstNonEmpty(selected.Path, selected.Name, file.Name))
+	item.Name = firstNonEmpty(selected.Name, item.Name)
+	item.Path = firstNonEmpty(selected.Path, item.Path)
+	item.Kind = firstNonEmpty(item.Kind, selected.Kind)
+	item.MimeType = firstNonEmpty(item.MimeType, selected.MimeType)
+	item.Size = firstNonEmpty(item.Size, selected.Size)
+	return item
+}
+
+type restoredPathLocator struct {
+	lister restoredFileLister
+	cache  map[string][]pikpak.FileEntry
+}
+
+func newRestoredPathLocator(lister restoredFileLister) *restoredPathLocator {
+	return &restoredPathLocator{
+		lister: lister,
+		cache:  make(map[string][]pikpak.FileEntry),
+	}
+}
+
+func (l *restoredPathLocator) locate(ctx context.Context, rootID string, segments []string, selected DownloadItem) (DownloadItem, bool, error) {
+	if len(segments) == 0 {
+		return DownloadItem{}, false, nil
+	}
+	parentID := rootID
+	for i, segment := range segments {
+		if err := ctx.Err(); err != nil {
+			return DownloadItem{}, false, err
+		}
+		files, err := l.list(ctx, parentID)
+		if err != nil {
+			return DownloadItem{}, false, err
+		}
+		if i == len(segments)-1 {
+			file, ok, err := chooseRestoredPathFile(files, segment, selected)
+			if err != nil || !ok {
+				return DownloadItem{}, ok, err
+			}
+			return restoredItemFromSelection(file, selected), true, nil
+		}
+		folder, ok, err := chooseRestoredPathFolder(files, segment)
+		if err != nil || !ok {
+			return DownloadItem{}, ok, err
+		}
+		parentID = folder.ID
+	}
+	return DownloadItem{}, false, nil
+}
+
+func (l *restoredPathLocator) list(ctx context.Context, parentID string) ([]pikpak.FileEntry, error) {
+	if files, ok := l.cache[parentID]; ok {
+		return files, nil
+	}
+	files, err := l.lister.ListFiles(ctx, parentID)
+	if err != nil {
+		return nil, err
+	}
+	l.cache[parentID] = files
+	return files, nil
+}
+
+func chooseRestoredPathFolder(files []pikpak.FileEntry, name string) (pikpak.FileEntry, bool, error) {
+	var matches []pikpak.FileEntry
+	for _, file := range files {
+		if file.IsFolder() && file.Name == name {
+			matches = append(matches, file)
+		}
+	}
+	if len(matches) == 0 {
+		return pikpak.FileEntry{}, false, nil
+	}
+	if len(matches) > 1 {
+		return pikpak.FileEntry{}, false, fmt.Errorf("restored folder path %q is ambiguous", name)
+	}
+	return matches[0], true, nil
+}
+
+func chooseRestoredPathFile(files []pikpak.FileEntry, name string, selected DownloadItem) (pikpak.FileEntry, bool, error) {
+	var matches []pikpak.FileEntry
+	for _, file := range files {
+		if !file.IsFolder() && file.Name == name {
+			matches = append(matches, file)
+		}
+	}
+	if len(matches) == 0 {
+		return pikpak.FileEntry{}, false, nil
+	}
+	if selected.Size != "" {
+		var exact []pikpak.FileEntry
+		var unknown []pikpak.FileEntry
+		for _, file := range matches {
+			switch file.Size {
+			case selected.Size:
+				exact = append(exact, file)
+			case "":
+				unknown = append(unknown, file)
+			}
+		}
+		if len(exact) == 1 {
+			return exact[0], true, nil
+		}
+		if len(exact) > 1 {
+			matches = exact
+		} else if len(unknown) > 0 {
+			matches = unknown
+		}
+	}
+	if len(matches) > 1 {
+		return pikpak.FileEntry{}, false, fmt.Errorf("restored file path %q is ambiguous", name)
+	}
+	return matches[0], true, nil
+}
+
+func selectedPathCandidates(rootName string, selected DownloadItem) [][]string {
+	base := firstNonEmpty(selected.Path, selected.Name)
+	candidates := make([][]string, 0, 3)
+	add := func(segments []string) {
+		if len(segments) == 0 {
+			return
+		}
+		key := strings.Join(segments, "\x00")
+		for _, existing := range candidates {
+			if strings.Join(existing, "\x00") == key {
+				return
+			}
+		}
+		candidates = append(candidates, segments)
+	}
+
+	segments := pathSegments(base)
+	add(segments)
+	if rootName != "" && len(segments) > 1 && segments[0] == rootName {
+		add(segments[1:])
+	}
+	if selected.Name != "" {
+		add(pathSegments(selected.Name))
+	}
+	return candidates
+}
+
+func pathSegments(value string) []string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(path.Clean(value), "/")
+	segments := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" || part == "." || part == "/" {
+			continue
+		}
+		segments = append(segments, part)
+	}
+	return segments
 }
 
 func (s *Server) waitForRestoredFileEntry(ctx context.Context, account AccountRuntime, fileID string) (*pikpak.FileEntry, error) {
@@ -1827,16 +2118,21 @@ func downloadItemFromFile(file pikpak.FileEntry, itemPath string) DownloadItem {
 }
 
 func downloadItemIDExists(items []DownloadItem, id string) bool {
+	_, ok := downloadItemByID(items, id)
+	return ok
+}
+
+func downloadItemByID(items []DownloadItem, id string) (DownloadItem, bool) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return false
+		return DownloadItem{}, false
 	}
 	for _, item := range items {
 		if item.ID == id {
-			return true
+			return item, true
 		}
 	}
-	return false
+	return DownloadItem{}, false
 }
 
 func restoreFileIDs(resp *pikpak.RestoreShareResponse) []string {
@@ -2151,8 +2447,7 @@ func sampleItemDetail(items []DownloadItem) string {
 	if len(items) == 0 {
 		return ""
 	}
-	item := items[0]
-	return "示例：" + firstNonEmpty(item.Path, item.Name)
+	return ""
 }
 
 func itemLogDetails(item DownloadItem) []string {
