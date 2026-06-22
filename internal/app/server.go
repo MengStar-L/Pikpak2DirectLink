@@ -25,22 +25,27 @@ import (
 var webFS embed.FS
 
 type Server struct {
-	config       Config
-	accounts     *AccountPool
-	jobs         *jobStore
-	resolver     *resolveQueue
-	logs         *logStore
-	authSessions *authSessionStore
-	creds        *credentialStore
-	updater      *updater
-	db           *sql.DB
-	cdk          *cdkStore
-	settings     *settingsStore
-	gateHTML     []byte
-	userHTML     []byte
-	mux          *http.ServeMux
-	batchMu      sync.Mutex
-	batches      map[string]*batchState
+	config               Config
+	accounts             *AccountPool
+	jobs                 *jobStore
+	resolver             *resolveQueue
+	logs                 *logStore
+	authSessions         *authSessionStore
+	creds                *credentialStore
+	updater              *updater
+	db                   *sql.DB
+	cdk                  *cdkStore
+	settings             *settingsStore
+	gateHTML             []byte
+	userHTML             []byte
+	mux                  *http.ServeMux
+	batchMu              sync.Mutex
+	batches              map[string]*batchState
+	healthCancel         context.CancelFunc
+	healthDone           chan struct{}
+	accountHealthProbe   accountHealthProbeFunc
+	accountHealthRefresh accountRefreshLoginFunc
+	nowFunc              func() time.Time
 }
 
 const resourceParseErrorThreshold = 2
@@ -151,6 +156,11 @@ func NewServer(cfg Config) (*Server, error) {
 		batches:      make(map[string]*batchState),
 	}
 
+	if err := server.accounts.EnsureCredentialSchedule(time.Now(), server.accountHealthInterval()); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	// The updater logs into the shared console with no job context.
 	server.updater = newUpdater(cfg.UpdateRepo, cfg.RequestTimeout, func(level LogLevel, message string, details ...string) {
 		server.logJob(level, "", message, details...)
@@ -169,6 +179,7 @@ func NewServer(cfg Config) (*Server, error) {
 		serialTimeout = timeout
 		parallelTimeout = timeout
 	}
+	serialTimeout, parallelTimeout = normalizeResolveTimeouts(serialTimeout, parallelTimeout, minResolveTaskTimeout(cfg))
 	server.resolver = newResolveQueue(serialTimeout, parallelTimeout, initialConcurrency, server.failJob)
 	go server.resolver.run()
 
@@ -202,6 +213,7 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("PATCH /api/accounts/{id}", server.handleUpdateAccount)
 	server.mux.HandleFunc("DELETE /api/accounts/{id}", server.handleDeleteAccount)
 	server.mux.HandleFunc("POST /api/accounts/{id}/reset", server.handleResetAccount)
+	server.mux.HandleFunc("POST /api/accounts/{id}/refresh-login", server.handleRefreshAccountLogin)
 	server.mux.HandleFunc("POST /api/jobs", server.handleCreateJob)
 	server.mux.HandleFunc("GET /api/jobs/{id}", server.handleGetJob)
 	server.mux.HandleFunc("POST /api/jobs/{id}/select", server.handleSelectItem)
@@ -233,6 +245,7 @@ func NewServer(cfg Config) (*Server, error) {
 	// Poll GitHub Releases in the background so the UI can surface an available
 	// update. Installs are always user-initiated.
 	go server.updater.runPeriodicCheck(context.Background(), cfg.UpdateCheckPeriod)
+	server.startAccountHealthMonitor()
 
 	return server, nil
 }
@@ -244,6 +257,12 @@ func (s *Server) Handler() http.Handler {
 // Close releases server-held resources such as the database handle. It is safe
 // to call on a nil database.
 func (s *Server) Close() error {
+	if s.healthCancel != nil {
+		s.healthCancel()
+	}
+	if s.healthDone != nil {
+		<-s.healthDone
+	}
 	if s.db != nil {
 		return s.db.Close()
 	}
@@ -521,6 +540,34 @@ func (s *Server) handleResetAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reset"})
 }
 
+func (s *Server) handleRefreshAccountLogin(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout*2)
+	defer cancel()
+
+	account, err := s.accounts.RefreshLogin(ctx, r.PathValue("id"))
+	if err != nil {
+		lowerErr := strings.ToLower(err.Error())
+		status := http.StatusBadGateway
+		switch {
+		case strings.Contains(lowerErr, "not found"):
+			status = http.StatusNotFound
+		case strings.Contains(lowerErr, "missing"), strings.Contains(lowerErr, "required"), strings.Contains(lowerErr, "empty"):
+			status = http.StatusBadRequest
+		case strings.Contains(lowerErr, "password"), strings.Contains(lowerErr, "login"):
+			status = http.StatusUnauthorized
+		}
+		writeError(w, status, friendlyPikPakError(err))
+		return
+	}
+	checkedAt := s.now()
+	s.accounts.MarkCredentialCheckSuccess(account.ID, checkedAt, checkedAt.Add(s.accountHealthInterval()), nil)
+	if refreshed, ok := s.accounts.Summary(account.ID); ok {
+		account = refreshed
+	}
+	s.logJob(LogSuccess, "", "PikPak account login refreshed", "account: "+account.Username)
+	writeJSON(w, http.StatusOK, account)
+}
+
 type updateAccountRequest struct {
 	TrafficLimitGB int `json:"traffic_limit_gb"`
 }
@@ -570,7 +617,8 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	// A multi-line submission fans out into one child job per link, parallelized
 	// through the resolve queue. A single line keeps the original single-job flow
 	// (multi-file resolution still pauses for a manual selection).
-	if lines := splitResourceLines(req.Input); len(lines) > 1 {
+	lines := splitResourceLineSpecs(req.Input)
+	if len(lines) > 1 {
 		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, "", priorityAdmin, s.baseURL(r))
 		if status != 0 {
 			writeError(w, status, msg)
@@ -579,6 +627,11 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		parent.QueueAhead = s.resolver.position(parent.ID)
 		writeJSON(w, http.StatusAccepted, parent)
 		return
+	}
+	rawInput := req.Input
+	if len(lines) == 1 {
+		rawInput = lines[0].raw
+		req.Input = lines[0].clean
 	}
 
 	kind, err := detectResourceKind(req.Input)
@@ -602,7 +655,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if kind == ResourceShare {
-		share, passCode, err := shareStateAndPassCode(req.Input, req.PassCode)
+		share, passCode, err := shareStateAndPassCode(rawInput, req.PassCode)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -808,6 +861,8 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 			return
 		}
 
+		s.cleanupTempResourcesBestEffort(jobID, account, "account attempt failed", false)
+
 		// A CDK traffic overdraw is deterministic and not the account's fault:
 		// retrying on other accounts would just repeat the expensive transfer and
 		// hit the same refusal. Fail the job terminally instead.
@@ -817,6 +872,13 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 			s.finishAccountAttempt(jobID, account.ID, "failed", overdraw.Error())
 			s.logJob(LogWarn, jobID, "文件大小超过 CDK 剩余流量，已拒绝", overdraw.Error())
 			s.failJob(jobID, overdraw)
+			return
+		}
+		if isCDKRefusalError(err) {
+			s.accounts.MarkAvailable(account.ID)
+			s.finishAccountAttempt(jobID, account.ID, "failed", safeUserError(err.Error()))
+			s.logJob(LogWarn, jobID, "CDK refused the resolved file", safeUserError(err.Error()))
+			s.failJob(jobID, err)
 			return
 		}
 
@@ -906,8 +968,15 @@ func (s *Server) processMagnet(ctx context.Context, jobID string, account Accoun
 		return err
 	}
 
+	// 清洗磁链，去除多余参数
+	job := mustJob(s.jobs.get(jobID))
+	magnetLink := normalizeMagnetLink(job.Input)
+	if magnetLink != job.Input {
+		s.logJob(LogInfo, jobID, "磁链已标准化清洗")
+	}
+
 	s.updateJobState(jobID, JobRunning, StageTransfer, "creating offline task", "")
-	task, err := account.Client.CreateOfflineTask(ctx, mustJob(s.jobs.get(jobID)).Input, folderID, "")
+	task, err := account.Client.CreateOfflineTask(ctx, magnetLink, folderID, "")
 	if err != nil {
 		return err
 	}
@@ -930,8 +999,19 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 
 	s.updateJobState(jobID, JobRunning, StageTransfer, "inspecting share link", "")
 	s.logJob(LogInfo, jobID, "开始读取 PikPak 分享链接 ...")
-	shareInfo, err := account.Client.GetShareInfo(ctx, job.Share.ShareID, job.PassCode, "")
+
+	shareParseTimeout := s.config.ShareParseTimeout
+	if shareParseTimeout <= 0 {
+		shareParseTimeout = 60 * time.Second
+	}
+	shareCtx, cancelShare := context.WithTimeout(ctx, shareParseTimeout)
+	defer cancelShare()
+
+	shareInfo, err := account.Client.GetShareInfo(shareCtx, job.Share.ShareID, job.PassCode, "")
 	if err != nil {
+		if shareCtx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), "context deadline exceeded") {
+			return fmt.Errorf("分享链接解析超时（%v），可能触发 PikPak 风控", shareParseTimeout)
+		}
 		return err
 	}
 
@@ -946,49 +1026,68 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 		return err
 	}
 
-	selectedID := job.Share.SelectedID
-	if selectedID == "" {
-		selectedID = job.Share.TailID
-	}
-
+	selectedIDs := selectedShareIDs(job.Share)
+	tailID := strings.TrimSpace(job.Share.TailID)
 	restoreIDs := []string{}
-	if selectedID == "" {
-		items := shareItems(shareInfo.Files)
+	var items []DownloadItem
+	if len(selectedIDs) == 0 {
+		items, err = s.collectShareItems(shareCtx, account, job.Share.ShareID, shareInfo.PassCodeToken, shareInfo.Files, "")
+		if err != nil {
+			if shareCtx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), "context deadline exceeded") {
+				return fmt.Errorf("分享链接解析超时（%v），可能触发 PikPak 风控", shareParseTimeout)
+			}
+			return err
+		}
 		if len(items) == 0 {
 			return errors.New("share link did not return any file or folder")
 		}
+		if tailID != "" {
+			if downloadItemIDExists(items, tailID) {
+				selectedIDs = []string{tailID}
+			} else {
+				s.logJob(LogWarn, jobID, "share link tail id was not found in the share file list", tailID)
+				s.addJobWarning(jobID, "Share link target was not exposed by PikPak; showing the share contents instead.")
+			}
+		}
+	}
+	if len(selectedIDs) == 0 {
 		if len(items) > 1 {
 			// A batch child auto-restores every root item instead of pausing for a
 			// source selection, so it can resolve the whole share unattended.
 			if job.ResolveAll {
 				for _, item := range items {
-					restoreIDs = append(restoreIDs, item.ID)
+					selectedIDs = append(selectedIDs, item.ID)
 				}
 			} else {
 				s.logJob(LogWarn, jobID, fmt.Sprintf("分享链接包含 %d 个项目，需要选择目标", len(items)), sampleItemDetail(items))
 				return s.requestSelection(jobID, StageSourceSelection, "pick a file or folder from the share first", items, account.ID)
 			}
 		} else {
-			selectedID = items[0].ID
+			selectedIDs = []string{items[0].ID}
 		}
 	}
-	if len(restoreIDs) == 0 {
-		restoreIDs = []string{selectedID}
-	}
-
-	folderID, err := s.ensureJobFolder(ctx, jobID, account)
-	if err != nil {
-		return err
-	}
+	restoreIDs = selectedIDs
 
 	s.updateJobState(jobID, JobRunning, StageTransfer, "restoring the selected share item into PikPak", "")
 	s.logJob(LogInfo, jobID, "分享文件正在转存到 PikPak 临时目录 ...")
-	if err := account.Client.RestoreShare(ctx, job.Share.ShareID, shareInfo.PassCodeToken, restoreIDs); err != nil {
+	restoreResp, err := account.Client.RestoreShare(shareCtx, job.Share.ShareID, shareInfo.PassCodeToken, restoreIDs)
+	if err != nil {
 		return err
 	}
+	restoredIDs := restoreFileIDs(restoreResp)
+	if len(restoredIDs) == 0 {
+		return errors.New("share restore did not return any file id")
+	}
+	s.recordTempResource(jobID, account.ID, restoredIDs...)
+	if len(restoredIDs) == 1 {
+		_, _ = s.jobs.update(jobID, func(current *Job) error {
+			current.FolderID = restoredIDs[0]
+			return nil
+		})
+	}
 
-	s.updateJobState(jobID, JobRunning, StageTransfer, "waiting for restored files to appear", "")
-	items, err := s.waitForTransferredFiles(ctx, account, folderID, "")
+	s.updateJobState(jobID, JobRunning, StageTransfer, "waiting for restored files to become ready", "")
+	items, err = s.waitForRestoredShareItems(ctx, jobID, account, restoredIDs)
 	if err != nil {
 		return err
 	}
@@ -1000,9 +1099,10 @@ func (s *Server) finishWithItems(ctx context.Context, jobID string, account Acco
 	if len(items) == 0 {
 		return errors.New("no downloadable file was produced")
 	}
+	job := mustJob(s.jobs.get(jobID))
 	// A batch child must never pause for a selection — resolve every file it
 	// found and let the batch coordinator merge the results.
-	if mustJob(s.jobs.get(jobID)).ResolveAll {
+	if job.ResolveAll || (job.ResolveSelected && len(items) > 1) {
 		return s.completeJobBatch(ctx, jobID, account, items)
 	}
 	if len(items) > 1 {
@@ -1034,6 +1134,19 @@ func (s *Server) cdkOverdrawError(jobID string, item DownloadItem) error {
 	return nil
 }
 
+func isCDKRefusalError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var overdraw errCDKOverdraw
+	if errors.As(err, &overdraw) {
+		return true
+	}
+	return errors.Is(err, errCDKNotFound) ||
+		errors.Is(err, errCDKExpired) ||
+		errors.Is(err, errCDKExhausted)
+}
+
 func (s *Server) requestSelection(jobID string, stage JobStage, message string, items []DownloadItem, accountID string) error {
 	sortItems(items)
 	_, err := s.jobs.update(jobID, func(job *Job) error {
@@ -1059,6 +1172,10 @@ func (s *Server) resolveExistingFile(ctx context.Context, jobID string, item Dow
 	}
 
 	if err := s.completeJob(ctx, jobID, account, item); err != nil {
+		if isCDKRefusalError(err) {
+			s.failJob(jobID, err)
+			return
+		}
 		s.accounts.MarkFailed(account.ID, err)
 		s.failJob(jobID, err)
 	}
@@ -1075,6 +1192,10 @@ func (s *Server) resolveExistingFiles(ctx context.Context, jobID string, items [
 	}
 
 	if err := s.completeJobBatch(ctx, jobID, account, items); err != nil {
+		if isCDKRefusalError(err) {
+			s.failJob(jobID, err)
+			return
+		}
 		s.accounts.MarkFailed(account.ID, err)
 		s.failJob(jobID, err)
 	}
@@ -1086,10 +1207,19 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 		return err
 	}
 
+	size := parseBytes(result.File.Size)
+	if cdkCode := mustJob(s.jobs.get(jobID)).CDKCode; cdkCode != "" {
+		if err := s.cdk.chargeIfEnough(cdkCode, size, time.Now()); err != nil {
+			s.cleanupTempResourcesBestEffort(jobID, account, "CDK charge failed", false, item.ID)
+			return err
+		}
+	}
+
 	s.updateJobState(jobID, JobRunning, StageTransfer, "cleaning temporary PikPak files", "")
 	s.logJob(LogInfo, jobID, "开始清理 PikPak 临时文件 ...")
-	if err := s.cleanupJobFiles(ctx, jobID, account, item.ID); err != nil {
-		return fmt.Errorf("direct link was created, but cleanup failed: %w", err)
+	if err := s.cleanupJobTempResources(ctx, jobID, account, item.ID); err != nil {
+		s.logJob(LogWarn, jobID, "temporary PikPak cleanup failed", err.Error())
+		s.addJobWarning(jobID, "Temporary PikPak cleanup failed; generated links are still ready.")
 	}
 	s.logJob(LogSuccess, jobID, "PikPak 临时文件已清理")
 
@@ -1108,11 +1238,7 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 		// The direct link has now been delivered, so the resource's size counts
 		// against this account's monthly downstream budget (and the CDK's traffic
 		// allowance, when the job came from a CDK user).
-		size := parseBytes(result.File.Size)
 		s.accounts.AddTraffic(account.ID, size)
-		if cdkCode := mustJob(s.jobs.get(jobID)).CDKCode; cdkCode != "" {
-			_ = s.cdk.charge(cdkCode, size)
-		}
 		s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(size))
 	}
 	return err
@@ -1140,13 +1266,15 @@ func (s *Server) resolveFileLink(ctx context.Context, jobID string, account Acco
 	item.Size = firstNonEmpty(item.Size, file.Size)
 
 	proxyToken := newJobID()
+	job := mustJob(s.jobs.get(jobID))
 	result := &JobResult{
 		File:       item,
 		DirectURL:  directURL,
-		ProxyURL:   strings.TrimRight(mustJob(s.jobs.get(jobID)).BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken,
+		ProxyURL:   strings.TrimRight(job.BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken,
 		ProxyToken: proxyToken,
 		AccountID:  account.ID,
 	}
+	result.applyPreferredURL(job.Mode)
 	if expiresAt := file.ExpireAt(); !expiresAt.IsZero() {
 		result.ExpiresAt = expiresAt.Format(time.RFC3339)
 	}
@@ -1183,10 +1311,19 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 		totalSize += parseBytes(result.File.Size)
 	}
 
+	fallbackIDs := downloadItemIDs(items)
+	if cdkCode := mustJob(s.jobs.get(jobID)).CDKCode; cdkCode != "" {
+		if err := s.cdk.chargeIfEnough(cdkCode, totalSize, time.Now()); err != nil {
+			s.cleanupTempResourcesBestEffort(jobID, account, "CDK charge failed", false, fallbackIDs...)
+			return err
+		}
+	}
+
 	s.updateJobState(jobID, JobRunning, StageTransfer, "cleaning temporary PikPak files", "")
 	s.logJob(LogInfo, jobID, "开始清理 PikPak 临时文件 ...")
-	if err := s.cleanupJobFiles(ctx, jobID, account, ""); err != nil {
-		return fmt.Errorf("direct links were created, but cleanup failed: %w", err)
+	if err := s.cleanupJobTempResources(ctx, jobID, account, fallbackIDs...); err != nil {
+		s.logJob(LogWarn, jobID, "temporary PikPak cleanup failed", err.Error())
+		s.addJobWarning(jobID, "Temporary PikPak cleanup failed; generated links are still ready.")
 	}
 	s.logJob(LogSuccess, jobID, "PikPak 临时文件已清理")
 
@@ -1203,28 +1340,111 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 	if err == nil {
 		s.logJob(LogSuccess, jobID, fmt.Sprintf("解析任务完成，共 %d 个文件", len(results)))
 		s.accounts.AddTraffic(account.ID, totalSize)
-		if cdkCode := mustJob(s.jobs.get(jobID)).CDKCode; cdkCode != "" {
-			_ = s.cdk.charge(cdkCode, totalSize)
-		}
 		s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(totalSize))
 	}
 	return err
 }
 
-func (s *Server) cleanupJobFiles(ctx context.Context, jobID string, account AccountRuntime, fallbackFileID string) error {
+func downloadItemIDs(items []DownloadItem) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		if id := strings.TrimSpace(item.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return uniqueStrings(ids)
+}
+
+func selectedShareIDs(share *ShareState) []string {
+	if share == nil {
+		return nil
+	}
+	ids := append([]string(nil), share.SelectedIDs...)
+	if len(ids) == 0 && strings.TrimSpace(share.SelectedID) != "" {
+		ids = append(ids, share.SelectedID)
+	}
+	return uniqueStrings(ids)
+}
+
+func (s *Server) recordTempResource(jobID, accountID string, ids ...string) {
+	cleanIDs := uniqueStrings(ids)
+	if len(cleanIDs) == 0 {
+		return
+	}
+	_, _ = s.jobs.update(jobID, func(job *Job) error {
+		job.TempAccountID = accountID
+		job.TempIDs = uniqueStrings(append(job.TempIDs, cleanIDs...))
+		if len(cleanIDs) == 1 && job.FolderID == "" {
+			job.FolderID = cleanIDs[0]
+		}
+		return nil
+	})
+}
+
+func (s *Server) clearTempResources(jobID string) {
+	_, _ = s.jobs.update(jobID, func(job *Job) error {
+		job.FolderID = ""
+		job.TempAccountID = ""
+		job.TempIDs = nil
+		return nil
+	})
+}
+
+func (s *Server) addJobWarning(jobID, warning string) {
+	warning = strings.TrimSpace(warning)
+	if warning == "" {
+		return
+	}
+	_, _ = s.jobs.update(jobID, func(job *Job) error {
+		for _, existing := range job.Warnings {
+			if existing == warning {
+				return nil
+			}
+		}
+		job.Warnings = append(job.Warnings, warning)
+		return nil
+	})
+}
+
+func (s *Server) cleanupJobTempResources(ctx context.Context, jobID string, account AccountRuntime, fallbackIDs ...string) error {
 	job, ok := s.jobs.get(jobID)
 	if !ok {
 		return errors.New("job not found")
 	}
-
-	cleanupID := strings.TrimSpace(job.FolderID)
-	if cleanupID == "" {
-		cleanupID = strings.TrimSpace(fallbackFileID)
-	}
-	if cleanupID == "" {
+	if job.TempAccountID != "" && job.TempAccountID != account.ID {
 		return nil
 	}
-	return account.Client.DeleteFiles(ctx, []string{cleanupID})
+
+	ids := append([]string(nil), job.TempIDs...)
+	if len(ids) == 0 && strings.TrimSpace(job.FolderID) != "" {
+		ids = append(ids, job.FolderID)
+	}
+	ids = append(ids, fallbackIDs...)
+	ids = uniqueStrings(ids)
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := account.Client.DeleteFiles(ctx, ids); err != nil {
+		return err
+	}
+	s.clearTempResources(jobID)
+	return nil
+}
+
+func (s *Server) cleanupTempResourcesBestEffort(jobID string, account AccountRuntime, reason string, warn bool, fallbackIDs ...string) {
+	timeout := s.config.RequestTimeout
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := s.cleanupJobTempResources(ctx, jobID, account, fallbackIDs...); err != nil {
+		s.logJob(LogWarn, jobID, "temporary PikPak cleanup failed", reason, err.Error())
+		if warn {
+			s.addJobWarning(jobID, "Temporary PikPak cleanup failed; generated links are still ready.")
+		}
+	}
 }
 
 func (s *Server) ensureJobFolder(ctx context.Context, jobID string, account AccountRuntime) (string, error) {
@@ -1245,6 +1465,8 @@ func (s *Server) ensureJobFolder(ctx context.Context, jobID string, account Acco
 
 	_, err = s.jobs.update(jobID, func(current *Job) error {
 		current.FolderID = folder.ID
+		current.TempAccountID = account.ID
+		current.TempIDs = uniqueStrings(append(current.TempIDs, folder.ID))
 		return nil
 	})
 	if err != nil {
@@ -1319,6 +1541,188 @@ func (s *Server) waitForTransferredFiles(ctx context.Context, account AccountRun
 	}
 }
 
+func (s *Server) waitForRestoredShareItems(ctx context.Context, jobID string, account AccountRuntime, fileIDs []string) ([]DownloadItem, error) {
+	var items []DownloadItem
+	for _, fileID := range uniqueStrings(fileIDs) {
+		file, err := s.waitForRestoredFileEntry(ctx, account, fileID)
+		if err != nil {
+			s.logJob(LogWarn, jobID, "恢复后的分享文件暂不可用，已跳过", err.Error())
+			continue
+		}
+		if file.IsFolder() {
+			children, err := s.collectFiles(ctx, account, file.ID, file.Name)
+			if err != nil {
+				s.logJob(LogWarn, jobID, fmt.Sprintf("分享文件夹 %s 展开失败，已跳过", file.Name), err.Error())
+				continue
+			}
+			items = append(items, children...)
+			continue
+		}
+		items = append(items, downloadItemFromFile(*file, file.Name))
+	}
+	if len(items) == 0 {
+		return nil, errors.New("restored share did not produce any file")
+	}
+	sortItems(items)
+	return s.waitForShareDirectURLs(ctx, jobID, account, items)
+}
+
+func (s *Server) waitForRestoredFileEntry(ctx context.Context, account AccountRuntime, fileID string) (*pikpak.FileEntry, error) {
+	timeout := s.config.ShareURLTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	pollInterval := s.config.SharePollInterval
+	if pollInterval <= 0 {
+		pollInterval = 3 * time.Second
+	}
+	requestTimeout := s.config.RequestTimeout
+	if requestTimeout <= 0 {
+		requestTimeout = 20 * time.Second
+	}
+	if timeout < requestTimeout {
+		requestTimeout = timeout
+	}
+
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+		file, err := account.Client.GetFile(requestCtx, fileID)
+		cancel()
+		if err == nil {
+			return file, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("waiting for restored file %s timed out: %w", fileID, lastErr)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
+}
+
+func (s *Server) waitForShareDirectURLs(ctx context.Context, jobID string, account AccountRuntime, items []DownloadItem) ([]DownloadItem, error) {
+	s.logJob(LogInfo, jobID, "等待文件直链就绪 ...")
+
+	readyItems := make([]DownloadItem, 0, len(items))
+	for _, item := range items {
+		file, err := account.Client.WaitForFileDownloadURL(ctx, item.ID, s.config.ShareURLTimeout, s.config.SharePollInterval)
+		if err != nil {
+			s.logJob(LogWarn, jobID, fmt.Sprintf("文件 %s 直链获取失败，已跳过", item.Name), err.Error())
+			continue
+		}
+
+		if file.BestDownloadURL() != "" {
+			item.MimeType = firstNonEmpty(item.MimeType, file.MimeType)
+			item.Size = firstNonEmpty(item.Size, file.Size)
+			readyItems = append(readyItems, item)
+		} else {
+			s.logJob(LogWarn, jobID, fmt.Sprintf("文件 %s 直链为空，已跳过", item.Name))
+		}
+	}
+
+	if len(readyItems) == 0 {
+		return nil, fmt.Errorf("所有文件直链获取失败，可能触发 PikPak 风控")
+	}
+
+	if len(readyItems) < len(items) {
+		s.addJobWarning(jobID, fmt.Sprintf("Some files were skipped because their direct links were not ready (%d/%d ready).", len(readyItems), len(items)))
+		s.logJob(LogWarn, jobID, fmt.Sprintf("部分文件直链获取失败：成功 %d/%d", len(readyItems), len(items)))
+	}
+
+	return readyItems, nil
+}
+
+func (s *Server) collectShareItems(ctx context.Context, account AccountRuntime, shareID, passCodeToken string, files []pikpak.FileEntry, prefix string) ([]DownloadItem, error) {
+	var items []DownloadItem
+	for _, file := range files {
+		currentPath := file.Name
+		if prefix != "" {
+			currentPath = path.Join(prefix, file.Name)
+		}
+		if file.IsFolder() {
+			resp, err := account.Client.GetShareFolder(ctx, shareID, passCodeToken, file.ID)
+			if err != nil {
+				return nil, err
+			}
+			children, err := s.collectShareItems(ctx, account, shareID, passCodeToken, resp.Files, currentPath)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, children...)
+			continue
+		}
+		items = append(items, downloadItemFromFile(file, currentPath))
+	}
+	sortItems(items)
+	return items, nil
+}
+
+func downloadItemFromFile(file pikpak.FileEntry, itemPath string) DownloadItem {
+	if itemPath == "" {
+		itemPath = file.Name
+	}
+	return DownloadItem{
+		ID:       file.ID,
+		Name:     file.Name,
+		Path:     itemPath,
+		Kind:     file.Kind,
+		MimeType: file.MimeType,
+		Size:     file.Size,
+	}
+}
+
+func downloadItemIDExists(items []DownloadItem, id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	for _, item := range items {
+		if item.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func restoreFileIDs(resp *pikpak.RestoreShareResponse) []string {
+	if resp == nil {
+		return nil
+	}
+	ids := make([]string, 0, 1+len(resp.TaskInfo))
+	if id := strings.TrimSpace(resp.FileID); id != "" {
+		ids = append(ids, id)
+	}
+	for _, task := range resp.TaskInfo {
+		if id := strings.TrimSpace(task.FileID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return uniqueStrings(ids)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
 func (s *Server) lookupTask(ctx context.Context, account AccountRuntime, taskID string) (phase, message string, found bool, err error) {
 	tasks, err := account.Client.ListOfflineTasks(ctx, nil)
 	if err != nil {
@@ -1390,7 +1794,6 @@ func (s *Server) beginAccountAttempt(jobID string, account AccountRuntime) {
 		job.Status = JobRunning
 		job.Error = ""
 		job.AccountID = account.ID
-		job.FolderID = ""
 		job.AccountAttempts = append(job.AccountAttempts, AccountAttempt{
 			AccountID: account.ID,
 			Username:  account.Username,

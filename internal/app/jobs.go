@@ -53,6 +53,7 @@ type DownloadItem struct {
 
 type JobResult struct {
 	File       DownloadItem `json:"file"`
+	URL        string       `json:"url"`
 	DirectURL  string       `json:"direct_url"`
 	ProxyURL   string       `json:"proxy_url"`
 	ProxyToken string       `json:"proxy_token"`
@@ -63,6 +64,20 @@ type JobResult struct {
 	// used a different account, so the proxy handler needs it to re-fetch a fresh
 	// direct link after expiry.
 	AccountID string `json:"-"`
+}
+
+func preferredResultURL(mode, directURL, proxyURL string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "proxy") {
+		return firstNonEmpty(proxyURL, directURL)
+	}
+	return firstNonEmpty(directURL, proxyURL)
+}
+
+func (r *JobResult) applyPreferredURL(mode string) {
+	if r == nil {
+		return
+	}
+	r.URL = preferredResultURL(mode, r.DirectURL, r.ProxyURL)
 }
 
 // BatchProgress is the parent-job rollup for a multi-line submission, surfaced to
@@ -87,10 +102,11 @@ type AccountAttempt struct {
 }
 
 type ShareState struct {
-	ShareID       string `json:"share_id"`
-	TailID        string `json:"tail_id,omitempty"`
-	PassCodeToken string `json:"pass_code_token,omitempty"`
-	SelectedID    string `json:"selected_id,omitempty"`
+	ShareID       string   `json:"share_id"`
+	TailID        string   `json:"tail_id,omitempty"`
+	PassCodeToken string   `json:"pass_code_token,omitempty"`
+	SelectedID    string   `json:"selected_id,omitempty"`
+	SelectedIDs   []string `json:"selected_ids,omitempty"`
 }
 
 type Job struct {
@@ -112,10 +128,17 @@ type Job struct {
 	AccountAttempts []AccountAttempt `json:"account_attempts,omitempty"`
 	Result          *JobResult       `json:"result,omitempty"`
 	Results         []JobResult      `json:"results,omitempty"`
+	Warnings        []string         `json:"warnings,omitempty"`
 	QueueAhead      int              `json:"queue_ahead"`
+	TempAccountID   string           `json:"-"`
+	TempIDs         []string         `json:"-"`
 	// ResolveAll marks a child job that must auto-resolve every file it finds
 	// (never pause at selection_required). Set on the children a batch fans out.
 	ResolveAll bool `json:"-"`
+	// ResolveSelected marks a resumed share job whose source-selection choices
+	// are already the final files to parse, so it should not ask for a second
+	// result-selection pass after restoring them.
+	ResolveSelected bool `json:"-"`
 	// ParentID links a child job back to its batch parent.
 	ParentID string `json:"-"`
 	// Batch is the rollup carried by a parent (kind == batch) job.
@@ -166,10 +189,30 @@ func (s *jobStore) create(job *Job) {
 	s.order = append(s.order, job.ID)
 
 	if len(s.order) > s.capacity {
-		toEvict := s.order[0]
-		delete(s.jobs, toEvict)
-		s.order = s.order[1:]
+		for len(s.order) > s.capacity {
+			idx := s.firstEvictableLocked()
+			if idx < 0 {
+				break
+			}
+			toEvict := s.order[idx]
+			delete(s.jobs, toEvict)
+			s.order = append(s.order[:idx], s.order[idx+1:]...)
+		}
 	}
+}
+
+func (s *jobStore) firstEvictableLocked() int {
+	for i, id := range s.order {
+		job := s.jobs[id]
+		if job == nil || isTerminalJobStatus(job.Status) {
+			return i
+		}
+	}
+	return -1
+}
+
+func isTerminalJobStatus(status JobStatus) bool {
+	return status == JobCompleted || status == JobFailed
 }
 
 func (s *jobStore) get(id string) (*Job, bool) {
@@ -224,6 +267,12 @@ func cloneJob(job *Job) *Job {
 	if len(job.Results) > 0 {
 		copyJob.Results = append([]JobResult(nil), job.Results...)
 	}
+	if len(job.Warnings) > 0 {
+		copyJob.Warnings = append([]string(nil), job.Warnings...)
+	}
+	if len(job.TempIDs) > 0 {
+		copyJob.TempIDs = append([]string(nil), job.TempIDs...)
+	}
 	if job.Batch != nil {
 		batchCopy := *job.Batch
 		if len(job.Batch.Failures) > 0 {
@@ -265,17 +314,53 @@ func looksLikeShareLink(input string) bool {
 // one-element slice, so callers can branch on len() to keep the existing
 // single-job behavior intact.
 func splitResourceLines(input string) []string {
-	seen := make(map[string]bool)
-	var lines []string
-	for _, raw := range strings.Split(input, "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || seen[line] {
-			continue
-		}
-		seen[line] = true
-		lines = append(lines, line)
+	specs := splitResourceLineSpecs(input)
+	lines := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		lines = append(lines, spec.clean)
 	}
 	return lines
+}
+
+type resourceLineSpec struct {
+	raw   string
+	clean string
+}
+
+func splitResourceLineSpecs(input string) []resourceLineSpec {
+	seen := make(map[string]bool)
+	var specs []resourceLineSpec
+	for _, raw := range strings.Split(input, "\n") {
+		raw = strings.TrimSpace(raw)
+		clean := normalizeResourceInput(raw)
+		if clean == "" || seen[clean] {
+			continue
+		}
+		seen[clean] = true
+		specs = append(specs, resourceLineSpec{raw: raw, clean: clean})
+	}
+	return specs
+}
+
+func normalizeResourceInput(input string) string {
+	cleaned := strings.TrimSpace(input)
+	if strings.HasPrefix(strings.ToLower(cleaned), "magnet:?") {
+		return normalizeMagnetLink(cleaned)
+	}
+	if looksLikeShareLink(cleaned) {
+		return normalizeShareLink(cleaned)
+	}
+	return cleaned
+}
+
+func normalizeShareLink(input string) string {
+	cleaned := strings.TrimSpace(input)
+	for _, sep := range []string{"?", "#"} {
+		if cut := strings.Index(cleaned, sep); cut >= 0 {
+			cleaned = strings.TrimSpace(cleaned[:cut])
+		}
+	}
+	return cleaned
 }
 
 type parsedShareLink struct {

@@ -184,13 +184,13 @@ function mountAria2() {
   }
 }
 
-// collectPushItems gathers one link per resolved file (direct preferred) from
-// whichever result shape the current job produced.
+// collectPushItems gathers one preferred link per resolved file from whichever
+// result shape the current job produced.
 function collectPushItems() {
   const items = [];
   const push = (result) => {
     if (!result) return;
-    const url = result.direct_url || result.proxy_url;
+    const url = result.url || result.direct_url || result.proxy_url;
     if (url) items.push({ url, name: result.file?.path || result.file?.name });
   };
   if (lastResults && lastResults.length) {
@@ -397,9 +397,16 @@ function renderAccounts() {
 
     const meta = document.createElement('div');
     meta.className = 'muted account-meta-line';
-    const metaText = document.createElement('span');
-    metaText.textContent = account.logged_in ? 'session 已保存，可直接用于解析' : '将使用账号密码重新登录';
-    meta.appendChild(metaText);
+    const accountUsable = account.status !== 'failed';
+    meta.appendChild(createAccountMetaPill(accountUsable ? '可用' : '不可用', accountUsable ? 'success' : 'danger'));
+    meta.appendChild(createAccountMetaPill(
+      `上次验证：${account.credential_checked_at ? formatDateTime(account.credential_checked_at) : '尚未验证'}`,
+      'checked',
+    ));
+    meta.appendChild(createAccountMetaPill(
+      `下次验证：${account.credential_next_check_at ? formatDateTime(account.credential_next_check_at) : '-'}`,
+      'next',
+    ));
     const parseErrorCount = Number(account.parse_error_count) || 0;
     if (parseErrorCount > 0) {
       const parseButton = document.createElement('button');
@@ -419,6 +426,12 @@ function renderAccounts() {
       const error = document.createElement('p');
       error.className = 'account-error';
       error.textContent = account.last_error;
+      text.appendChild(error);
+    }
+    if (account.credential_check_error && account.credential_check_error !== account.last_error) {
+      const error = document.createElement('p');
+      error.className = 'account-error';
+      error.textContent = `凭据验证：${account.credential_check_error}`;
       text.appendChild(error);
     }
 
@@ -447,6 +460,13 @@ function renderAccounts() {
 
     const actions = document.createElement('div');
     actions.className = 'mini-actions';
+
+    const refreshLoginButton = document.createElement('button');
+    refreshLoginButton.type = 'button';
+    refreshLoginButton.className = 'secondary compact';
+    setButtonContent(refreshLoginButton, '刷新登录', 'refresh');
+    refreshLoginButton.addEventListener('click', () => refreshAccountLogin(account.id, refreshLoginButton));
+    actions.appendChild(refreshLoginButton);
 
     const resetButton = document.createElement('button');
     resetButton.type = 'button';
@@ -773,10 +793,12 @@ function renderSettings(settings) {
   concurrencyInput.max = settings.max_concurrency || 32;
   const timeout = Number(settings.task_timeout_seconds) ||
     (settings.parallel ? settings.parallel_timeout_seconds : settings.serial_timeout_seconds);
+  const minTimeoutMinutes = Math.max(1, Math.ceil((Number(settings.min_task_timeout_seconds) || 60) / 60));
   if (document.activeElement !== taskTimeoutInput) {
-    taskTimeoutInput.value = Math.max(1, Math.round((timeout || 60) / 60));
+    taskTimeoutInput.value = Math.max(minTimeoutMinutes, Math.ceil((timeout || 60) / 60));
   }
-  taskTimeoutInput.max = Math.max(1, Math.floor((Number(settings.max_task_timeout_seconds) || 43200) / 60));
+  taskTimeoutInput.min = minTimeoutMinutes;
+  taskTimeoutInput.max = Math.max(minTimeoutMinutes, Math.floor((Number(settings.max_task_timeout_seconds) || 43200) / 60));
   const mode = settings.parallel ? `并行 ×${settings.concurrency}` : '串行';
   concurrencyState.textContent = `${mode} · 任务超时 ${formatSeconds(timeout)}`;
   // Keep the global status-bar counters in sync with whatever this response saw.
@@ -808,6 +830,7 @@ async function onSaveConcurrency(event) {
   const value = Number(concurrencyInput.value);
   const max = Number(concurrencyInput.max) || 32;
   const timeoutMinutes = Number(taskTimeoutInput.value);
+  const minTimeoutMinutes = Number(taskTimeoutInput.min) || 1;
   const maxTimeoutMinutes = Number(taskTimeoutInput.max) || 720;
   if (!Number.isInteger(value) || value < 1) {
     showConcurrencyError('并发数至少为 1');
@@ -817,8 +840,8 @@ async function onSaveConcurrency(event) {
     showConcurrencyError(`并发数最多为 ${max}`);
     return;
   }
-  if (!Number.isInteger(timeoutMinutes) || timeoutMinutes < 1) {
-    showConcurrencyError('任务超时时间至少为 1 分钟');
+  if (!Number.isInteger(timeoutMinutes) || timeoutMinutes < minTimeoutMinutes) {
+    showConcurrencyError(`任务超时时间至少为 ${minTimeoutMinutes} 分钟`);
     return;
   }
   if (timeoutMinutes > maxTimeoutMinutes) {
@@ -905,6 +928,21 @@ async function resetAccount(id) {
     showToast('账号状态已重置', 'success');
   } catch (error) {
     showAccountError(error.message);
+  }
+}
+
+async function refreshAccountLogin(id, button) {
+  const previous = getButtonLabel(button) || '刷新登录';
+  button.disabled = true;
+  setButtonContent(button, '刷新中', 'refresh');
+  try {
+    await api(`/api/accounts/${id}/refresh-login`, { method: 'POST' });
+    await refreshAppState();
+    showToast('PikPak 登录信息已刷新', 'success');
+  } catch (error) {
+    showAccountError(error.message);
+    button.disabled = false;
+    setButtonContent(button, previous, 'refresh');
   }
 }
 
@@ -1036,9 +1074,76 @@ function renderJob(job) {
     renderResultTree(job, results);
   } else if (job.result) {
     renderResult(job);
+  } else if (hasJobNotices(job)) {
+    renderResultNoticesOnly(job);
   } else {
     resultPanel.classList.add('hidden');
+    clearResultNotices();
   }
+}
+
+function jobWarnings(job) {
+  return Array.isArray(job?.warnings) ? job.warnings.filter(Boolean) : [];
+}
+
+function jobFailures(job) {
+  return Array.isArray(job?.batch?.failures) ? job.batch.failures.filter(Boolean) : [];
+}
+
+function hasJobNotices(job) {
+  return jobWarnings(job).length > 0 || jobFailures(job).length > 0;
+}
+
+function ensureResultNotices() {
+  let notices = resultPanel.querySelector('.result-notices');
+  if (notices) return notices;
+  notices = document.createElement('div');
+  notices.className = 'result-notices hidden';
+  const before = resultSingle && resultSingle.parentElement === resultPanel ? resultSingle : resultTree;
+  resultPanel.insertBefore(notices, before || null);
+  return notices;
+}
+
+function clearResultNotices() {
+  const notices = resultPanel.querySelector('.result-notices');
+  if (!notices) return;
+  notices.innerHTML = '';
+  notices.classList.add('hidden');
+}
+
+function renderResultNotices(job) {
+  const warnings = jobWarnings(job);
+  const failures = jobFailures(job);
+  const notices = ensureResultNotices();
+  notices.innerHTML = '';
+  if (warnings.length === 0 && failures.length === 0) {
+    notices.classList.add('hidden');
+    return;
+  }
+
+  appendNoticeBlock(notices, 'warn', '提示', warnings);
+  appendNoticeBlock(notices, 'danger', '失败链接', failures.map((failure) => {
+    const label = failure.label || '链接';
+    return `${label}: ${failure.error || '解析失败'}`;
+  }));
+  notices.classList.remove('hidden');
+}
+
+function appendNoticeBlock(container, variant, title, items) {
+  if (!items.length) return;
+  const block = document.createElement('section');
+  block.className = `result-notice ${variant}`;
+  const heading = document.createElement('strong');
+  heading.textContent = title;
+  block.appendChild(heading);
+  const list = document.createElement('ul');
+  for (const item of items) {
+    const li = document.createElement('li');
+    li.textContent = item;
+    list.appendChild(li);
+  }
+  block.appendChild(list);
+  container.appendChild(block);
 }
 
 function renderAttempts(attempts) {
@@ -1096,16 +1201,16 @@ function renderSelection(job) {
   selectionTree.innerHTML = '';
 
   const items = job.items || [];
-  const single = job.stage === 'source_selection';
-  selectionHint.textContent = single
-    ? '该分享含多个项目，请选择要转存的一项'
+  const sourceSelection = job.stage === 'source_selection';
+  selectionHint.textContent = sourceSelection
+    ? '勾选要解析的文件，可多选'
     : '勾选需要生成下载链接的文件，可多选';
-  selectAll.closest('.tree-toolbar').classList.toggle('hidden', single);
-  generateButton.parentElement.classList.toggle('hidden', single);
+  selectAll.closest('.tree-toolbar').classList.remove('hidden');
+  generateButton.parentElement.classList.remove('hidden');
 
   const root = buildSelectionTree(items);
   for (const node of root.children) {
-    selectionTree.appendChild(renderSelectionNode(node, single));
+    selectionTree.appendChild(renderSelectionNode(node, sourceSelection));
   }
   selectAll.checked = false;
   selectAll.indeterminate = false;
@@ -1135,7 +1240,7 @@ function buildSelectionTree(items) {
   return root;
 }
 
-function renderSelectionNode(node, single) {
+function renderSelectionNode(node, sourceSelection) {
   if (node.isFolder) {
     const wrap = document.createElement('div');
     wrap.className = 'tree-folder';
@@ -1169,23 +1274,21 @@ function renderSelectionNode(node, single) {
     label.appendChild(folderName);
 
     row.appendChild(toggle);
-    if (!single) {
-      const folderCheck = document.createElement('input');
-      folderCheck.type = 'checkbox';
-      folderCheck.className = 'tree-checkbox';
-      folderCheck.addEventListener('change', () => {
-        popCheckbox(folderCheck);
-        setSubtreeChecked(node, folderCheck.checked);
-        refreshFolderStates();
-        updateSelectionSummary();
-      });
-      row.appendChild(folderCheck);
-    }
+    const folderCheck = document.createElement('input');
+    folderCheck.type = 'checkbox';
+    folderCheck.className = 'tree-checkbox';
+    folderCheck.addEventListener('change', () => {
+      popCheckbox(folderCheck);
+      setSubtreeChecked(node, folderCheck.checked);
+      refreshFolderStates();
+      updateSelectionSummary();
+    });
+    row.appendChild(folderCheck);
     row.appendChild(label);
     wrap.appendChild(row);
 
     for (const child of node.children) {
-      childrenInner.appendChild(renderSelectionNode(child, single));
+      childrenInner.appendChild(renderSelectionNode(child, sourceSelection));
     }
     wrap.appendChild(childrenWrap);
     return wrap;
@@ -1195,26 +1298,6 @@ function renderSelectionNode(node, single) {
   row.className = 'tree-row tree-file-row';
   const label = document.createElement('label');
   label.className = 'tree-label tree-file-label';
-
-  if (single) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'secondary compact';
-    setButtonLabel(button, '转存这一项');
-    button.addEventListener('click', () => chooseSelectionItem(selectionJobId, node.item.id, button));
-    const meta = document.createElement('span');
-    meta.className = 'tree-file-meta';
-    meta.textContent = formatBytes(node.item.size);
-    label.innerHTML = '<svg class="ui-icon tree-file-icon"><use href="#icon-file"></use></svg>';
-    const name = document.createElement('span');
-    name.className = 'tree-file-name';
-    name.textContent = node.name;
-    label.appendChild(name);
-    row.appendChild(label);
-    row.appendChild(meta);
-    row.appendChild(button);
-    return row;
-  }
 
   const check = document.createElement('input');
   check.type = 'checkbox';
@@ -1239,6 +1322,14 @@ function renderSelectionNode(node, single) {
   row.appendChild(check);
   row.appendChild(label);
   row.appendChild(meta);
+  if (sourceSelection) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'secondary compact';
+    setButtonLabel(button, '解析');
+    button.addEventListener('click', () => chooseSelectionItem(selectionJobId, node.item.id, button));
+    row.appendChild(button);
+  }
   return row;
 }
 
@@ -1296,6 +1387,7 @@ function selectedItemIds() {
 function updateSelectionSummary() {
   const count = selectedItemIds().length;
   selectionSummary.textContent = `已选 ${count} 项`;
+  setButtonLabel(generateButton, `解析已选中（${count}项）`);
   generateButton.disabled = count === 0;
 }
 
@@ -1303,7 +1395,7 @@ async function onGenerateSelection() {
   const ids = selectedItemIds();
   if (!ids.length || !selectionJobId) return;
   generateButton.disabled = true;
-  setButtonLabel(generateButton, '生成中...');
+  setButtonLabel(generateButton, '解析中...');
   try {
     const job = await api(`/api/jobs/${selectionJobId}/select`, {
       method: 'POST',
@@ -1318,7 +1410,7 @@ async function onGenerateSelection() {
     showJobError(error.message);
     generateButton.disabled = false;
   } finally {
-    setButtonLabel(generateButton, '生成下载链接');
+    updateSelectionSummary();
   }
 }
 
@@ -1353,6 +1445,7 @@ function renderResult(job) {
   resultSingle.classList.remove('hidden');
   resultTree.classList.add('hidden');
   resultTree.innerHTML = '';
+  renderResultNotices(job);
 
   resultMode.textContent = job.mode === 'proxy' ? '代理优先' : '直链优先';
   resultMode.className = `status-pill ${job.mode === 'proxy' ? 'warn' : 'success'}`;
@@ -1367,6 +1460,7 @@ function renderResult(job) {
   proxyOpen.href = result.proxy_url || '#';
   directCopy.disabled = !result.direct_url;
   proxyCopy.disabled = !result.proxy_url;
+  reorderSingleResultLinks(job.mode);
 
   refreshAria2PushAll();
   requestAnimationFrame(() => {
@@ -1384,6 +1478,7 @@ function renderResultTree(job, results) {
   resultSingle.classList.add('hidden');
   resultTree.classList.remove('hidden');
   resultTree.innerHTML = '';
+  renderResultNotices(job);
 
   const batch = job.batch;
   if (batch) {
@@ -1399,7 +1494,7 @@ function renderResultTree(job, results) {
 
   const root = buildResultTree(results);
   for (const node of root.children) {
-    resultTree.appendChild(renderResultNode(node));
+    resultTree.appendChild(renderResultNode(node, job.mode));
   }
 
   refreshAria2PushAll();
@@ -1434,7 +1529,20 @@ function buildResultTree(results) {
   return root;
 }
 
-function renderResultNode(node) {
+function renderResultNoticesOnly(job) {
+  lastResults = null;
+  lastSingleResult = null;
+  resultPanel.classList.remove('hidden');
+  resultSingle.classList.add('hidden');
+  resultTree.classList.add('hidden');
+  resultTree.innerHTML = '';
+  resultMode.textContent = '任务提示';
+  resultMode.className = 'status-pill warn';
+  renderResultNotices(job);
+  refreshAria2PushAll();
+}
+
+function renderResultNode(node, mode = 'direct') {
   if (node.isFolder) {
     const wrap = document.createElement('div');
     wrap.className = 'tree-folder';
@@ -1472,7 +1580,7 @@ function renderResultNode(node) {
     wrap.appendChild(row);
 
     for (const child of node.children) {
-      childrenInner.appendChild(renderResultNode(child));
+      childrenInner.appendChild(renderResultNode(child, mode));
     }
     wrap.appendChild(childrenWrap);
     return wrap;
@@ -1496,13 +1604,32 @@ function renderResultNode(node) {
   head.appendChild(meta);
   card.appendChild(head);
 
-  if (result.direct_url) {
-    card.appendChild(buildLinkRow('直链', 'direct', result.direct_url, result.file?.path || result.file?.name));
-  }
-  if (result.proxy_url) {
-    card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url, result.file?.path || result.file?.name));
-  }
+  appendResultLinks(card, result, mode);
   return card;
+}
+
+function reorderSingleResultLinks(mode = 'direct') {
+  const directBlock = directValue?.closest('.link-block');
+  const proxyBlock = proxyValue?.closest('.link-block');
+  if (!directBlock || !proxyBlock || !resultSingle) return;
+  if (mode === 'proxy') {
+    resultSingle.appendChild(proxyBlock);
+    resultSingle.appendChild(directBlock);
+    return;
+  }
+  resultSingle.appendChild(directBlock);
+  resultSingle.appendChild(proxyBlock);
+}
+
+function appendResultLinks(container, result, mode = 'direct') {
+  const direct = { tag: '直链', cls: 'direct', url: result.direct_url };
+  const proxy = { tag: '代理链接', cls: 'proxy', url: result.proxy_url };
+  const rows = mode === 'proxy' ? [proxy, direct] : [direct, proxy];
+  for (const row of rows) {
+    if (row.url) {
+      container.appendChild(buildLinkRow(row.tag, row.cls, row.url, result.file?.path || result.file?.name));
+    }
+  }
 }
 
 // buildLinkRow is the compact open/copy block used for each link in the result
@@ -2157,6 +2284,7 @@ function clearJobUI() {
   selectionStage = '';
   checkboxByItemId = new Map();
   resultPanel.classList.add('hidden');
+  clearResultNotices();
   if (resultTree) resultTree.innerHTML = '';
   renderAttempts([]);
   jobBadge.textContent = '空闲';
@@ -2449,6 +2577,13 @@ function spawnRipple(event) {
 function createStatusPill(text, variant = 'neutral', compact = false) {
   const badge = document.createElement('span');
   badge.className = `status-pill ${variant}${compact ? ' compact-pill' : ''}`;
+  badge.textContent = text;
+  return badge;
+}
+
+function createAccountMetaPill(text, variant = 'neutral') {
+  const badge = document.createElement('span');
+  badge.className = `account-meta-pill ${variant}`;
   badge.textContent = text;
   return badge;
 }

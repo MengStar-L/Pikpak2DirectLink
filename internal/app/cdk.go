@@ -16,9 +16,9 @@ const cdkAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 const maxCDKBatch = 100
 
 var (
-	errCDKNotFound  = errors.New("CDK 不存在")
-	errCDKExpired   = errors.New("CDK 已过期")
-	errCDKExhausted = errors.New("CDK 流量已用完")
+	errCDKNotFound  = errors.New("CDK not found")
+	errCDKExpired   = errors.New("CDK expired")
+	errCDKExhausted = errors.New("CDK traffic exhausted")
 )
 
 // errCDKOverdraw signals that a resolved file is larger than the CDK's remaining
@@ -31,7 +31,7 @@ type errCDKOverdraw struct {
 }
 
 func (e errCDKOverdraw) Error() string {
-	return fmt.Sprintf("所选文件大小 %s 超过 CDK 剩余流量（剩余 %s）", formatTrafficLabel(e.size), formatTrafficLabel(e.remaining))
+	return fmt.Sprintf("selected size %s exceeds remaining CDK traffic (%s remaining)", formatTrafficLabel(e.size), formatTrafficLabel(e.remaining))
 }
 
 // CDK is the stored representation of a redemption code. Quota is metered in
@@ -277,4 +277,40 @@ func (s *cdkStore) charge(code string, bytes int64) error {
 		bytes, bytes, code,
 	)
 	return err
+}
+
+func (s *cdkStore) chargeIfEnough(code string, bytes int64, now time.Time) error {
+	if bytes < 0 {
+		bytes = 0
+	}
+	res, err := s.db.Exec(
+		`UPDATE cdks
+		 SET remaining_bytes=remaining_bytes-?, used_bytes=used_bytes+?
+		 WHERE code=? AND expires_at>? AND remaining_bytes>=?`,
+		bytes, bytes, code, now.Unix(), bytes,
+	)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return nil
+	}
+
+	c, ok, err := s.get(code)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errCDKNotFound
+	}
+	if c.ExpiresAt <= now.Unix() {
+		return errCDKExpired
+	}
+	if c.RemainingBytes <= 0 && bytes > 0 {
+		return errCDKExhausted
+	}
+	if c.RemainingBytes < bytes {
+		return errCDKOverdraw{size: bytes, remaining: c.RemainingBytes}
+	}
+	return errCDKExhausted
 }

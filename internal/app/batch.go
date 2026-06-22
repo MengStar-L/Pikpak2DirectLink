@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const maxBatchLinks = 100
+
 // batchState tracks the live progress of one multi-link parent job. Each child's
 // results are copied here the moment it finishes, so they survive even if the
 // jobStore later evicts the child. The parent job is updated from this state on
@@ -57,16 +59,22 @@ type childSpec struct {
 // and are enqueued at the given priority so they fan out across the resolve queue
 // under the admin's concurrency limit. It returns the parent job, or an HTTP
 // status + message when a line cannot be recognized (status 0 means success).
-func (s *Server) createBatchJob(lines []string, mode, defaultPassCode, cdkCode string, priority int, baseURL string) (*Job, int, string) {
+func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode, cdkCode string, priority int, baseURL string) (*Job, int, string) {
+	if len(lines) > maxBatchLinks {
+		return nil, 400, fmt.Sprintf("too many links: maximum is %d per batch", maxBatchLinks)
+	}
+
 	specs := make([]childSpec, 0, len(lines))
+	cleanLines := make([]string, 0, len(lines))
 	for i, line := range lines {
-		kind, err := detectResourceKind(line)
+		kind, err := detectResourceKind(line.clean)
 		if err != nil {
 			return nil, 400, fmt.Sprintf("第 %d 行无法识别：%s", i+1, err.Error())
 		}
-		spec := childSpec{input: line, kind: kind, label: batchLinkLabel(i+1, line, kind)}
+
+		spec := childSpec{input: line.clean, kind: kind, label: batchLinkLabel(i+1, line.clean, kind)}
 		if kind == ResourceShare {
-			share, passCode, err := shareStateAndPassCode(line, defaultPassCode)
+			share, passCode, err := shareStateAndPassCode(line.raw, defaultPassCode)
 			if err != nil {
 				return nil, 400, fmt.Sprintf("第 %d 行分享链接无效：%s", i+1, err.Error())
 			}
@@ -74,6 +82,7 @@ func (s *Server) createBatchJob(lines []string, mode, defaultPassCode, cdkCode s
 			spec.passCode = passCode
 		}
 		specs = append(specs, spec)
+		cleanLines = append(cleanLines, line.clean)
 	}
 
 	now := time.Now()
@@ -82,7 +91,7 @@ func (s *Server) createBatchJob(lines []string, mode, defaultPassCode, cdkCode s
 		ID:        parentID,
 		Kind:      ResourceBatch,
 		Mode:      mode,
-		Input:     strings.Join(lines, "\n"),
+		Input:     strings.Join(cleanLines, "\n"),
 		Status:    JobRunning,
 		Stage:     StageTransfer,
 		Message:   fmt.Sprintf("解析中：0/%d 条完成", len(specs)),
@@ -165,13 +174,18 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 			merged := r
 			merged.File.Path = label + "/" + childResultPath(r.File)
 			merged.ProxyURL = proxyURLForParent(bs.baseURL, parentID, r.ProxyToken)
+			merged.applyPreferredURL(child.Mode)
 			bs.results = append(bs.results, merged)
 		}
 		bs.succeeded++
-	} else if ok && child.Status == JobFailed && isBadResourceUserError(child.Error) {
+	} else {
+		errText := "child job was not found"
+		if ok && child.Status == JobFailed {
+			errText = child.Error
+		}
 		bs.failures = append(bs.failures, BatchFailure{
 			Label: label,
-			Error: badResourceParseUserError,
+			Error: safeBatchFailureError(errText),
 		})
 	}
 	done, total, succeeded := bs.done, bs.total, bs.succeeded
@@ -211,6 +225,14 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 		s.removeBatch(parentID)
 		s.logJob(LogSuccess, parentID, fmt.Sprintf("批量解析完成，成功 %d/%d 条", succeeded, total))
 	}
+}
+
+func safeBatchFailureError(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return genericUserJobError
+	}
+	return safeUserError(message)
 }
 
 // childResultPath is the in-link path of a resolved file, falling back to its

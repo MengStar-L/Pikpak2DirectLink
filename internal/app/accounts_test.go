@@ -139,6 +139,30 @@ func TestAccountPoolBootstrapUsesLegacySessionFile(t *testing.T) {
 	if state.record.SessionFile != legacySession {
 		t.Fatalf("expected legacy session file %q, got %q", legacySession, state.record.SessionFile)
 	}
+	if state.record.CredentialNextCheckAt == "" {
+		t.Fatalf("expected bootstrapped account to be scheduled for credential check")
+	}
+}
+
+func TestAccountPoolEnsureCredentialScheduleBackfillsOldAccounts(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC)
+	pool := newTrafficTestPool(t)
+	pool.injectAccount(accountRecord{ID: "old", Username: "old@example.com", Status: AccountAvailable})
+
+	if err := pool.EnsureCredentialSchedule(now, 6*time.Hour); err != nil {
+		t.Fatalf("ensure schedule: %v", err)
+	}
+
+	got := pool.List()[0]
+	wantNext := now.Add(6 * time.Hour).Format(time.RFC3339)
+	if got.CredentialNextCheckAt != wantNext {
+		t.Fatalf("next check = %q, want %q", got.CredentialNextCheckAt, wantNext)
+	}
+	if got.CredentialCheckedAt != "" {
+		t.Fatalf("old account should not get a checked_at value, got %q", got.CredentialCheckedAt)
+	}
 }
 
 func TestAccountPoolResolveOrder(t *testing.T) {
@@ -190,6 +214,26 @@ func TestAccountPoolResolveOrder(t *testing.T) {
 	got := orderIDs(pool.ResolveOrder(true))
 	if got[len(got)-1] != "a" {
 		t.Fatalf("failed account not last: %v", got)
+	}
+}
+
+func TestAccountPoolRefreshLoginValidation(t *testing.T) {
+	t.Parallel()
+
+	pool := newTrafficTestPool(t)
+
+	if _, err := pool.RefreshLogin(nil, "missing"); err == nil {
+		t.Fatal("expected error for unknown account")
+	}
+
+	pool.injectAccount(accountRecord{
+		ID:       "acct_missing_password",
+		Username: "demo@example.com",
+		Status:   AccountFailed,
+	})
+
+	if _, err := pool.RefreshLogin(nil, "acct_missing_password"); err == nil {
+		t.Fatal("expected error for account without saved password")
 	}
 }
 

@@ -896,6 +896,38 @@ button:disabled {
   gap: 10px;
   flex-wrap: wrap;
 }
+.account-meta-pill {
+  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+  white-space: nowrap;
+}
+.account-meta-pill.success {
+  color: #0d9f6e;
+  background: #e8fff5;
+  border-color: #bdf1d8;
+}
+.account-meta-pill.danger {
+  color: #d83c75;
+  background: var(--pink-soft);
+  border-color: var(--pink-line);
+}
+.account-meta-pill.checked {
+  color: #2f6feb;
+  background: #edf5ff;
+  border-color: #cfe3ff;
+}
+.account-meta-pill.next {
+  color: #b8750d;
+  background: #fff6df;
+  border-color: #ffe1a8;
+}
 .account-parse-error-pill {
   min-height: 26px;
   padding: 0 10px;
@@ -1425,6 +1457,20 @@ button:disabled {
   border-bottom: 1px solid var(--border);
   margin-bottom: 8px;
 }
+.selection-head {
+  align-items: flex-start;
+}
+.selection-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+.selection-head-actions .primary {
+  min-width: 160px;
+}
 .tree-check-all {
   display: inline-flex;
   align-items: center;
@@ -1516,6 +1562,38 @@ button:disabled {
 }
 
 .result-list { display: grid; gap: 16px; }
+.result-notices {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 14px;
+}
+.result-notice {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 10px 12px;
+}
+.result-notice.warn {
+  border-color: var(--orange-line);
+  background: var(--orange-soft);
+}
+.result-notice.danger {
+  border-color: var(--pink-line);
+  background: var(--pink-soft);
+}
+.result-notice strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-primary);
+  font-weight: 850;
+}
+.result-notice ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-secondary);
+  line-height: 1.55;
+  word-break: break-word;
+}
 .result-group-head {
   display: flex; align-items: center; gap: 8px;
   font-weight: 800; font-size: 13.5px; color: var(--text-primary);

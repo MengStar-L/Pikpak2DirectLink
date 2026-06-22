@@ -41,26 +41,29 @@ type AccountPoolConfig struct {
 }
 
 type AccountSummary struct {
-	ID               string        `json:"id"`
-	Username         string        `json:"username"`
-	Status           AccountStatus `json:"status"`
-	Ready            bool          `json:"ready"`
-	LoggedIn         bool          `json:"logged_in"`
-	Persisted        bool          `json:"persisted"`
-	Premium          bool          `json:"premium"`
-	PremiumType      string        `json:"premium_type,omitempty"`
-	PremiumUntil     string        `json:"premium_until,omitempty"`
-	PremiumError     string        `json:"premium_error,omitempty"`
-	PremiumCheckedAt string        `json:"premium_checked_at,omitempty"`
-	TrafficLimit     int64         `json:"traffic_limit"`
-	TrafficUsed      int64         `json:"traffic_used"`
-	TrafficLimited   bool          `json:"traffic_limited"`
-	LastError        string        `json:"last_error,omitempty"`
-	LastFailedAt     string        `json:"last_failed_at,omitempty"`
-	ParseErrorCount  int           `json:"parse_error_count"`
-	ParseErrors      []ParseError  `json:"parse_errors,omitempty"`
-	CreatedAt        time.Time     `json:"created_at"`
-	UpdatedAt        time.Time     `json:"updated_at"`
+	ID                    string        `json:"id"`
+	Username              string        `json:"username"`
+	Status                AccountStatus `json:"status"`
+	Ready                 bool          `json:"ready"`
+	LoggedIn              bool          `json:"logged_in"`
+	Persisted             bool          `json:"persisted"`
+	Premium               bool          `json:"premium"`
+	PremiumType           string        `json:"premium_type,omitempty"`
+	PremiumUntil          string        `json:"premium_until,omitempty"`
+	PremiumError          string        `json:"premium_error,omitempty"`
+	PremiumCheckedAt      string        `json:"premium_checked_at,omitempty"`
+	TrafficLimit          int64         `json:"traffic_limit"`
+	TrafficUsed           int64         `json:"traffic_used"`
+	TrafficLimited        bool          `json:"traffic_limited"`
+	LastError             string        `json:"last_error,omitempty"`
+	LastFailedAt          string        `json:"last_failed_at,omitempty"`
+	CredentialCheckedAt   string        `json:"credential_checked_at,omitempty"`
+	CredentialNextCheckAt string        `json:"credential_next_check_at,omitempty"`
+	CredentialCheckError  string        `json:"credential_check_error,omitempty"`
+	ParseErrorCount       int           `json:"parse_error_count"`
+	ParseErrors           []ParseError  `json:"parse_errors,omitempty"`
+	CreatedAt             time.Time     `json:"created_at"`
+	UpdatedAt             time.Time     `json:"updated_at"`
 }
 
 type AccountRuntime struct {
@@ -70,24 +73,27 @@ type AccountRuntime struct {
 }
 
 type accountRecord struct {
-	ID               string        `json:"id"`
-	Username         string        `json:"username"`
-	Password         string        `json:"password"`
-	SessionFile      string        `json:"session_file"`
-	Status           AccountStatus `json:"status"`
-	Premium          bool          `json:"premium"`
-	PremiumType      string        `json:"premium_type,omitempty"`
-	PremiumUntil     string        `json:"premium_until,omitempty"`
-	PremiumError     string        `json:"premium_error,omitempty"`
-	PremiumCheckedAt string        `json:"premium_checked_at,omitempty"`
-	TrafficLimit     int64         `json:"traffic_limit,omitempty"`
-	TrafficUsed      int64         `json:"traffic_used,omitempty"`
-	TrafficPeriod    string        `json:"traffic_period,omitempty"`
-	LastError        string        `json:"last_error,omitempty"`
-	LastFailedAt     string        `json:"last_failed_at,omitempty"`
-	ParseErrors      []ParseError  `json:"parse_errors,omitempty"`
-	CreatedAt        time.Time     `json:"created_at"`
-	UpdatedAt        time.Time     `json:"updated_at"`
+	ID                    string        `json:"id"`
+	Username              string        `json:"username"`
+	Password              string        `json:"password"`
+	SessionFile           string        `json:"session_file"`
+	Status                AccountStatus `json:"status"`
+	Premium               bool          `json:"premium"`
+	PremiumType           string        `json:"premium_type,omitempty"`
+	PremiumUntil          string        `json:"premium_until,omitempty"`
+	PremiumError          string        `json:"premium_error,omitempty"`
+	PremiumCheckedAt      string        `json:"premium_checked_at,omitempty"`
+	TrafficLimit          int64         `json:"traffic_limit,omitempty"`
+	TrafficUsed           int64         `json:"traffic_used,omitempty"`
+	TrafficPeriod         string        `json:"traffic_period,omitempty"`
+	LastError             string        `json:"last_error,omitempty"`
+	LastFailedAt          string        `json:"last_failed_at,omitempty"`
+	CredentialCheckedAt   string        `json:"credential_checked_at,omitempty"`
+	CredentialNextCheckAt string        `json:"credential_next_check_at,omitempty"`
+	CredentialCheckError  string        `json:"credential_check_error,omitempty"`
+	ParseErrors           []ParseError  `json:"parse_errors,omitempty"`
+	CreatedAt             time.Time     `json:"created_at"`
+	UpdatedAt             time.Time     `json:"updated_at"`
 }
 
 type ParseError struct {
@@ -160,20 +166,24 @@ func (p *AccountPool) Add(ctx context.Context, username, password string, traffi
 	}
 
 	record := accountRecord{
-		ID:            id,
-		Username:      username,
-		Password:      password,
-		SessionFile:   sessionFile,
-		Status:        AccountAvailable,
-		TrafficLimit:  trafficLimit,
-		TrafficPeriod: monthKey(now),
-		CreatedAt:     createdAt,
-		UpdatedAt:     now,
+		ID:                    id,
+		Username:              username,
+		Password:              password,
+		SessionFile:           sessionFile,
+		Status:                AccountAvailable,
+		TrafficLimit:          trafficLimit,
+		TrafficPeriod:         monthKey(now),
+		CredentialNextCheckAt: formatAccountTime(now),
+		CreatedAt:             createdAt,
+		UpdatedAt:             now,
 	}
 	// Re-adding an existing account keeps its accrued usage for the month.
 	if existed {
 		record.TrafficUsed = existingState.record.TrafficUsed
 		record.ParseErrors = append([]ParseError(nil), existingState.record.ParseErrors...)
+		record.CredentialCheckedAt = existingState.record.CredentialCheckedAt
+		record.CredentialNextCheckAt = existingState.record.CredentialNextCheckAt
+		record.CredentialCheckError = existingState.record.CredentialCheckError
 		if existingState.record.TrafficPeriod != "" {
 			record.TrafficPeriod = existingState.record.TrafficPeriod
 		}
@@ -214,15 +224,16 @@ func (p *AccountPool) AddBootstrap(username, password, sessionFile string) error
 	now := time.Now()
 	p.accounts[id] = &accountState{
 		record: accountRecord{
-			ID:            id,
-			Username:      username,
-			Password:      password,
-			SessionFile:   sessionFile,
-			Status:        AccountAvailable,
-			TrafficLimit:  defaultAccountTraffic,
-			TrafficPeriod: monthKey(now),
-			CreatedAt:     now,
-			UpdatedAt:     now,
+			ID:                    id,
+			Username:              username,
+			Password:              password,
+			SessionFile:           sessionFile,
+			Status:                AccountAvailable,
+			TrafficLimit:          defaultAccountTraffic,
+			TrafficPeriod:         monthKey(now),
+			CredentialNextCheckAt: formatAccountTime(now),
+			CreatedAt:             now,
+			UpdatedAt:             now,
 		},
 		client: p.newClient(username, password, sessionFile),
 	}
@@ -239,6 +250,76 @@ func (p *AccountPool) List() []AccountSummary {
 		summaries = append(summaries, p.summaryLocked(id))
 	}
 	return summaries
+}
+
+func (p *AccountPool) Summary(id string) (AccountSummary, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if p.accounts[id] == nil {
+		return AccountSummary{}, false
+	}
+	return p.summaryLocked(id), true
+}
+
+func (p *AccountPool) EnsureCredentialSchedule(now time.Time, interval time.Duration) error {
+	if interval <= 0 {
+		interval = defaultAccountHealthCheckInterval
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	changed := false
+	next := formatAccountTime(now.Add(interval))
+	for _, id := range p.order {
+		state := p.accounts[id]
+		if state == nil {
+			continue
+		}
+		if _, err := parseAccountTime(state.record.CredentialNextCheckAt); state.record.CredentialNextCheckAt == "" || err != nil {
+			state.record.CredentialNextCheckAt = next
+			state.record.UpdatedAt = now
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return p.saveLocked()
+}
+
+type credentialCheckTarget struct {
+	Account AccountRuntime
+	NextAt  time.Time
+}
+
+func (p *AccountPool) NextCredentialCheck(now time.Time) (credentialCheckTarget, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	var target credentialCheckTarget
+	for _, id := range p.order {
+		state := p.accounts[id]
+		if state == nil {
+			continue
+		}
+		nextAt, err := parseAccountTime(state.record.CredentialNextCheckAt)
+		if err != nil {
+			nextAt = now
+		}
+		if target.Account.ID != "" && !nextAt.Before(target.NextAt) {
+			continue
+		}
+		target = credentialCheckTarget{
+			Account: AccountRuntime{
+				ID:       state.record.ID,
+				Username: state.record.Username,
+				Client:   state.client,
+			},
+			NextAt: nextAt,
+		}
+	}
+	return target, target.Account.ID != ""
 }
 
 func (p *AccountPool) RefreshPremiumInfo(ctx context.Context) {
@@ -278,6 +359,49 @@ func (p *AccountPool) RefreshPremiumInfo(ctx context.Context) {
 		}
 		p.mu.Unlock()
 	}
+}
+
+func (p *AccountPool) MarkCredentialCheckSuccess(id string, checkedAt, nextAt time.Time, cleanupErr error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state := p.accounts[id]
+	if state == nil {
+		return
+	}
+	state.record.Status = AccountAvailable
+	state.record.LastError = ""
+	state.record.LastFailedAt = ""
+	state.record.CredentialCheckedAt = formatAccountTime(checkedAt)
+	state.record.CredentialNextCheckAt = formatAccountTime(nextAt)
+	state.record.CredentialCheckError = ""
+	if cleanupErr != nil {
+		state.record.CredentialCheckError = "测试文件清理失败：" + friendlyPikPakError(cleanupErr)
+	}
+	state.record.UpdatedAt = checkedAt
+	_ = p.saveLocked()
+}
+
+func (p *AccountPool) MarkCredentialCheckFailed(id string, err error, checkedAt, nextAt time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state := p.accounts[id]
+	if state == nil {
+		return
+	}
+	message := friendlyPikPakError(err)
+	if message == "" {
+		message = "账号凭据验证失败"
+	}
+	state.record.Status = AccountFailed
+	state.record.LastError = message
+	state.record.LastFailedAt = checkedAt.Format(time.RFC3339)
+	state.record.CredentialCheckedAt = formatAccountTime(checkedAt)
+	state.record.CredentialNextCheckAt = formatAccountTime(nextAt)
+	state.record.CredentialCheckError = message
+	state.record.UpdatedAt = checkedAt
+	_ = p.saveLocked()
 }
 
 func (p *AccountPool) Snapshot() []AccountRuntime {
@@ -417,6 +541,47 @@ func (p *AccountPool) ResetFailure(id string) error {
 	state.record.LastFailedAt = ""
 	state.record.UpdatedAt = time.Now()
 	return p.saveLocked()
+}
+
+func (p *AccountPool) RefreshLogin(ctx context.Context, id string) (AccountSummary, error) {
+	p.mu.RLock()
+	state := p.accounts[id]
+	if state == nil {
+		p.mu.RUnlock()
+		return AccountSummary{}, errors.New("account not found")
+	}
+	record := state.record
+	p.mu.RUnlock()
+
+	if strings.TrimSpace(record.Username) == "" || strings.TrimSpace(record.Password) == "" {
+		return AccountSummary{}, errors.New("account username or password is missing")
+	}
+
+	client := p.newClient(record.Username, record.Password, record.SessionFile)
+	if err := client.Login(ctx, record.Username, record.Password); err != nil {
+		return AccountSummary{}, err
+	}
+	premiumInfo, premiumErr := client.GetVIPInfo(ctx)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state = p.accounts[id]
+	if state == nil {
+		return AccountSummary{}, errors.New("account not found")
+	}
+
+	now := time.Now()
+	state.client = client
+	state.record.Status = AccountAvailable
+	state.record.LastError = ""
+	state.record.LastFailedAt = ""
+	updatePremiumRecord(&state.record, premiumInfo, premiumErr, now)
+	state.record.UpdatedAt = now
+	if err := p.saveLocked(); err != nil {
+		return AccountSummary{}, err
+	}
+	return p.summaryLocked(id), nil
 }
 
 func (p *AccountPool) MarkFailed(id string, err error) {
@@ -589,26 +754,29 @@ func (p *AccountPool) summaryLocked(id string) AccountSummary {
 	status := state.client.Status()
 	now := time.Now()
 	return AccountSummary{
-		ID:               state.record.ID,
-		Username:         state.record.Username,
-		Status:           state.record.Status,
-		Ready:            status.Ready,
-		LoggedIn:         status.LoggedIn,
-		Persisted:        status.Persisted,
-		Premium:          state.record.Premium,
-		PremiumType:      state.record.PremiumType,
-		PremiumUntil:     state.record.PremiumUntil,
-		PremiumError:     friendlyPikPakMessage(state.record.PremiumError),
-		PremiumCheckedAt: state.record.PremiumCheckedAt,
-		TrafficLimit:     state.record.TrafficLimit,
-		TrafficUsed:      effectiveTrafficUsed(state.record, now),
-		TrafficLimited:   accountTrafficLimited(state.record, now),
-		LastError:        friendlyPikPakMessage(state.record.LastError),
-		LastFailedAt:     state.record.LastFailedAt,
-		ParseErrorCount:  len(state.record.ParseErrors),
-		ParseErrors:      append([]ParseError(nil), state.record.ParseErrors...),
-		CreatedAt:        state.record.CreatedAt,
-		UpdatedAt:        state.record.UpdatedAt,
+		ID:                    state.record.ID,
+		Username:              state.record.Username,
+		Status:                state.record.Status,
+		Ready:                 status.Ready,
+		LoggedIn:              status.LoggedIn,
+		Persisted:             status.Persisted,
+		Premium:               state.record.Premium,
+		PremiumType:           state.record.PremiumType,
+		PremiumUntil:          state.record.PremiumUntil,
+		PremiumError:          friendlyPikPakMessage(state.record.PremiumError),
+		PremiumCheckedAt:      state.record.PremiumCheckedAt,
+		TrafficLimit:          state.record.TrafficLimit,
+		TrafficUsed:           effectiveTrafficUsed(state.record, now),
+		TrafficLimited:        accountTrafficLimited(state.record, now),
+		LastError:             friendlyPikPakMessage(state.record.LastError),
+		LastFailedAt:          state.record.LastFailedAt,
+		CredentialCheckedAt:   state.record.CredentialCheckedAt,
+		CredentialNextCheckAt: state.record.CredentialNextCheckAt,
+		CredentialCheckError:  friendlyPikPakMessage(state.record.CredentialCheckError),
+		ParseErrorCount:       len(state.record.ParseErrors),
+		ParseErrors:           append([]ParseError(nil), state.record.ParseErrors...),
+		CreatedAt:             state.record.CreatedAt,
+		UpdatedAt:             state.record.UpdatedAt,
 	}
 }
 
@@ -642,6 +810,21 @@ func accountIDForUsername(username string) string {
 // monthKey is the calendar-month identifier used to scope traffic counters.
 func monthKey(t time.Time) string {
 	return t.Format("2006-01")
+}
+
+func parseAccountTime(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, errors.New("time is empty")
+	}
+	return time.Parse(time.RFC3339, value)
+}
+
+func formatAccountTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // effectiveTrafficUsed returns the bytes used in the month that contains now.

@@ -2,8 +2,10 @@ package app
 
 import (
 	"errors"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -106,6 +108,48 @@ func TestCDKCharge(t *testing.T) {
 	}
 	if c.UsedBytes != 12*bytesPerGB {
 		t.Fatalf("used should accumulate to 12G, got %d", c.UsedBytes)
+	}
+}
+
+func TestCDKChargeIfEnoughDoesNotOverdrawConcurrently(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	store := newTestCDKStore(t)
+	created, _ := store.createBatch(1, 1*bytesPerGB, 30, now)
+	code := created[0].Code
+	chargeSize := int64(700 * 1024 * 1024)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- store.chargeIfEnough(code, chargeSize, now)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	successes := 0
+	overdraws := 0
+	for err := range errs {
+		if err == nil {
+			successes++
+			continue
+		}
+		if _, ok := errAsOverdraw(err); ok {
+			overdraws++
+			continue
+		}
+		t.Fatalf("unexpected charge error: %v", err)
+	}
+	if successes != 1 || overdraws != 1 {
+		t.Fatalf("successes=%d overdraws=%d, want 1 each", successes, overdraws)
+	}
+
+	c, _, _ := store.get(code)
+	if c.RemainingBytes != bytesPerGB-chargeSize || c.UsedBytes != chargeSize {
+		t.Fatalf("remaining=%d used=%d, want remaining=%d used=%d", c.RemainingBytes, c.UsedBytes, bytesPerGB-chargeSize, chargeSize)
 	}
 }
 
@@ -213,6 +257,14 @@ func TestUserJobViewHidesAccountInfo(t *testing.T) {
 	if contains(badResource.Error, "@") {
 		t.Fatalf("bad resource error leaked account info: %q", badResource.Error)
 	}
+
+	overdraw := toUserJobView(&Job{ID: "job5", Status: JobFailed, Error: (errCDKOverdraw{size: 2 * bytesPerGB, remaining: bytesPerGB}).Error()})
+	if overdraw.Error == genericUserJobError {
+		t.Fatalf("CDK overdraw should be a safe user-visible error, got generic")
+	}
+	if contains(overdraw.Error, "@") {
+		t.Fatalf("CDK overdraw leaked account info: %q", overdraw.Error)
+	}
 }
 
 func contains(haystack, needle string) bool {
@@ -261,6 +313,106 @@ func TestApplyItemsSelectionRejectsOverdraw(t *testing.T) {
 	// Unknown item id is rejected.
 	if _, status, _ := s.applyItemsSelection(mkJob("job-unknown"), []string{"a", "zzz"}); status != 400 {
 		t.Fatalf("expected 400 for unknown item, got status=%d", status)
+	}
+}
+
+func TestApplyItemSelectionRejectsUnknownSourceItem(t *testing.T) {
+	noopResolver := newResolveQueue(time.Second, time.Second, 1, func(string, error) {})
+	s := &Server{jobs: newJobStore(10), resolver: noopResolver}
+	s.jobs.create(&Job{
+		ID:     "source-job",
+		Status: JobSelectionRequired,
+		Stage:  StageSourceSelection,
+		Share:  &ShareState{ShareID: "share"},
+		Items:  []DownloadItem{{ID: "known", Name: "known"}},
+	})
+
+	if _, status, msg := s.applyItemSelection("source-job", "unknown"); status != 400 {
+		t.Fatalf("status=%d msg=%q, want 400", status, msg)
+	}
+}
+
+func TestApplyItemSelectionDuplicateSubmitOnlyQueuesOnce(t *testing.T) {
+	noopResolver := newResolveQueue(time.Second, time.Second, 1, func(string, error) {})
+	s := &Server{jobs: newJobStore(10), resolver: noopResolver}
+	s.jobs.create(&Job{
+		ID:     "source-job",
+		Status: JobSelectionRequired,
+		Stage:  StageSourceSelection,
+		Share:  &ShareState{ShareID: "share"},
+		Items:  []DownloadItem{{ID: "known", Name: "known"}},
+	})
+
+	if _, status, msg := s.applyItemSelection("source-job", "known"); status != 0 {
+		t.Fatalf("first selection status=%d msg=%q, want success", status, msg)
+	}
+	if _, status, msg := s.applyItemSelection("source-job", "known"); status != 409 {
+		t.Fatalf("second selection status=%d msg=%q, want 409", status, msg)
+	}
+	if queued := noopResolver.queuedIDs(); len(queued) != 1 || queued[0] != "source-job" {
+		t.Fatalf("queued IDs = %v, want [source-job]", queued)
+	}
+}
+
+func TestApplyItemsSelectionAcceptsMultipleSourceItems(t *testing.T) {
+	noopResolver := newResolveQueue(time.Second, time.Second, 1, func(string, error) {})
+	s := &Server{jobs: newJobStore(10), resolver: noopResolver}
+	s.jobs.create(&Job{
+		ID:     "source-job",
+		Status: JobSelectionRequired,
+		Stage:  StageSourceSelection,
+		Share:  &ShareState{ShareID: "share"},
+		Items: []DownloadItem{
+			{ID: "a", Name: "a.bin", Size: itoa64(256 * 1024 * 1024)},
+			{ID: "b", Name: "b.bin", Size: itoa64(256 * 1024 * 1024)},
+			{ID: "c", Name: "c.bin", Size: itoa64(256 * 1024 * 1024)},
+		},
+	})
+
+	updated, status, msg := s.applyItemsSelection("source-job", []string{"b", "a", "b"})
+	if status != 0 {
+		t.Fatalf("source multi selection status=%d msg=%q, want success", status, msg)
+	}
+	if updated.Status != JobQueued || updated.Stage != StageTransfer {
+		t.Fatalf("updated job status/stage = %s/%s, want queued/transfer", updated.Status, updated.Stage)
+	}
+	if updated.Share == nil || updated.Share.SelectedID != "b" || len(updated.Share.SelectedIDs) != 2 || updated.Share.SelectedIDs[0] != "b" || updated.Share.SelectedIDs[1] != "a" {
+		t.Fatalf("selected share ids = %+v, want [b a]", updated.Share)
+	}
+	if !updated.ResolveSelected {
+		t.Fatal("source multi selection should mark the job to resolve selected files directly")
+	}
+	if len(updated.Items) != 0 {
+		t.Fatalf("selection items should be cleared, got %+v", updated.Items)
+	}
+	if queued := noopResolver.queuedIDs(); len(queued) != 1 || queued[0] != "source-job" {
+		t.Fatalf("queued IDs = %v, want [source-job]", queued)
+	}
+}
+
+func TestApplyItemsSelectionRejectsSourceOverdraw(t *testing.T) {
+	now := time.Now()
+	store := newTestCDKStore(t)
+	created, _ := store.createBatch(1, 1*bytesPerGB, 30, now)
+	code := created[0].Code
+
+	noopResolver := newResolveQueue(time.Second, time.Second, 1, func(string, error) {})
+	s := &Server{cdk: store, jobs: newJobStore(10), resolver: noopResolver}
+	s.jobs.create(&Job{
+		ID:      "source-job",
+		Status:  JobSelectionRequired,
+		Stage:   StageSourceSelection,
+		Share:   &ShareState{ShareID: "share"},
+		CDKCode: code,
+		Items: []DownloadItem{
+			{ID: "a", Name: "a.bin", Size: itoa64(512 * 1024 * 1024)},
+			{ID: "b", Name: "b.bin", Size: itoa64(512 * 1024 * 1024)},
+			{ID: "c", Name: "c.bin", Size: itoa64(512 * 1024 * 1024)},
+		},
+	})
+
+	if _, status, msg := s.applyItemsSelection("source-job", []string{"a", "b", "c"}); status != http.StatusForbidden {
+		t.Fatalf("expected 403 for oversized source selection, got status=%d msg=%q", status, msg)
 	}
 }
 

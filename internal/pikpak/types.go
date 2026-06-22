@@ -83,7 +83,18 @@ type CreateFileResponse struct {
 
 type ShareListResponse struct {
 	PassCodeToken string      `json:"pass_code_token"`
+	NextPageToken string      `json:"next_page_token"`
 	Files         []FileEntry `json:"files"`
+}
+
+type RestoreShareResponse struct {
+	FileID   string            `json:"file_id"`
+	TaskInfo []RestoreTaskInfo `json:"task_info"`
+}
+
+type RestoreTaskInfo struct {
+	FileID string `json:"file_id"`
+	TaskID string `json:"task_id"`
 }
 
 type FileListResponse struct {

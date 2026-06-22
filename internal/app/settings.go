@@ -19,6 +19,56 @@ const (
 	maxTaskTimeoutSeconds        = 12 * 60 * 60
 )
 
+func minResolveTaskTimeout(cfg Config) time.Duration {
+	requestTimeout := cfg.RequestTimeout
+	if requestTimeout <= 0 {
+		requestTimeout = 20 * time.Second
+	}
+	shareParseTimeout := cfg.ShareParseTimeout
+	if shareParseTimeout <= 0 {
+		shareParseTimeout = 60 * time.Second
+	}
+	shareURLTimeout := cfg.ShareURLTimeout
+	if shareURLTimeout <= 0 {
+		shareURLTimeout = 60 * time.Second
+	}
+
+	minimum := time.Duration(minTaskTimeoutSeconds) * time.Second
+	shareBudget := shareParseTimeout + shareURLTimeout + 2*requestTimeout + 30*time.Second
+	if shareBudget > minimum {
+		minimum = shareBudget
+	}
+	return ceilDuration(minimum, time.Minute)
+}
+
+func maxResolveTaskTimeout(minimum time.Duration) time.Duration {
+	maximum := time.Duration(maxTaskTimeoutSeconds) * time.Second
+	if minimum > maximum {
+		return minimum
+	}
+	return maximum
+}
+
+func normalizeResolveTimeouts(serialTimeout, parallelTimeout, minimum time.Duration) (time.Duration, time.Duration) {
+	if serialTimeout < minimum {
+		serialTimeout = minimum
+	}
+	if parallelTimeout < minimum {
+		parallelTimeout = minimum
+	}
+	return serialTimeout, parallelTimeout
+}
+
+func ceilDuration(value, unit time.Duration) time.Duration {
+	if unit <= 0 || value <= 0 {
+		return value
+	}
+	if value%unit == 0 {
+		return value
+	}
+	return (value/unit + 1) * unit
+}
+
 type settingsStore struct {
 	db *sql.DB
 }
@@ -51,6 +101,28 @@ func (s *settingsStore) setInt(key string, value int) error {
 	return err
 }
 
+func (s *settingsStore) getInt64(key string, fallback int64) int64 {
+	var raw string
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key=?`, key).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) || err != nil {
+		return fallback
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+func (s *settingsStore) setInt64(key string, value int64) error {
+	_, err := s.db.Exec(
+		`INSERT INTO settings(key, value) VALUES(?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		key, strconv.FormatInt(value, 10),
+	)
+	return err
+}
+
 // --- HTTP (admin, behind the access gate) ---
 
 // settingsResponse is the admin-facing view of the resolution settings. It
@@ -72,6 +144,8 @@ type settingsResponse struct {
 func (s *Server) settingsPayload() settingsResponse {
 	concurrency := s.resolver.concurrencyValue()
 	serialTimeout, parallelTimeout, currentTimeout := s.resolver.timeoutSnapshot()
+	minTimeout := minResolveTaskTimeout(s.config)
+	maxTimeout := maxResolveTaskTimeout(minTimeout)
 	return settingsResponse{
 		Concurrency:      concurrency,
 		MaxConcurrency:   maxResolveConcurrency,
@@ -81,8 +155,8 @@ func (s *Server) settingsPayload() settingsResponse {
 		SerialTimeoutS:   int(serialTimeout.Seconds()),
 		ParallelTimeoutS: int(parallelTimeout.Seconds()),
 		TaskTimeoutS:     int(currentTimeout.Seconds()),
-		MinTaskTimeoutS:  minTaskTimeoutSeconds,
-		MaxTaskTimeoutS:  maxTaskTimeoutSeconds,
+		MinTaskTimeoutS:  int(minTimeout.Seconds()),
+		MaxTaskTimeoutS:  int(maxTimeout.Seconds()),
 	}
 }
 
@@ -118,12 +192,14 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		timeoutSeconds = req.TaskTimeoutMinutes * 60
 	}
 	if timeoutSeconds > 0 {
-		if timeoutSeconds < minTaskTimeoutSeconds {
-			writeError(w, http.StatusBadRequest, "任务超时时间至少为 1 分钟")
+		minTimeout := minResolveTaskTimeout(s.config)
+		maxTimeout := maxResolveTaskTimeout(minTimeout)
+		if timeoutSeconds < int(minTimeout.Seconds()) {
+			writeError(w, http.StatusBadRequest, "任务超时时间至少为 "+strconv.Itoa(int(minTimeout.Minutes()))+" 分钟")
 			return
 		}
-		if timeoutSeconds > maxTaskTimeoutSeconds {
-			writeError(w, http.StatusBadRequest, "任务超时时间最多为 "+strconv.Itoa(maxTaskTimeoutSeconds/60)+" 分钟")
+		if timeoutSeconds > int(maxTimeout.Seconds()) {
+			writeError(w, http.StatusBadRequest, "任务超时时间最多为 "+strconv.Itoa(int(maxTimeout.Minutes()))+" 分钟")
 			return
 		}
 	}

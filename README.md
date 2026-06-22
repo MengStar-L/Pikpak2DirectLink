@@ -270,6 +270,10 @@ PUBLIC_BASE_URL=https://your-domain.example
 | `PARALLEL_QUEUE_TIMEOUT` | `2m` | 并行模式下新任务的默认任务超时预算。 |
 | `UPDATE_REPO` | `MengStar-L/Pikpak2DirectLink` | 在线更新检查的 GitHub 仓库，格式为 `owner/name`。 |
 | `UPDATE_CHECK_INTERVAL` | `6h` | 后台自动检查更新的间隔。设为 `0` 可关闭后台检查，仍可手动检查。 |
+| `ACCOUNT_HEALTH_CHECK_URL` | `https://mypikpak.com/s/VOveL7ZI01ViAz9VVKGgSWDlo2` | 账号可用性测试用的 PikPak 分享链接。 |
+| `ACCOUNT_HEALTH_CHECK_INTERVAL` | `6h` | 每个账号两次凭据验证之间的间隔。 |
+| `ACCOUNT_AUTO_REFRESH_GAP` | `30m` | 后台自动刷新不同账号登录凭据的最小间隔。 |
+| `ACCOUNT_HEALTH_CHECK_TIMEOUT` | `60s` | 单次账号可用性测试的超时预算。 |
 
 示例：
 

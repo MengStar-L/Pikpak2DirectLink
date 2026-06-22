@@ -12,6 +12,27 @@ import (
 
 // --- shared job-selection helper (used by admin and CDK-user endpoints) ---
 
+type selectionUpdateError struct {
+	status  int
+	message string
+}
+
+func (e selectionUpdateError) Error() string {
+	return e.message
+}
+
+func selectionHTTPError(status int, message string) error {
+	return selectionUpdateError{status: status, message: message}
+}
+
+func selectionErrorResponse(err error) (int, string) {
+	var selectionErr selectionUpdateError
+	if errors.As(err, &selectionErr) {
+		return selectionErr.status, selectionErr.message
+	}
+	return http.StatusConflict, err.Error()
+}
+
 // applyItemSelection resolves a pending selection on a job and kicks the next
 // stage. It returns the updated job, or an HTTP status code + message on error
 // (status 0 means success).
@@ -53,26 +74,42 @@ func (s *Server) applyItemSelection(jobID, itemID string) (*Job, int, string) {
 	}
 
 	_, err := s.jobs.update(jobID, func(current *Job) error {
+		if current.Status != JobSelectionRequired {
+			return selectionHTTPError(http.StatusConflict, "job is not waiting for a selection")
+		}
 		current.Status = JobQueued
 		current.Message = "queued"
 		current.Error = ""
 		switch current.Stage {
 		case StageSourceSelection:
 			if current.Share == nil {
-				return errors.New("share context is missing")
+				return selectionHTTPError(http.StatusConflict, "share context is missing")
+			}
+			found := false
+			for _, item := range current.Items {
+				if item.ID == itemID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return selectionHTTPError(http.StatusBadRequest, "selected item was not found in the current share")
 			}
 			current.Items = nil
 			current.Share.SelectedID = itemID
+			current.Share.SelectedIDs = []string{itemID}
 			current.Stage = StageTransfer
+			current.ResolveSelected = true
 		case StageResultSelection:
 			current.Message = "queued"
 		default:
-			return errors.New("job cannot accept selections right now")
+			return selectionHTTPError(http.StatusConflict, "job cannot accept selections right now")
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, http.StatusConflict, err.Error()
+		status, msg := selectionErrorResponse(err)
+		return nil, status, msg
 	}
 
 	// Resume continuations jump to the front of the queue: the user already
@@ -93,12 +130,9 @@ func (s *Server) applyItemSelection(jobID, itemID string) (*Job, int, string) {
 	return updated, 0, ""
 }
 
-// applyItemsSelection is the multi-select counterpart of applyItemSelection,
-// used by the CDK-user portal. At the result-selection stage it accepts several
-// files, gates them against the CDK's remaining traffic as a SUM, and resolves
-// each into its own link. At the source-selection stage it accepts exactly one
-// item (you can only transfer one share root at a time) and behaves like the
-// single-select path.
+// applyItemsSelection is the multi-select counterpart of applyItemSelection.
+// It accepts several selected files, gates them against the CDK's remaining
+// traffic as a SUM, and resolves each into its own link.
 func (s *Server) applyItemsSelection(jobID string, itemIDs []string) (*Job, int, string) {
 	seen := make(map[string]bool, len(itemIDs))
 	ordered := make([]string, 0, len(itemIDs))
@@ -122,12 +156,65 @@ func (s *Server) applyItemsSelection(jobID string, itemIDs []string) (*Job, int,
 		return nil, http.StatusConflict, "job is not waiting for a selection"
 	}
 
-	// Source selection only ever picks one item; defer to the single-select path.
 	if job.Stage == StageSourceSelection {
-		if len(ordered) != 1 {
-			return nil, http.StatusBadRequest, "此步骤只能选择一个项目"
+		byID := make(map[string]DownloadItem, len(job.Items))
+		for _, item := range job.Items {
+			byID[item.ID] = item
 		}
-		return s.applyItemSelection(jobID, ordered[0])
+		var totalSize int64
+		for _, id := range ordered {
+			item, ok := byID[id]
+			if !ok {
+				return nil, http.StatusBadRequest, "selected item was not found in the current share"
+			}
+			totalSize += parseBytes(item.Size)
+		}
+		if job.CDKCode != "" {
+			if c, ok, err := s.cdk.get(job.CDKCode); err == nil && ok && totalSize > c.RemainingBytes {
+				return nil, http.StatusForbidden, "所选文件合计 " + formatTrafficLabel(totalSize) + " 超过 CDK 剩余流量（剩余 " + formatTrafficLabel(c.RemainingBytes) + "），请减少选择"
+			}
+		}
+
+		_, err := s.jobs.update(jobID, func(current *Job) error {
+			if current.Status != JobSelectionRequired {
+				return selectionHTTPError(http.StatusConflict, "job is not waiting for a selection")
+			}
+			if current.Stage != StageSourceSelection {
+				return selectionHTTPError(http.StatusConflict, "job cannot accept selections right now")
+			}
+			if current.Share == nil {
+				return selectionHTTPError(http.StatusConflict, "share context is missing")
+			}
+			byID := make(map[string]struct{}, len(current.Items))
+			for _, item := range current.Items {
+				byID[item.ID] = struct{}{}
+			}
+			for _, id := range ordered {
+				if _, ok := byID[id]; !ok {
+					return selectionHTTPError(http.StatusBadRequest, "selected item was not found in the current share")
+				}
+			}
+			current.Status = JobQueued
+			current.Message = "queued"
+			current.Error = ""
+			current.Items = nil
+			current.Share.SelectedID = ordered[0]
+			current.Share.SelectedIDs = append([]string(nil), ordered...)
+			current.Stage = StageTransfer
+			current.ResolveSelected = true
+			return nil
+		})
+		if err != nil {
+			status, msg := selectionErrorResponse(err)
+			return nil, status, msg
+		}
+
+		s.resolver.enqueue(jobID, priorityResume, func(ctx context.Context) {
+			s.processJob(ctx, jobID)
+		})
+
+		updated, _ := s.jobs.get(jobID)
+		return updated, 0, ""
 	}
 	if job.Stage != StageResultSelection {
 		return nil, http.StatusConflict, "job cannot accept selections right now"
@@ -157,13 +244,29 @@ func (s *Server) applyItemsSelection(jobID string, itemIDs []string) (*Job, int,
 	}
 
 	_, err := s.jobs.update(jobID, func(current *Job) error {
+		if current.Status != JobSelectionRequired {
+			return selectionHTTPError(http.StatusConflict, "job is not waiting for a selection")
+		}
+		if current.Stage != StageResultSelection {
+			return selectionHTTPError(http.StatusConflict, "job cannot accept selections right now")
+		}
+		byID := make(map[string]struct{}, len(current.Items))
+		for _, item := range current.Items {
+			byID[item.ID] = struct{}{}
+		}
+		for _, id := range ordered {
+			if _, ok := byID[id]; !ok {
+				return selectionHTTPError(http.StatusBadRequest, "selected file was not found in the current result set")
+			}
+		}
 		current.Status = JobQueued
 		current.Message = "queued"
 		current.Error = ""
 		return nil
 	})
 	if err != nil {
-		return nil, http.StatusConflict, err.Error()
+		status, msg := selectionErrorResponse(err)
+		return nil, status, msg
 	}
 
 	s.resolver.enqueue(jobID, priorityResume, func(ctx context.Context) {
@@ -428,7 +531,8 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 
 	// A multi-line submission fans out into one child job per link, parallelized
 	// through the resolve queue under the same concurrency limit.
-	if lines := splitResourceLines(req.Input); len(lines) > 1 {
+	lines := splitResourceLineSpecs(req.Input)
+	if len(lines) > 1 {
 		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, c.Code, priorityUser, s.baseURL(r))
 		if status != 0 {
 			writeError(w, status, msg)
@@ -440,6 +544,11 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, view)
 		return
 	}
+	rawInput := req.Input
+	if len(lines) == 1 {
+		rawInput = lines[0].raw
+		req.Input = lines[0].clean
+	}
 
 	kind, err := detectResourceKind(req.Input)
 	if err != nil {
@@ -450,7 +559,7 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 	var share *ShareState
 	if kind == ResourceShare {
 		var passCode string
-		share, passCode, err = shareStateAndPassCode(req.Input, req.PassCode)
+		share, passCode, err = shareStateAndPassCode(rawInput, req.PassCode)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -555,6 +664,7 @@ type userJobView struct {
 	Result     *JobResult     `json:"result,omitempty"`
 	Results    []JobResult    `json:"results,omitempty"`
 	Batch      *BatchProgress `json:"batch,omitempty"`
+	Warnings   []string       `json:"warnings,omitempty"`
 	QueueAhead int            `json:"queue_ahead"`
 	CreatedAt  time.Time      `json:"created_at"`
 	UpdatedAt  time.Time      `json:"updated_at"`
@@ -584,6 +694,7 @@ func toUserJobView(job *Job) userJobView {
 		Result:    job.Result,
 		Results:   job.Results,
 		Batch:     job.Batch,
+		Warnings:  job.Warnings,
 		CreatedAt: job.CreatedAt,
 		UpdatedAt: job.UpdatedAt,
 	}
@@ -594,8 +705,33 @@ func toUserJobView(job *Job) userJobView {
 }
 
 func safeUserError(message string) string {
+	message = strings.TrimSpace(message)
 	if isBadResourceUserError(message) {
 		return badResourceParseUserError
+	}
+	if message == "" {
+		return genericUserJobError
+	}
+	if message == errCDKNotFound.Error() {
+		return "CDK is invalid."
+	}
+	if message == errCDKExpired.Error() {
+		return "CDK has expired."
+	}
+	if message == errCDKExhausted.Error() {
+		return "CDK traffic has been used up."
+	}
+	lower := strings.ToLower(message)
+	if strings.Contains(lower, "cdk") && strings.Contains(lower, "traffic") {
+		return "Selected files exceed remaining CDK traffic."
+	}
+	if strings.Contains(lower, "context deadline exceeded") ||
+		strings.Contains(lower, "timeout") ||
+		strings.Contains(message, "超时") {
+		return "Parsing timed out. Please try again later."
+	}
+	if isResourceUnavailableMessage(lower) {
+		return friendlyPikPakMessage(message)
 	}
 	return genericUserJobError
 }

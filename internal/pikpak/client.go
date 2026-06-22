@@ -88,11 +88,36 @@ func NewClient(cfg Config) *Client {
 
 	return &Client{
 		config: cfg,
-		http: &http.Client{
-			Timeout: cfg.RequestTimeout,
+		http:   &http.Client{
+			// 不设置全局 Timeout，每个请求通过 context 控制超时
+			// 避免分享链接等长超时请求被全局 timeout 打断
 		},
 		deviceID: deviceID,
 	}
+}
+
+func (c *Client) requestTimeout() time.Duration {
+	timeout := c.config.RequestTimeout
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	return timeout
+}
+
+func (c *Client) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := c.requestTimeout()
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			requestCtx, cancel := context.WithCancel(ctx)
+			cancel()
+			return requestCtx, func() {}
+		}
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func (c *Client) DeviceID() string {
@@ -310,32 +335,126 @@ func (c *Client) GetVIPInfo(ctx context.Context) (*VIPInfo, error) {
 }
 
 func (c *Client) GetShareInfo(ctx context.Context, shareID, passCode, parentID string) (*ShareListResponse, error) {
+	return c.getShareList(ctx, "/drive/v1/share", shareID, "pass_code", passCode, parentID, "3")
+}
+
+func (c *Client) GetShareFolder(ctx context.Context, shareID, passCodeToken, parentID string) (*ShareListResponse, error) {
+	return c.getShareList(ctx, "/drive/v1/share/detail", shareID, "pass_code_token", passCodeToken, parentID, "6")
+}
+
+func (c *Client) getShareList(ctx context.Context, pathValue, shareID, passKey, passValue, parentID, order string) (*ShareListResponse, error) {
 	query := url.Values{}
 	query.Set("limit", "100")
 	query.Set("thumbnail_size", "SIZE_LARGE")
-	query.Set("order", "3")
+	query.Set("order", order)
 	query.Set("share_id", shareID)
 	if parentID != "" {
 		query.Set("parent_id", parentID)
 	}
-	if passCode != "" {
-		query.Set("pass_code", passCode)
+	if passValue != "" || passKey == "pass_code_token" {
+		query.Set(passKey, passValue)
 	}
 
-	var resp ShareListResponse
-	if err := c.doJSON(ctx, http.MethodGet, driveHost, "/drive/v1/share", query, nil, true, &resp); err != nil {
-		return nil, err
+	merged := &ShareListResponse{}
+	pageToken := ""
+	for {
+		pageQuery := cloneValues(query)
+		if pageToken != "" {
+			pageQuery.Set("page_token", pageToken)
+		}
+
+		var resp ShareListResponse
+		if err := c.doJSON(ctx, http.MethodGet, driveHost, pathValue, pageQuery, nil, true, &resp); err != nil {
+			return nil, err
+		}
+		if resp.PassCodeToken != "" {
+			merged.PassCodeToken = resp.PassCodeToken
+		}
+		merged.Files = append(merged.Files, resp.Files...)
+		if resp.NextPageToken == "" || resp.NextPageToken == pageToken {
+			break
+		}
+		pageToken = resp.NextPageToken
 	}
-	return &resp, nil
+	return merged, nil
 }
 
-func (c *Client) RestoreShare(ctx context.Context, shareID, passCodeToken string, fileIDs []string) error {
+func (c *Client) RestoreShare(ctx context.Context, shareID, passCodeToken string, fileIDs []string) (*RestoreShareResponse, error) {
 	payload := map[string]any{
 		"share_id":        shareID,
 		"pass_code_token": passCodeToken,
 		"file_ids":        fileIDs,
 	}
-	return c.doJSON(ctx, http.MethodPost, driveHost, "/drive/v1/share/restore", nil, payload, true, nil)
+	var resp RestoreShareResponse
+	if err := c.doJSON(ctx, http.MethodPost, driveHost, "/drive/v1/share/restore", nil, payload, true, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// WaitForFileDownloadURL 等待文件直链就绪，带轮询和超时控制
+// 参考 TelDriveManager 的 wait_for_download_urls 实现
+// 分享文件转存后需要等待 PikPak 后台准备直链，可能需要几秒到几十秒
+func (c *Client) WaitForFileDownloadURL(ctx context.Context, fileID string, timeout, pollInterval time.Duration) (*FileEntry, error) {
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	if pollInterval <= 0 {
+		pollInterval = 3 * time.Second
+	}
+
+	opCtx, cancelOp := context.WithTimeout(ctx, timeout)
+	defer cancelOp()
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	var lastErr error
+	attempt := 0
+
+	// 立即尝试一次
+	attempt++
+	requestCtx, cancel := c.requestContext(opCtx)
+	file, err := c.GetFile(requestCtx, fileID)
+	cancel()
+	if err == nil && file.BestDownloadURL() != "" {
+		return file, nil
+	}
+	if err != nil {
+		lastErr = err
+	}
+
+	// 轮询等待直链就绪
+	for {
+		select {
+		case <-opCtx.Done():
+			return nil, opCtx.Err()
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				errMsg := fmt.Sprintf("等待文件直链超时（%v），尝试次数：%d", timeout, attempt)
+				if lastErr != nil {
+					errMsg += fmt.Sprintf("，最后错误：%v", lastErr)
+				}
+				return nil, fmt.Errorf("%s，可能触发 PikPak 风控", errMsg)
+			}
+
+			attempt++
+			requestCtx, cancel := c.requestContext(opCtx)
+			file, err := c.GetFile(requestCtx, fileID)
+			cancel()
+
+			if err != nil {
+				lastErr = err
+				// 继续重试，不立即失败
+				continue
+			}
+
+			if file.BestDownloadURL() != "" {
+				return file, nil
+			}
+		}
+	}
 }
 
 func (c *Client) DeleteFiles(ctx context.Context, fileIDs []string) error {
@@ -446,8 +565,11 @@ func (c *Client) doJSON(ctx context.Context, method, baseURL, path string, query
 			return err
 		}
 
-		req, err := http.NewRequestWithContext(ctx, method, buildURL(baseURL, path, query), body)
+		requestCtx, cancelRequest := c.requestContext(ctx)
+
+		req, err := http.NewRequestWithContext(requestCtx, method, buildURL(baseURL, path, query), body)
 		if err != nil {
+			cancelRequest()
 			return err
 		}
 
@@ -462,6 +584,7 @@ func (c *Client) doJSON(ctx context.Context, method, baseURL, path string, query
 		}
 
 		respBytes, statusCode, err := c.send(req)
+		cancelRequest()
 		if err != nil {
 			return err
 		}
@@ -588,8 +711,10 @@ func (c *Client) loginLocked(ctx context.Context) error {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, loginURL, body)
+	requestCtx, cancelRequest := c.requestContext(ctx)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, loginURL, body)
 	if err != nil {
+		cancelRequest()
 		return err
 	}
 
@@ -598,6 +723,7 @@ func (c *Client) loginLocked(ctx context.Context) error {
 	}
 
 	respBytes, statusCode, err := c.send(req)
+	cancelRequest()
 	if err != nil {
 		return err
 	}
@@ -634,8 +760,10 @@ func (c *Client) refreshTokenLocked(ctx context.Context) error {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, userHost+"/v1/auth/token", body)
+	requestCtx, cancelRequest := c.requestContext(ctx)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, userHost+"/v1/auth/token", body)
 	if err != nil {
+		cancelRequest()
 		return err
 	}
 
@@ -644,6 +772,7 @@ func (c *Client) refreshTokenLocked(ctx context.Context) error {
 	}
 
 	respBytes, statusCode, err := c.send(req)
+	cancelRequest()
 	if err != nil {
 		return err
 	}
@@ -696,8 +825,10 @@ func (c *Client) initCaptcha(ctx context.Context, action string, meta map[string
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, userHost+"/v1/shield/captcha/init", body)
+	requestCtx, cancelRequest := c.requestContext(ctx)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, userHost+"/v1/shield/captcha/init", body)
 	if err != nil {
+		cancelRequest()
 		return "", err
 	}
 
@@ -706,6 +837,7 @@ func (c *Client) initCaptcha(ctx context.Context, action string, meta map[string
 	}
 
 	respBytes, statusCode, err := c.send(req)
+	cancelRequest()
 	if err != nil {
 		return "", err
 	}
@@ -835,6 +967,17 @@ func buildURL(baseURL, path string, query url.Values) string {
 		return baseURL + path
 	}
 	return baseURL + path + "?" + query.Encode()
+}
+
+func cloneValues(values url.Values) url.Values {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(url.Values, len(values))
+	for key, list := range values {
+		cloned[key] = append([]string(nil), list...)
+	}
+	return cloned
 }
 
 func encodeJSON(payload any) (io.Reader, error) {

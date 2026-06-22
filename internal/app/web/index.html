@@ -244,7 +244,7 @@
         </section>
 
         <section id="selectionPanel" class="panel hidden">
-          <div class="panel-head">
+          <div class="panel-head selection-head">
             <div class="section-title compact-title">
               <span class="title-icon orange" aria-hidden="true"><svg class="ui-icon"><use href="#icon-file"></use></svg></span>
               <div>
@@ -252,21 +252,21 @@
                 <p id="selectionHint" class="muted"></p>
               </div>
             </div>
+            <div class="selection-head-actions">
+              <span id="selectionSummary" class="muted">已选 0 项</span>
+              <button id="generateButton" type="button" class="primary compact" disabled>
+                <svg class="ui-icon"><use href="#icon-play"></use></svg>
+                <span class="button-label">解析已选中（0项）</span>
+              </button>
+            </div>
           </div>
           <div class="tree-toolbar">
             <label class="tree-check-all">
               <input id="selectAll" type="checkbox">
               <span>全选文件</span>
             </label>
-            <span id="selectionSummary" class="muted">已选 0 项</span>
           </div>
           <div id="selectionTree" class="selection-tree"></div>
-          <div class="tree-actions">
-            <button id="generateButton" type="button" class="primary button-large" disabled>
-              <svg class="ui-icon"><use href="#icon-play"></use></svg>
-              <span class="button-label">生成下载链接</span>
-            </button>
-          </div>
         </section>
 
         <section id="resultPanel" class="panel result-panel hidden">

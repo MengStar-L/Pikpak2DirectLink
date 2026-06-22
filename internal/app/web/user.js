@@ -110,11 +110,11 @@ function mountAria2() {
   }
 }
 
-// collectPushItems returns one link per resolved file (direct preferred).
+// collectPushItems returns one preferred link per resolved file.
 function collectPushItems() {
   const items = [];
   for (const result of lastResults || []) {
-    const url = result.direct_url || result.proxy_url;
+    const url = result.url || result.direct_url || result.proxy_url;
     if (url) items.push({ url, name: result.file?.path || result.file?.name });
   }
   return items;
@@ -316,14 +316,78 @@ function renderJob(job) {
   const results = job.results && job.results.length ? job.results : (job.result ? [job.result] : []);
   if (results.length) {
     renderResults(job, results);
+  } else if (hasJobNotices(job)) {
+    renderResultNoticesOnly(job);
   } else {
     resultPanel.classList.add('hidden');
+    clearResultNotices();
   }
 }
 
+function jobWarnings(job) {
+  return Array.isArray(job?.warnings) ? job.warnings.filter(Boolean) : [];
+}
+
+function jobFailures(job) {
+  return Array.isArray(job?.batch?.failures) ? job.batch.failures.filter(Boolean) : [];
+}
+
+function hasJobNotices(job) {
+  return jobWarnings(job).length > 0 || jobFailures(job).length > 0;
+}
+
+function ensureResultNotices() {
+  let notices = resultPanel.querySelector('.result-notices');
+  if (notices) return notices;
+  notices = document.createElement('div');
+  notices.className = 'result-notices hidden';
+  resultPanel.insertBefore(notices, resultList || null);
+  return notices;
+}
+
+function clearResultNotices() {
+  const notices = resultPanel.querySelector('.result-notices');
+  if (!notices) return;
+  notices.innerHTML = '';
+  notices.classList.add('hidden');
+}
+
+function renderResultNotices(job) {
+  const warnings = jobWarnings(job);
+  const failures = jobFailures(job);
+  const notices = ensureResultNotices();
+  notices.innerHTML = '';
+  if (warnings.length === 0 && failures.length === 0) {
+    notices.classList.add('hidden');
+    return;
+  }
+  appendNoticeBlock(notices, 'warn', '提示', warnings);
+  appendNoticeBlock(notices, 'danger', '失败链接', failures.map((failure) => {
+    const label = failure.label || '链接';
+    return `${label}: ${failure.error || '解析失败'}`;
+  }));
+  notices.classList.remove('hidden');
+}
+
+function appendNoticeBlock(container, variant, title, items) {
+  if (!items.length) return;
+  const block = document.createElement('section');
+  block.className = `result-notice ${variant}`;
+  const heading = document.createElement('strong');
+  heading.textContent = title;
+  block.appendChild(heading);
+  const list = document.createElement('ul');
+  for (const item of items) {
+    const li = document.createElement('li');
+    li.textContent = item;
+    list.appendChild(li);
+  }
+  block.appendChild(list);
+  container.appendChild(block);
+}
+
 // renderSelection builds a folder tree from the flat item list (paths like
-// "图集/foo.mkv") with tristate folder checkboxes and a select-all. Source
-// selection only allows one item, so it falls back to single-pick buttons.
+// "图集/foo.mkv") with tristate folder checkboxes and a select-all.
 function renderSelection(job) {
   if (selectionJobId === job.id && selectionStage === job.stage) {
     // Already rendered for this job/stage; don't rebuild and wipe the user's
@@ -337,16 +401,15 @@ function renderSelection(job) {
   selectionTree.innerHTML = '';
 
   const items = job.items || [];
-  const single = job.stage === 'source_selection';
-  selectionHint.textContent = single ? '该分享含多个项目，请选择要转存的一项' : '勾选需要生成下载链接的文件，可多选';
+  const sourceSelection = job.stage === 'source_selection';
+  selectionHint.textContent = sourceSelection ? '勾选要解析的文件，可多选' : '勾选需要生成下载链接的文件，可多选';
 
-  // Select-all / summary / generate button are only meaningful for multi-select.
-  selectAll.closest('.tree-toolbar').classList.toggle('hidden', single);
-  generateButton.parentElement.classList.toggle('hidden', single);
+  selectAll.closest('.tree-toolbar').classList.remove('hidden');
+  generateButton.parentElement.classList.remove('hidden');
 
   const root = buildTree(items);
   for (const node of root.children) {
-    selectionTree.appendChild(renderNode(node, single));
+    selectionTree.appendChild(renderNode(node, sourceSelection));
   }
   selectAll.checked = false;
   selectAll.indeterminate = false;
@@ -378,7 +441,7 @@ function buildTree(items) {
   return root;
 }
 
-function renderNode(node, single) {
+function renderNode(node, sourceSelection) {
   if (node.isFolder) {
     const wrap = document.createElement('div');
     wrap.className = 'tree-folder';
@@ -412,24 +475,22 @@ function renderNode(node, single) {
     label.appendChild(folderName);
 
     row.appendChild(toggle);
-    if (!single) {
-      const folderCheck = document.createElement('input');
-      folderCheck.type = 'checkbox';
-      folderCheck.className = 'tree-checkbox';
-      folderCheck.addEventListener('change', () => {
-        popCheckbox(folderCheck);
-        setSubtreeChecked(node, folderCheck.checked);
-        refreshFolderStates();
-        updateSelectionSummary();
-      });
-      node._folderCheck = folderCheck;
-      row.appendChild(folderCheck);
-    }
+    const folderCheck = document.createElement('input');
+    folderCheck.type = 'checkbox';
+    folderCheck.className = 'tree-checkbox';
+    folderCheck.addEventListener('change', () => {
+      popCheckbox(folderCheck);
+      setSubtreeChecked(node, folderCheck.checked);
+      refreshFolderStates();
+      updateSelectionSummary();
+    });
+    node._folderCheck = folderCheck;
+    row.appendChild(folderCheck);
     row.appendChild(label);
     wrap.appendChild(row);
 
     for (const child of node.children) {
-      childrenInner.appendChild(renderNode(child, single));
+      childrenInner.appendChild(renderNode(child, sourceSelection));
     }
     wrap.appendChild(childrenWrap);
     return wrap;
@@ -440,26 +501,6 @@ function renderNode(node, single) {
   row.className = 'tree-row tree-file-row';
   const label = document.createElement('label');
   label.className = 'tree-label tree-file-label';
-
-  if (single) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'secondary compact';
-    setButtonLabel(button, '转存这一项');
-    button.addEventListener('click', () => chooseSingle(selectionJobId, node.item.id, button));
-    const meta = document.createElement('span');
-    meta.className = 'tree-file-meta';
-    meta.textContent = formatBytes(node.item.size);
-    label.innerHTML = '<svg class="ui-icon tree-file-icon"><use href="#icon-file"></use></svg>';
-    const name = document.createElement('span');
-    name.className = 'tree-file-name';
-    name.textContent = node.name;
-    label.appendChild(name);
-    row.appendChild(label);
-    row.appendChild(meta);
-    row.appendChild(button);
-    return row;
-  }
 
   const check = document.createElement('input');
   check.type = 'checkbox';
@@ -484,6 +525,14 @@ function renderNode(node, single) {
   row.appendChild(check);
   row.appendChild(label);
   row.appendChild(meta);
+  if (sourceSelection) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'secondary compact';
+    setButtonLabel(button, '解析');
+    button.addEventListener('click', () => chooseSingle(selectionJobId, node.item.id, button));
+    row.appendChild(button);
+  }
   return row;
 }
 
@@ -544,6 +593,7 @@ function selectedItemIds() {
 function updateSelectionSummary() {
   const count = selectedItemIds().length;
   selectionSummary.textContent = `已选 ${count} 项`;
+  setButtonLabel(generateButton, `解析已选中（${count}项）`);
   generateButton.disabled = count === 0;
 }
 
@@ -551,7 +601,7 @@ async function onGenerate() {
   const ids = selectedItemIds();
   if (!ids.length) return;
   generateButton.disabled = true;
-  setButtonLabel(generateButton, '生成中...');
+  setButtonLabel(generateButton, '解析中...');
   try {
     const job = await api(`/api/u/jobs/${selectionJobId}/select`, {
       method: 'POST',
@@ -566,7 +616,7 @@ async function onGenerate() {
     showError(jobError, error.message);
     generateButton.disabled = false;
   } finally {
-    setButtonLabel(generateButton, '生成下载链接');
+    updateSelectionSummary();
   }
 }
 
@@ -598,6 +648,7 @@ async function chooseSingle(jobId, itemId, button) {
 function renderResults(job, results) {
   lastResults = results || [];
   resultPanel.classList.remove('hidden');
+  renderResultNotices(job);
   const batch = job.batch;
   resultCount.textContent = batch
     ? `${batch.succeeded || 0}/${batch.total || 0} 条${(Number(batch.failed) || 0) > 0 ? ` · 失败 ${Number(batch.failed) || 0} 条` : ''} · ${results.length} 个文件`
@@ -642,18 +693,33 @@ function renderResults(job, results) {
       head.appendChild(meta);
       card.appendChild(head);
 
-      if (result.direct_url) {
-        card.appendChild(buildLinkRow('直链', 'direct', result.direct_url, result.file?.path || result.file?.name));
-      }
-      if (result.proxy_url) {
-        card.appendChild(buildLinkRow('代理链接', 'proxy', result.proxy_url, result.file?.path || result.file?.name));
-      }
+      appendResultLinks(card, result, job.mode);
       resultList.appendChild(card);
     }
   }
 
   requestAnimationFrame(() => resultPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
   refreshAria2PushAll();
+}
+
+function renderResultNoticesOnly(job) {
+  lastResults = [];
+  resultPanel.classList.remove('hidden');
+  resultCount.textContent = '任务提示';
+  resultList.innerHTML = '';
+  renderResultNotices(job);
+  refreshAria2PushAll();
+}
+
+function appendResultLinks(container, result, mode = 'direct') {
+  const direct = { tag: '直链', cls: 'direct', url: result.direct_url };
+  const proxy = { tag: '代理链接', cls: 'proxy', url: result.proxy_url };
+  const rows = mode === 'proxy' ? [proxy, direct] : [direct, proxy];
+  for (const row of rows) {
+    if (row.url) {
+      container.appendChild(buildLinkRow(row.tag, row.cls, row.url, result.file?.path || result.file?.name));
+    }
+  }
 }
 
 function buildLinkRow(tagText, tagClass, url, name) {
@@ -710,6 +776,7 @@ function clearJobUI() {
   selectionPanel.classList.add('hidden');
   selectionTree.innerHTML = '';
   resultPanel.classList.add('hidden');
+  clearResultNotices();
   resultList.innerHTML = '';
   jobBadge.textContent = '空闲';
   jobBadge.className = 'status-pill neutral';

@@ -67,6 +67,91 @@ func TestSplitResourceLinesRejectsBadLine(t *testing.T) {
 	}
 }
 
+func TestSplitResourceLineSpecsPreservesRawSharePassCode(t *testing.T) {
+	t.Parallel()
+
+	specs := splitResourceLineSpecs(" https://mypikpak.com/s/SHAREID?act=play&pwd=abcd#frag ")
+	if len(specs) != 1 {
+		t.Fatalf("specs = %+v, want one", specs)
+	}
+	if specs[0].clean != "https://mypikpak.com/s/SHAREID" {
+		t.Fatalf("clean = %q", specs[0].clean)
+	}
+	share, passCode, err := shareStateAndPassCode(specs[0].raw, "")
+	if err != nil {
+		t.Fatalf("shareStateAndPassCode: %v", err)
+	}
+	if share.ShareID != "SHAREID" {
+		t.Fatalf("share id = %q", share.ShareID)
+	}
+	if passCode != "abcd" {
+		t.Fatalf("pass code = %q", passCode)
+	}
+}
+
+func TestShareLinkWithPlayQueryKeepsTailOnlyAsParsedHint(t *testing.T) {
+	t.Parallel()
+
+	raw := "https://mypikpak.com/s/VOvcyQK1N_7s6UMZ3DrR7DsMo2/AAAAY_pRskUJZDb_c2vjzOMio2_VOv?act=play"
+	specs := splitResourceLineSpecs(raw)
+	if len(specs) != 1 {
+		t.Fatalf("specs = %+v, want one", specs)
+	}
+	if specs[0].clean != "https://mypikpak.com/s/VOvcyQK1N_7s6UMZ3DrR7DsMo2/AAAAY_pRskUJZDb_c2vjzOMio2_VOv" {
+		t.Fatalf("clean = %q", specs[0].clean)
+	}
+	share, passCode, err := shareStateAndPassCode(specs[0].raw, "")
+	if err != nil {
+		t.Fatalf("shareStateAndPassCode: %v", err)
+	}
+	if share.ShareID != "VOvcyQK1N_7s6UMZ3DrR7DsMo2" {
+		t.Fatalf("share id = %q", share.ShareID)
+	}
+	if share.TailID != "AAAAY_pRskUJZDb_c2vjzOMio2_VOv" {
+		t.Fatalf("tail id = %q", share.TailID)
+	}
+	if passCode != "" {
+		t.Fatalf("pass code = %q", passCode)
+	}
+}
+
+func TestPreferredResultURLFollowsMode(t *testing.T) {
+	t.Parallel()
+
+	if got := preferredResultURL("direct", "https://direct", "https://proxy"); got != "https://direct" {
+		t.Fatalf("direct mode preferred URL = %q", got)
+	}
+	if got := preferredResultURL("proxy", "https://direct", "https://proxy"); got != "https://proxy" {
+		t.Fatalf("proxy mode preferred URL = %q", got)
+	}
+	if got := preferredResultURL("proxy", "https://direct", ""); got != "https://direct" {
+		t.Fatalf("proxy mode fallback URL = %q", got)
+	}
+	if got := preferredResultURL("direct", "", "https://proxy"); got != "https://proxy" {
+		t.Fatalf("direct mode fallback URL = %q", got)
+	}
+}
+
+func TestJobStoreDoesNotEvictActiveJobs(t *testing.T) {
+	t.Parallel()
+
+	store := newJobStore(2)
+	store.create(&Job{ID: "queued", Status: JobQueued})
+	store.create(&Job{ID: "running", Status: JobRunning})
+	store.create(&Job{ID: "select", Status: JobSelectionRequired})
+
+	for _, id := range []string{"queued", "running", "select"} {
+		if _, ok := store.get(id); !ok {
+			t.Fatalf("active job %q was evicted", id)
+		}
+	}
+
+	store.create(&Job{ID: "done", Status: JobCompleted})
+	if _, ok := store.get("done"); ok {
+		t.Fatal("terminal overflow job should be evicted before active jobs")
+	}
+}
+
 func TestParseShareLink(t *testing.T) {
 	t.Parallel()
 

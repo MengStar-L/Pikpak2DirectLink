@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"pikpak2directlink/internal/pikpak"
 )
 
 func TestBuildContentDispositionIncludesFallbackFilename(t *testing.T) {
@@ -60,5 +62,43 @@ func TestProxyErrorsDoNotExposeInternalDetails(t *testing.T) {
 	}
 	if len(logs[0].Details) == 0 || !strings.Contains(logs[0].Details[0], leakedAccount) {
 		t.Fatalf("expected internal log to retain the diagnostic detail, got %+v", logs[0])
+	}
+}
+
+func TestRestoreFileIDsDedupesResponseIDs(t *testing.T) {
+	t.Parallel()
+
+	got := restoreFileIDs(&pikpak.RestoreShareResponse{
+		FileID: " root ",
+		TaskInfo: []pikpak.RestoreTaskInfo{
+			{FileID: "child-a"},
+			{FileID: "root"},
+			{FileID: ""},
+			{FileID: " child-b "},
+		},
+	})
+	want := []string{"root", "child-a", "child-b"}
+	if len(got) != len(want) {
+		t.Fatalf("ids = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ids = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestDownloadItemIDExists(t *testing.T) {
+	t.Parallel()
+
+	items := []DownloadItem{{ID: "file-a"}, {ID: "file-b"}}
+	if !downloadItemIDExists(items, "file-b") {
+		t.Fatal("expected file-b to be found")
+	}
+	if downloadItemIDExists(items, "missing-tail-id") {
+		t.Fatal("unexpectedly trusted a tail id not present in the collected share items")
+	}
+	if downloadItemIDExists(items, " ") {
+		t.Fatal("blank id should not match")
 	}
 }

@@ -60,7 +60,7 @@ type resolveQueue struct {
 
 func newResolveQueue(serialTimeout, parallelTimeout time.Duration, concurrency int, fail func(jobID string, err error)) *resolveQueue {
 	if serialTimeout <= 0 {
-		serialTimeout = 45 * time.Second
+		serialTimeout = 60 * time.Second
 	}
 	if parallelTimeout <= 0 {
 		parallelTimeout = 2 * time.Minute

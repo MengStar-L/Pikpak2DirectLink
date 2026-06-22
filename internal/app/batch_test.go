@@ -13,7 +13,7 @@ func TestSplitResourceLines(t *testing.T) {
 		input string
 		want  []string
 	}{
-		{name: "single", input: "magnet:?xt=urn:btih:a", want: []string{"magnet:?xt=urn:btih:a"}},
+		{name: "single", input: "magnet:?xt=urn:btih:a", want: []string{"magnet:?xt=urn%3Abtih%3Aa"}},
 		{name: "empty", input: "", want: nil},
 		{name: "blank only", input: "  \n\t\n", want: nil},
 		{
@@ -25,6 +25,21 @@ func TestSplitResourceLines(t *testing.T) {
 			name:  "dedupe preserves order",
 			input: "magnet:?a\nmagnet:?b\nmagnet:?a",
 			want:  []string{"magnet:?a", "magnet:?b"},
+		},
+		{
+			name:  "dedupe after magnet cleanup",
+			input: "magnet:?xt=urn:btih:abc&dn=Movie&xl=123\nmagnet:?xt=urn:btih:abc&dn=Movie&ws=http://example.com",
+			want:  []string{"magnet:?dn=Movie&xt=urn%3Abtih%3Aabc"},
+		},
+		{
+			name:  "clean share query and fragment",
+			input: "https://mypikpak.com/s/SHAREID?act=play&pwd=1234#frag",
+			want:  []string{"https://mypikpak.com/s/SHAREID"},
+		},
+		{
+			name:  "dedupe after share cleanup",
+			input: "https://mypikpak.com/s/SHAREID?act=play\nhttps://mypikpak.com/s/SHAREID#frag",
+			want:  []string{"https://mypikpak.com/s/SHAREID"},
 		},
 	}
 
@@ -71,6 +86,19 @@ func TestSanitizePathSegment(t *testing.T) {
 	}
 }
 
+func TestCreateBatchJobRejectsTooManyLinks(t *testing.T) {
+	t.Parallel()
+
+	lines := make([]resourceLineSpec, maxBatchLinks+1)
+	for i := range lines {
+		lines[i] = resourceLineSpec{raw: "magnet:?xt=urn:btih:test", clean: "magnet:?xt=urn:btih:test"}
+	}
+	s := &Server{}
+	if _, status, _ := s.createBatchJob(lines, "direct", "", "", priorityAdmin, "https://host"); status != 400 {
+		t.Fatalf("status = %d, want 400", status)
+	}
+}
+
 // TestBatchChildDoneMerge drives three pre-seeded terminal children through the
 // coordinator and asserts the parent's merged result set, path prefixes,
 // parent-pointing proxy URLs, and "x/x" rollup. No PikPak/network is needed
@@ -97,9 +125,11 @@ func TestBatchChildDoneMerge(t *testing.T) {
 	// Two completed children with results, one failed child.
 	s.jobs.create(&Job{
 		ID:     "childA",
+		Mode:   "proxy",
 		Status: JobCompleted,
 		Results: []JobResult{{
 			File:       DownloadItem{Name: "a.mkv", Path: "a.mkv", Size: "100"},
+			URL:        "https://host/proxy/childA?token=tokA",
 			DirectURL:  "https://direct/a",
 			ProxyToken: "tokA",
 			ProxyURL:   "https://host/proxy/childA?token=tokA",
@@ -108,9 +138,11 @@ func TestBatchChildDoneMerge(t *testing.T) {
 	})
 	s.jobs.create(&Job{
 		ID:     "childB",
+		Mode:   "direct",
 		Status: JobCompleted,
 		Results: []JobResult{{
 			File:       DownloadItem{Name: "b.mp4", Path: "sub/b.mp4", Size: "200"},
+			URL:        "https://direct/b",
 			DirectURL:  "https://direct/b",
 			ProxyToken: "tokB",
 			ProxyURL:   "https://host/proxy/childB?token=tokB",
@@ -151,11 +183,18 @@ func TestBatchChildDoneMerge(t *testing.T) {
 	if ra.ProxyURL != "https://host/proxy/parent01?token=tokA" {
 		t.Fatalf("A proxy URL = %q, want parent-pointing", ra.ProxyURL)
 	}
+	if ra.URL != "https://host/proxy/parent01?token=tokA" {
+		t.Fatalf("A preferred URL = %q, want parent-pointing proxy", ra.URL)
+	}
 	if ra.AccountID != "acct1" {
 		t.Fatalf("A account id lost: %q", ra.AccountID)
 	}
-	if _, okB := byPath["链接2 B/sub/b.mp4"]; !okB {
+	rb, okB := byPath["链接2 B/sub/b.mp4"]
+	if !okB {
 		t.Fatalf("missing prefixed nested path for B; got %v", keysOf(byPath))
+	}
+	if rb.URL != "https://direct/b" {
+		t.Fatalf("B preferred URL = %q, want direct", rb.URL)
 	}
 
 	// The batch state is removed once finalized.
@@ -217,6 +256,33 @@ func TestBatchChildDoneRecordsBadResourceFailure(t *testing.T) {
 	}
 	if parent.Batch.Failures[0].Label != "链接1 Bad" || parent.Batch.Failures[0].Error != badResourceParseUserError {
 		t.Fatalf("failure entry = %+v", parent.Batch.Failures[0])
+	}
+}
+
+func TestBatchChildDoneRecordsGenericFailure(t *testing.T) {
+	t.Parallel()
+
+	s := &Server{jobs: newJobStore(50), batches: make(map[string]*batchState)}
+	parentID := "parentGeneric"
+	s.jobs.create(&Job{ID: parentID, Kind: ResourceBatch, Status: JobRunning, Batch: &BatchProgress{Total: 1}})
+	s.registerBatch(&batchState{parentID: parentID, baseURL: "https://h", total: 1})
+	s.jobs.create(&Job{ID: "failed", Status: JobFailed, Error: "all PikPak accounts failed: alice@example.com: boom"})
+
+	s.batchChildDone(parentID, "failed", "link 1")
+
+	parent, _ := s.jobs.get(parentID)
+	if parent.Batch == nil || len(parent.Batch.Failures) != 1 {
+		t.Fatalf("failures = %+v, want one", parent.Batch)
+	}
+	failure := parent.Batch.Failures[0]
+	if failure.Label != "link 1" {
+		t.Fatalf("label = %q", failure.Label)
+	}
+	if failure.Error != genericUserJobError {
+		t.Fatalf("error = %q, want generic user-safe error", failure.Error)
+	}
+	if strings.Contains(failure.Error, "@") || strings.Contains(failure.Error, "alice") {
+		t.Fatalf("failure leaked account detail: %q", failure.Error)
 	}
 }
 
