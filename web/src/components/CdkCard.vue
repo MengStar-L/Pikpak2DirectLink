@@ -3,7 +3,6 @@ import { ref } from 'vue'
 import { Ticket, RefreshCw, Trash2, Save, X } from 'lucide-vue-next'
 import CopyButton from './CopyButton.vue'
 import type { CDKView } from '../lib/types'
-import { formatRelative } from '../lib/format'
 
 const props = defineProps<{ cdk: CDKView; busy?: boolean }>()
 
@@ -42,8 +41,6 @@ function saveEdit() {
       <div class="stat"><span class="k">到期</span><span class="v mono">{{ cdk.days_left }} 天</span></div>
     </div>
 
-    <div class="meta">{{ formatRelative(cdk.expires_at) }}过期 · 创建于 {{ formatRelative(cdk.created_at) }}</div>
-
     <footer class="actions">
       <div v-if="editing" class="edit-row">
         <input v-model.number="draftGb" class="input input-mono sm" type="number" min="1" step="1" inputmode="numeric" /><span class="unit">GB</span>
@@ -71,7 +68,6 @@ function saveEdit() {
 .stat { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: var(--r-sm); background: var(--panel-2); border: 1px solid var(--line); }
 .stat .k { font-size: var(--fs-2xs); color: var(--ink-3); }
 .stat .v { font-size: var(--fs-sm); font-weight: var(--fw-semi); color: var(--ink); }
-.meta { font-size: var(--fs-xs); color: var(--ink-3); }
 .actions { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 11px; border-top: 1px solid var(--line); }
 .edit-row { display: flex; align-items: center; gap: 6px; width: 100%; flex-wrap: wrap; }
 .input.sm { width: 74px; height: 28px; }

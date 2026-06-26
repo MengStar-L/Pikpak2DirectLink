@@ -127,7 +127,10 @@ defineExpose({ refresh: load })
 .sec-head.mb { margin-bottom: 14px; }
 .eyebrow { display: block; margin-bottom: 2px; }
 .head-actions { display: flex; align-items: center; gap: 8px; }
-.gen-form { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 10px; align-items: end; }
+.gen-form { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 10px 14px; align-items: center; }
+.gen-form .field { display: flex; align-items: center; gap: 9px; }
+.gen-form .field-label { margin-bottom: 0; flex: none; white-space: nowrap; color: var(--ink-2); }
+.gen-form .field .input { flex: 1 1 auto; min-width: 0; }
 .gen-form .btn { height: 34px; }
 .cdk-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
 @media (max-width: 820px) { .gen-form { grid-template-columns: 1fr 1fr; } }

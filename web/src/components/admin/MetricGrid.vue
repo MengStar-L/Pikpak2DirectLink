@@ -35,6 +35,7 @@ const cells = [
 .strip {
   display: flex;
   align-items: stretch;
+  flex: none;
   padding: 0;
   overflow: hidden;
 }
