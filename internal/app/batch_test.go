@@ -13,7 +13,7 @@ func TestSplitResourceLines(t *testing.T) {
 		input string
 		want  []string
 	}{
-		{name: "single", input: "magnet:?xt=urn:btih:a", want: []string{"magnet:?xt=urn%3Abtih%3Aa"}},
+		{name: "single", input: "magnet:?xt=urn:btih:a", want: []string{"magnet:?xt=urn:btih:a"}},
 		{name: "empty", input: "", want: nil},
 		{name: "blank only", input: "  \n\t\n", want: nil},
 		{
@@ -29,7 +29,7 @@ func TestSplitResourceLines(t *testing.T) {
 		{
 			name:  "dedupe after magnet cleanup",
 			input: "magnet:?xt=urn:btih:abc&dn=Movie&xl=123\nmagnet:?xt=urn:btih:abc&dn=Movie&ws=http://example.com",
-			want:  []string{"magnet:?dn=Movie&xt=urn%3Abtih%3Aabc"},
+			want:  []string{"magnet:?xt=urn:btih:abc&dn=Movie"},
 		},
 		{
 			name:  "clean share query and fragment",
