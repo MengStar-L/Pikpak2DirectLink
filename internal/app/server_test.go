@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -85,6 +87,206 @@ func TestProxyErrorsDoNotExposeInternalDetails(t *testing.T) {
 	if len(logs[0].Details) == 0 || !strings.Contains(logs[0].Details[0], leakedAccount) {
 		t.Fatalf("expected internal log to retain the diagnostic detail, got %+v", logs[0])
 	}
+}
+
+func TestParseContentRangeSize(t *testing.T) {
+	cases := []struct {
+		header string
+		want   int64
+		ok     bool
+	}{
+		{header: "bytes 0-0/12345", want: 12345, ok: true},
+		{header: "bytes 10-20/12345", want: 12345, ok: true},
+		{header: "bytes 0-0/*", ok: false},
+		{header: "items 0-0/12345", ok: false},
+		{header: "bytes 0-0/not-a-number", ok: false},
+		{header: "", ok: false},
+	}
+	for _, tc := range cases {
+		got, ok := parseContentRangeSize(tc.header)
+		if got != tc.want || ok != tc.ok {
+			t.Fatalf("parseContentRangeSize(%q) = (%d, %v), want (%d, %v)", tc.header, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestProxyMultipartServesFullDownloadWithUpstreamRanges(t *testing.T) {
+	payload := []byte("abcdefghijklmnopqrstuvwxyz")
+	var mu sync.Mutex
+	var seen []string
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		mu.Lock()
+		seen = append(seen, rangeHeader)
+		mu.Unlock()
+
+		if rangeHeader == "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		start, end, ok := parseTestRange(rangeHeader, int64(len(payload)))
+		if !ok {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer upstream.Close()
+
+	s := &Server{logs: newLogStore(10)}
+	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
+	rec := httptest.NewRecorder()
+
+	served := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+		Concurrency: 3,
+		ChunkSize:   5,
+		MinSize:     4,
+	})
+
+	if !served {
+		t.Fatal("expected multipart proxy to serve the response")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, payload) {
+		t.Fatalf("body = %q, want %q", got, payload)
+	}
+	if got := rec.Header().Get("Content-Length"); got != strconv.Itoa(len(payload)) {
+		t.Fatalf("Content-Length = %q, want %d", got, len(payload))
+	}
+	if got := rec.Header().Get("Content-Range"); got != "" {
+		t.Fatalf("Content-Range should not be sent for full response, got %q", got)
+	}
+
+	mu.Lock()
+	gotRanges := append([]string(nil), seen...)
+	mu.Unlock()
+	wantRanges := []string{"bytes=0-0", "bytes=0-4", "bytes=5-9", "bytes=10-14", "bytes=15-19", "bytes=20-24", "bytes=25-25"}
+	if !seenAllRanges(gotRanges, wantRanges) {
+		t.Fatalf("upstream ranges = %v, want at least %v", gotRanges, wantRanges)
+	}
+}
+
+func TestProxyRangeRequestUsesSingleUpstreamRange(t *testing.T) {
+	payload := []byte("abcdefghijklmnopqrstuvwxyz")
+	var seen []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("Range"))
+		start, end, ok := parseTestRange(r.Header.Get("Range"), int64(len(payload)))
+		if !ok {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer upstream.Close()
+
+	s := &Server{jobs: newJobStore(10), logs: newLogStore(10)}
+	s.jobs.create(&Job{
+		ID:     "job-proxy",
+		Status: JobCompleted,
+		Result: &JobResult{
+			File:       DownloadItem{ID: "file-1", Name: "file.bin"},
+			DirectURL:  upstream.URL,
+			ProxyToken: "tok",
+		},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
+	req.Header.Set("Range", "bytes=3-8")
+	req.SetPathValue("id", "job-proxy")
+	rec := httptest.NewRecorder()
+
+	s.handleProxy(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != string(payload[3:9]) {
+		t.Fatalf("body = %q, want %q", got, payload[3:9])
+	}
+	if len(seen) != 1 || seen[0] != "bytes=3-8" {
+		t.Fatalf("upstream ranges = %v, want only client range", seen)
+	}
+}
+
+func TestProxyMultipartFallsBackWhenUpstreamIgnoresRange(t *testing.T) {
+	payload := []byte("small fallback payload")
+	var seen []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("Range"))
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
+	}))
+	defer upstream.Close()
+
+	s := &Server{logs: newLogStore(10)}
+	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
+	rec := httptest.NewRecorder()
+	served := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+		Concurrency: 2,
+		ChunkSize:   4,
+		MinSize:     4,
+	})
+	if served {
+		t.Fatal("multipart path should not serve when upstream ignores Range")
+	}
+
+	rec = httptest.NewRecorder()
+	s.serveProxySingleStream(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy")
+	if rec.Code != http.StatusOK || rec.Body.String() != string(payload) {
+		t.Fatalf("fallback status/body = %d/%q", rec.Code, rec.Body.String())
+	}
+	if len(seen) != 2 || seen[0] != "bytes=0-0" || seen[1] != "" {
+		t.Fatalf("upstream ranges = %v, want probe then plain fallback", seen)
+	}
+}
+
+func parseTestRange(header string, size int64) (int64, int64, bool) {
+	if !strings.HasPrefix(header, "bytes=") {
+		return 0, 0, false
+	}
+	parts := strings.Split(strings.TrimPrefix(header, "bytes="), "-")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	end, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	if start < 0 || end < start || end >= size {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+func seenAllRanges(got, want []string) bool {
+	counts := make(map[string]int, len(got))
+	for _, value := range got {
+		counts[value]++
+	}
+	for _, value := range want {
+		if counts[value] == 0 {
+			return false
+		}
+		counts[value]--
+	}
+	return true
 }
 
 func TestRestoreFileIDsDedupesResponseIDs(t *testing.T) {

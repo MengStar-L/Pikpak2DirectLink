@@ -721,6 +721,24 @@ var proxyHTTPClient = &http.Client{
 	},
 }
 
+type proxyMultipartConfig struct {
+	Concurrency int
+	ChunkSize   int64
+	MinSize     int64
+}
+
+var defaultProxyMultipartConfig = proxyMultipartConfig{
+	Concurrency: 4,
+	ChunkSize:   16 << 20,
+	MinSize:     64 << 20,
+}
+
+type proxyByteRange struct {
+	Index int
+	Start int64
+	End   int64
+}
+
 // jobAllowsProxy reports whether a job may expose proxy (中转) links. Admin jobs
 // (no CDK) always may; a CDK job may only if its CDK has AllowProxy set. A
 // missing/deleted CDK is treated as allowed so the admin path and edge cases
@@ -803,6 +821,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Method == http.MethodGet &&
+		strings.TrimSpace(r.Header.Get("Range")) == "" &&
+		strings.TrimSpace(r.Header.Get("If-Range")) == "" &&
+		strings.TrimSpace(r.Header.Get("If-None-Match")) == "" &&
+		strings.TrimSpace(r.Header.Get("If-Modified-Since")) == "" {
+		if s.serveProxyMultipart(w, r, sourceURL, result, jobID, defaultProxyMultipartConfig) {
+			return
+		}
+	}
+	s.serveProxySingleStream(w, r, sourceURL, result, jobID)
+}
+
+func (s *Server) serveProxySingleStream(w http.ResponseWriter, r *http.Request, sourceURL string, result *JobResult, jobID string) {
 	upstreamMethod := r.Method
 	if upstreamMethod == http.MethodHead {
 		upstreamMethod = http.MethodGet
@@ -863,6 +894,213 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if rerr != nil {
 			break
 		}
+	}
+}
+
+type proxyRangeProbe struct {
+	Header http.Header
+	Size   int64
+}
+
+type proxyRangeResult struct {
+	Range proxyByteRange
+	Data  []byte
+	Err   error
+}
+
+func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sourceURL string, result *JobResult, jobID string, cfg proxyMultipartConfig) bool {
+	if cfg.Concurrency < 1 || cfg.ChunkSize <= 0 || cfg.MinSize <= 0 {
+		return false
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	probe, ok, err := probeProxyRangeSupport(ctx, sourceURL)
+	if err != nil {
+		return false
+	}
+	if !ok || probe.Size < cfg.MinSize {
+		return false
+	}
+
+	ranges := proxyByteRanges(probe.Size, cfg.ChunkSize)
+	if len(ranges) <= 1 {
+		return false
+	}
+
+	workers := cfg.Concurrency
+	if workers > len(ranges) {
+		workers = len(ranges)
+	}
+	jobs := make(chan proxyByteRange)
+	results := make(chan proxyRangeResult, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			for br := range jobs {
+				results <- fetchProxyRange(ctx, sourceURL, br)
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, br := range ranges {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- br:
+			}
+		}
+	}()
+
+	pending := make(map[int]proxyRangeResult)
+	next := 0
+	wroteHeader := false
+	rc := http.NewResponseController(w)
+	for completed := 0; completed < len(ranges); completed++ {
+		select {
+		case <-ctx.Done():
+			return true
+		case res := <-results:
+			if res.Err != nil {
+				cancel()
+				if !wroteHeader {
+					return false
+				}
+				s.logJob(LogError, jobID, "proxy multipart download interrupted", res.Err.Error())
+				return true
+			}
+
+			pending[res.Range.Index] = res
+			for {
+				ready, ok := pending[next]
+				if !ok {
+					break
+				}
+				if !wroteHeader {
+					copyProxyDownloadHeaders(w.Header(), probe.Header)
+					w.Header().Set("Accept-Ranges", "bytes")
+					w.Header().Set("Content-Length", strconv.FormatInt(probe.Size, 10))
+					w.Header().Del("Content-Range")
+					if w.Header().Get("Content-Disposition") == "" && result.File.Name != "" {
+						w.Header().Set("Content-Disposition", buildContentDisposition(result.File.Name))
+					}
+					w.WriteHeader(http.StatusOK)
+					_ = rc.Flush()
+					wroteHeader = true
+				}
+				if _, err := w.Write(ready.Data); err != nil {
+					cancel()
+					return true
+				}
+				_ = rc.Flush()
+				delete(pending, next)
+				next++
+			}
+		}
+	}
+	return wroteHeader
+}
+
+func probeProxyRangeSupport(ctx context.Context, sourceURL string) (proxyRangeProbe, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
+	if err != nil {
+		return proxyRangeProbe{}, false, err
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("Accept-Encoding", "identity")
+
+	resp, err := proxyHTTPClient.Do(req)
+	if err != nil {
+		return proxyRangeProbe{}, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent {
+		return proxyRangeProbe{}, false, nil
+	}
+	size, ok := parseContentRangeSize(resp.Header.Get("Content-Range"))
+	if !ok {
+		return proxyRangeProbe{}, false, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(resp.Header.Get("Accept-Ranges")), "bytes") {
+		return proxyRangeProbe{}, false, nil
+	}
+	return proxyRangeProbe{Header: resp.Header.Clone(), Size: size}, true, nil
+}
+
+func fetchProxyRange(ctx context.Context, sourceURL string, br proxyByteRange) proxyRangeResult {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
+	if err != nil {
+		return proxyRangeResult{Range: br, Err: err}
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", br.Start, br.End))
+	req.Header.Set("Accept-Encoding", "identity")
+
+	resp, err := proxyHTTPClient.Do(req)
+	if err != nil {
+		return proxyRangeResult{Range: br, Err: err}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent {
+		return proxyRangeResult{Range: br, Err: fmt.Errorf("upstream returned %s for range %d-%d", resp.Status, br.Start, br.End)}
+	}
+
+	want := br.End - br.Start + 1
+	data, err := io.ReadAll(io.LimitReader(resp.Body, want+1))
+	if err != nil {
+		return proxyRangeResult{Range: br, Err: err}
+	}
+	if int64(len(data)) != want {
+		return proxyRangeResult{Range: br, Err: fmt.Errorf("upstream returned %d bytes for range %d-%d, want %d", len(data), br.Start, br.End, want)}
+	}
+	return proxyRangeResult{Range: br, Data: data}
+}
+
+func parseContentRangeSize(value string) (int64, bool) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(strings.ToLower(value), "bytes ") {
+		return 0, false
+	}
+	slash := strings.LastIndex(value, "/")
+	if slash < 0 || slash == len(value)-1 {
+		return 0, false
+	}
+	total := strings.TrimSpace(value[slash+1:])
+	if total == "*" {
+		return 0, false
+	}
+	size, err := strconv.ParseInt(total, 10, 64)
+	if err != nil || size <= 0 {
+		return 0, false
+	}
+	return size, true
+}
+
+func proxyByteRanges(size, chunkSize int64) []proxyByteRange {
+	if size <= 0 || chunkSize <= 0 {
+		return nil
+	}
+	var ranges []proxyByteRange
+	for start := int64(0); start < size; start += chunkSize {
+		end := start + chunkSize - 1
+		if end >= size {
+			end = size - 1
+		}
+		ranges = append(ranges, proxyByteRange{Index: len(ranges), Start: start, End: end})
+	}
+	return ranges
+}
+
+func copyProxyDownloadHeaders(dst, src http.Header) {
+	for _, key := range []string{
+		"Accept-Ranges",
+		"Cache-Control",
+		"Content-Disposition",
+		"Content-Type",
+		"ETag",
+		"Last-Modified",
+	} {
+		copyHeaderIfPresent(dst, src, key)
 	}
 }
 
