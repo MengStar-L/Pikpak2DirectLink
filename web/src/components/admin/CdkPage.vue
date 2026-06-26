@@ -6,6 +6,7 @@ import PrimaryButton from '../PrimaryButton.vue'
 import CdkCard from '../CdkCard.vue'
 import Skeleton from '../Skeleton.vue'
 import { api } from '../../lib/api'
+import { copyText } from '../../lib/clipboard'
 import { toast } from '../../composables/useToast'
 import type { CDKView } from '../../lib/types'
 
@@ -43,7 +44,11 @@ async function generate() {
       days: form.value.days,
       allow_proxy: form.value.allow_proxy,
     })
-    toast(`已生成 ${created.length} 个 CDK`, 'success')
+    const copied = await copyText(created.map((c) => c.code).join('\n'))
+    toast(
+      copied ? `已生成 ${created.length} 个 CDK，并已复制到剪贴板` : `已生成 ${created.length} 个 CDK，但自动复制失败，请手动复制`,
+      copied ? 'success' : 'info',
+    )
     await load()
   } catch (e: any) {
     formErr.value = e?.message || '生成失败'
