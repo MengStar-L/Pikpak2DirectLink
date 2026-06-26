@@ -33,6 +33,7 @@ const phaseLabel = computed(() => PHASE_LABEL[status.value?.phase || 'idle'] || 
 const isActive = computed(() => ACTIVE.includes(status.value?.phase || 'idle'))
 
 async function load() {
+  if (timer) { clearTimeout(timer); timer = undefined }
   try {
     status.value = await api.update.status()
     emit('available', Boolean(status.value.update_available))

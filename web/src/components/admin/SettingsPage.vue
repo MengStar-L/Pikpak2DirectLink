@@ -31,8 +31,8 @@ async function loadSettings() {
 
 async function saveSettings() {
   concErr.value = ''
-  if (concInput.value < 1 || concInput.value > 32) { concErr.value = '并发数需在 1–32 之间'; return }
-  if (timeoutInput.value < 1) { concErr.value = '超时至少 1 分钟'; return }
+  if (!Number.isFinite(concInput.value) || concInput.value < 1 || concInput.value > 32) { concErr.value = '并发数需在 1–32 之间'; return }
+  if (!Number.isFinite(timeoutInput.value) || timeoutInput.value < 1) { concErr.value = '超时至少 1 分钟'; return }
   concSaving.value = true
   try {
     settings.value = await api.settings.update({ concurrency: concInput.value, task_timeout_minutes: timeoutInput.value })
