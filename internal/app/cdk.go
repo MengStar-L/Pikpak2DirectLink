@@ -42,6 +42,7 @@ type CDK struct {
 	UsedBytes      int64
 	ExpiresAt      int64 // unix seconds
 	CreatedAt      int64 // unix seconds
+	AllowProxy     bool  // whether this CDK may use proxy (中转) download
 }
 
 // cdkView is the JSON shape returned to clients, with derived fields. Traffic is
@@ -56,6 +57,7 @@ type cdkView struct {
 	CreatedAt      string `json:"created_at"`
 	DaysLeft       int    `json:"days_left"`
 	Expired        bool   `json:"expired"`
+	AllowProxy     bool   `json:"allow_proxy"`
 }
 
 func toCDKView(c CDK, now time.Time) cdkView {
@@ -74,7 +76,16 @@ func toCDKView(c CDK, now time.Time) cdkView {
 		CreatedAt:      time.Unix(c.CreatedAt, 0).Format(time.RFC3339),
 		DaysLeft:       daysLeft,
 		Expired:        expired,
+		AllowProxy:     c.AllowProxy,
 	}
+}
+
+// b2i maps a bool to the 0/1 integer SQLite stores it as.
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // formatTrafficLabel renders a byte count as a compact human-readable string
@@ -130,9 +141,9 @@ func normalizeCode(code string) string {
 	return strings.ToUpper(strings.TrimSpace(code))
 }
 
-// createBatch generates count new CDKs sharing the same traffic quota (bytes)
-// and expiry.
-func (s *cdkStore) createBatch(count int, remainingBytes int64, days int, now time.Time) ([]CDK, error) {
+// createBatch generates count new CDKs sharing the same traffic quota (bytes),
+// expiry, and proxy-download permission.
+func (s *cdkStore) createBatch(count int, remainingBytes int64, days int, allowProxy bool, now time.Time) ([]CDK, error) {
 	if count < 1 {
 		count = 1
 	}
@@ -164,8 +175,8 @@ func (s *cdkStore) createBatch(count int, remainingBytes int64, days int, now ti
 				return nil, err
 			}
 			_, err = tx.Exec(
-				`INSERT INTO cdks(code, remaining_bytes, used_bytes, expires_at, created_at) VALUES(?,?,?,?,?)`,
-				candidate, remainingBytes, 0, expiresAt, createdAt,
+				`INSERT INTO cdks(code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy) VALUES(?,?,?,?,?,?)`,
+				candidate, remainingBytes, 0, expiresAt, createdAt, b2i(allowProxy),
 			)
 			if err == nil {
 				code = candidate
@@ -176,7 +187,7 @@ func (s *cdkStore) createBatch(count int, remainingBytes int64, days int, now ti
 		if code == "" {
 			return nil, errors.New("无法生成唯一的 CDK，请重试")
 		}
-		out = append(out, CDK{Code: code, RemainingBytes: remainingBytes, ExpiresAt: expiresAt, CreatedAt: createdAt})
+		out = append(out, CDK{Code: code, RemainingBytes: remainingBytes, ExpiresAt: expiresAt, CreatedAt: createdAt, AllowProxy: allowProxy})
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -186,7 +197,7 @@ func (s *cdkStore) createBatch(count int, remainingBytes int64, days int, now ti
 }
 
 func (s *cdkStore) list() ([]CDK, error) {
-	rows, err := s.db.Query(`SELECT code, remaining_bytes, used_bytes, expires_at, created_at FROM cdks ORDER BY created_at DESC, code`)
+	rows, err := s.db.Query(`SELECT code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy FROM cdks ORDER BY created_at DESC, code`)
 	if err != nil {
 		return nil, err
 	}
@@ -195,9 +206,11 @@ func (s *cdkStore) list() ([]CDK, error) {
 	var out []CDK
 	for rows.Next() {
 		var c CDK
-		if err := rows.Scan(&c.Code, &c.RemainingBytes, &c.UsedBytes, &c.ExpiresAt, &c.CreatedAt); err != nil {
+		var allow int64
+		if err := rows.Scan(&c.Code, &c.RemainingBytes, &c.UsedBytes, &c.ExpiresAt, &c.CreatedAt, &allow); err != nil {
 			return nil, err
 		}
+		c.AllowProxy = allow != 0
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -205,21 +218,23 @@ func (s *cdkStore) list() ([]CDK, error) {
 
 func (s *cdkStore) get(code string) (CDK, bool, error) {
 	var c CDK
+	var allow int64
 	err := s.db.QueryRow(
-		`SELECT code, remaining_bytes, used_bytes, expires_at, created_at FROM cdks WHERE code=?`, code,
-	).Scan(&c.Code, &c.RemainingBytes, &c.UsedBytes, &c.ExpiresAt, &c.CreatedAt)
+		`SELECT code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy FROM cdks WHERE code=?`, code,
+	).Scan(&c.Code, &c.RemainingBytes, &c.UsedBytes, &c.ExpiresAt, &c.CreatedAt, &allow)
 	if errors.Is(err, sql.ErrNoRows) {
 		return CDK{}, false, nil
 	}
 	if err != nil {
 		return CDK{}, false, err
 	}
+	c.AllowProxy = allow != 0
 	return c, true, nil
 }
 
-// update resets a CDK's remaining traffic quota (bytes) and pushes its expiry to
-// now+days.
-func (s *cdkStore) update(code string, remainingBytes int64, days int, now time.Time) (CDK, bool, error) {
+// update resets a CDK's remaining traffic quota (bytes), pushes its expiry to
+// now+days, and sets whether it may use proxy download.
+func (s *cdkStore) update(code string, remainingBytes int64, days int, allowProxy bool, now time.Time) (CDK, bool, error) {
 	if remainingBytes < 0 {
 		remainingBytes = 0
 	}
@@ -227,7 +242,7 @@ func (s *cdkStore) update(code string, remainingBytes int64, days int, now time.
 		days = 1
 	}
 	expiresAt := now.Add(time.Duration(days) * 24 * time.Hour).Unix()
-	res, err := s.db.Exec(`UPDATE cdks SET remaining_bytes=?, expires_at=? WHERE code=?`, remainingBytes, expiresAt, code)
+	res, err := s.db.Exec(`UPDATE cdks SET remaining_bytes=?, expires_at=?, allow_proxy=? WHERE code=?`, remainingBytes, expiresAt, b2i(allowProxy), code)
 	if err != nil {
 		return CDK{}, false, err
 	}

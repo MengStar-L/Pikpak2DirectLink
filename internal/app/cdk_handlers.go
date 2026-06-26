@@ -290,14 +290,16 @@ func (s *Server) applyItemsSelection(jobID string, itemIDs []string) (*Job, int,
 // --- admin CDK management ---
 
 type createCDKRequest struct {
-	Count     int `json:"count"`
-	TrafficGB int `json:"traffic_gb"`
-	Days      int `json:"days"`
+	Count      int  `json:"count"`
+	TrafficGB  int  `json:"traffic_gb"`
+	Days       int  `json:"days"`
+	AllowProxy bool `json:"allow_proxy"`
 }
 
 type updateCDKRequest struct {
-	TrafficGB int `json:"traffic_gb"`
-	Days      int `json:"days"`
+	TrafficGB  int  `json:"traffic_gb"`
+	Days       int  `json:"days"`
+	AllowProxy bool `json:"allow_proxy"`
 }
 
 func (s *Server) handleListCDKs(w http.ResponseWriter, _ *http.Request) {
@@ -338,7 +340,7 @@ func (s *Server) handleCreateCDKs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	created, err := s.cdk.createBatch(req.Count, int64(req.TrafficGB)*bytesPerGB, req.Days, now)
+	created, err := s.cdk.createBatch(req.Count, int64(req.TrafficGB)*bytesPerGB, req.Days, req.AllowProxy, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -348,7 +350,11 @@ func (s *Server) handleCreateCDKs(w http.ResponseWriter, r *http.Request) {
 	for _, c := range created {
 		views = append(views, toCDKView(c, now))
 	}
-	s.logJob(LogSuccess, "", "已分发 CDK", "数量："+itoa(len(created)), "流量额度："+itoa(req.TrafficGB)+"G", "有效天数："+itoa(req.Days))
+	proxyLabel := "否"
+	if req.AllowProxy {
+		proxyLabel = "是"
+	}
+	s.logJob(LogSuccess, "", "已分发 CDK", "数量："+itoa(len(created)), "流量额度："+itoa(req.TrafficGB)+"G", "有效天数："+itoa(req.Days), "支持中转："+proxyLabel)
 	writeJSON(w, http.StatusCreated, map[string]any{"cdks": views})
 }
 
@@ -369,7 +375,7 @@ func (s *Server) handleUpdateCDK(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	updated, ok, err := s.cdk.update(code, int64(req.TrafficGB)*bytesPerGB, req.Days, now)
+	updated, ok, err := s.cdk.update(code, int64(req.TrafficGB)*bytesPerGB, req.Days, req.AllowProxy, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -542,6 +548,12 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Mode != "direct" && req.Mode != "proxy" {
 		writeError(w, http.StatusBadRequest, "mode must be direct or proxy")
+		return
+	}
+	// Proxy (中转) download is a per-CDK privilege; reject it server-side even if
+	// the UI is bypassed.
+	if req.Mode == "proxy" && !c.AllowProxy {
+		writeError(w, http.StatusForbidden, "此 CDK 不支持中转下载")
 		return
 	}
 

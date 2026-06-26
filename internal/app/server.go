@@ -703,11 +703,50 @@ func (s *Server) handleSelectItem(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, updatedJob)
 }
 
+// proxyHTTPClient is a tuned client for streaming large files from PikPak's CDN
+// through this server. The default client's small socket buffers and modest
+// idle-connection pool throttle throughput, especially on high-latency links.
+var proxyHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ReadBufferSize:        64 << 10,
+		WriteBufferSize:       64 << 10,
+		ForceAttemptHTTP2:     true,
+	},
+}
+
+// jobAllowsProxy reports whether a job may expose proxy (中转) links. Admin jobs
+// (no CDK) always may; a CDK job may only if its CDK has AllowProxy set. A
+// missing/deleted CDK is treated as allowed so the admin path and edge cases
+// don't break — a CDK job whose CDK is gone fails elsewhere anyway.
+func (s *Server) jobAllowsProxy(cdkCode string) bool {
+	if cdkCode == "" {
+		return true
+	}
+	c, ok, err := s.cdk.get(cdkCode)
+	if err != nil || !ok {
+		return true
+	}
+	return c.AllowProxy
+}
+
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	job, ok := s.jobs.get(jobID)
 	if !ok {
 		writeError(w, http.StatusNotFound, proxyInvalidLinkError)
+		return
+	}
+	// Defense in depth: a CDK that may not use 中转 cannot pull files through the
+	// proxy even with a valid token (its results normally carry no proxy URL).
+	if !s.jobAllowsProxy(job.CDKCode) {
+		writeError(w, http.StatusForbidden, proxyInvalidLinkError)
 		return
 	}
 
@@ -779,7 +818,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	copyHeaderIfPresent(proxyReq.Header, r.Header, "If-None-Match")
 	copyHeaderIfPresent(proxyReq.Header, r.Header, "If-Modified-Since")
 
-	resp, err := http.DefaultClient.Do(proxyReq)
+	resp, err := proxyHTTPClient.Do(proxyReq)
 	if err != nil {
 		s.writeProxyFailure(w, http.StatusBadGateway, jobID, err)
 		return
@@ -806,7 +845,25 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodHead {
 		return
 	}
-	_, _ = io.Copy(w, resp.Body)
+	// Stream with a large buffer and flush each chunk: bigger reads/writes keep
+	// the pipe full on high-latency links, and flushing avoids any server-side
+	// buffering stall. (io.CopyBuffer alone would defer to the response writer's
+	// 32 KiB ReadFrom path, so copy explicitly.)
+	rc := http.NewResponseController(w)
+	_ = rc.Flush()
+	buf := make([]byte, 1<<20) // 1 MiB
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			_ = rc.Flush()
+		}
+		if rerr != nil {
+			break
+		}
+	}
 }
 
 const (
@@ -1403,13 +1460,18 @@ func (s *Server) resolveFileLink(ctx context.Context, jobID string, account Acco
 	item.MimeType = firstNonEmpty(item.MimeType, file.MimeType)
 	item.Size = firstNonEmpty(item.Size, file.Size)
 
-	proxyToken := newJobID()
 	result := &JobResult{
-		File:       item,
-		DirectURL:  directURL,
-		ProxyURL:   strings.TrimRight(job.BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken,
-		ProxyToken: proxyToken,
-		AccountID:  account.ID,
+		File:      item,
+		DirectURL: directURL,
+		AccountID: account.ID,
+	}
+	// Only mint a proxy (中转) link when the job is permitted to use it: admin
+	// jobs always, CDK jobs only if their CDK allows it. No-proxy CDK results
+	// then carry only a direct link, and the frontend hides the proxy row.
+	if s.jobAllowsProxy(job.CDKCode) {
+		proxyToken := newJobID()
+		result.ProxyURL = strings.TrimRight(job.BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken
+		result.ProxyToken = proxyToken
 	}
 	result.applyPreferredURL(job.Mode)
 	if expiresAt := file.ExpireAt(); !expiresAt.IsZero() {

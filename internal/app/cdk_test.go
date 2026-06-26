@@ -1,6 +1,7 @@
 package app
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -26,7 +27,7 @@ func TestCDKCreateAndList(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	store := newTestCDKStore(t)
 
-	created, err := store.createBatch(3, 5*bytesPerGB, 30, now)
+	created, err := store.createBatch(3, 5*bytesPerGB, 30, true, now)
 	if err != nil {
 		t.Fatalf("createBatch: %v", err)
 	}
@@ -53,11 +54,106 @@ func TestCDKCreateAndList(t *testing.T) {
 	}
 }
 
+func TestCDKAllowProxyPersistsAndToggles(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	store := newTestCDKStore(t)
+
+	off, err := store.createBatch(1, 5*bytesPerGB, 30, false, now)
+	if err != nil {
+		t.Fatalf("createBatch(false): %v", err)
+	}
+	on, err := store.createBatch(1, 5*bytesPerGB, 30, true, now)
+	if err != nil {
+		t.Fatalf("createBatch(true): %v", err)
+	}
+	if off[0].AllowProxy {
+		t.Fatal("created CDK should have AllowProxy=false")
+	}
+	if !on[0].AllowProxy {
+		t.Fatal("created CDK should have AllowProxy=true")
+	}
+
+	// Round-trips through get + view.
+	gotOff, ok, _ := store.get(off[0].Code)
+	if !ok || gotOff.AllowProxy {
+		t.Fatalf("get(off): ok=%v allow=%v, want ok=true allow=false", ok, gotOff.AllowProxy)
+	}
+	if v := toCDKView(gotOff, now); v.AllowProxy {
+		t.Fatal("cdkView should expose AllowProxy=false")
+	}
+
+	// And shows up in list.
+	for _, c := range mustList(t, store) {
+		if c.Code == on[0].Code && !c.AllowProxy {
+			t.Fatal("list should report AllowProxy=true for the enabled CDK")
+		}
+	}
+
+	// update flips the flag.
+	updated, ok, err := store.update(off[0].Code, 5*bytesPerGB, 30, true, now)
+	if err != nil || !ok {
+		t.Fatalf("update: ok=%v err=%v", ok, err)
+	}
+	if !updated.AllowProxy {
+		t.Fatal("update should have set AllowProxy=true")
+	}
+}
+
+func mustList(t *testing.T, store *cdkStore) []CDK {
+	t.Helper()
+	list, err := store.list()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	return list
+}
+
+// TestMigrateCDKAddAllowProxyOnExistingDB guards the startup migration that runs
+// against real user databases: adding the column must succeed, be idempotent,
+// and default existing CDKs to proxy-allowed so prior behavior is preserved.
+func TestMigrateCDKAddAllowProxyOnExistingDB(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	db.SetMaxOpenConns(1)
+
+	// Simulate a pre-feature cdks table without the allow_proxy column.
+	if _, err := db.Exec(`CREATE TABLE cdks (
+		code TEXT PRIMARY KEY,
+		remaining_bytes INTEGER NOT NULL,
+		used_bytes INTEGER NOT NULL DEFAULT 0,
+		expires_at INTEGER NOT NULL,
+		created_at INTEGER NOT NULL
+	)`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO cdks(code, remaining_bytes, used_bytes, expires_at, created_at) VALUES('OLDCODE-AAAA-BBBB-CCCC', 100, 0, 9999999999, 1700000000)`); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+
+	if err := migrateCDKAddAllowProxy(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if err := migrateCDKAddAllowProxy(db); err != nil { // idempotent
+		t.Fatalf("migrate (2nd run): %v", err)
+	}
+
+	c, ok, err := newCDKStore(db).get("OLDCODE-AAAA-BBBB-CCCC")
+	if err != nil || !ok {
+		t.Fatalf("get migrated row: ok=%v err=%v", ok, err)
+	}
+	if !c.AllowProxy {
+		t.Fatal("existing CDK should default to AllowProxy=true after migration")
+	}
+}
+
 func TestCDKHasTrafficGuards(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	store := newTestCDKStore(t)
 
-	created, _ := store.createBatch(1, 2*bytesPerGB, 30, now)
+	created, _ := store.createBatch(1, 2*bytesPerGB, 30, true, now)
 	code := created[0].Code
 
 	if _, err := store.hasTraffic(code, now); err != nil {
@@ -78,7 +174,7 @@ func TestCDKHasTrafficGuards(t *testing.T) {
 	}
 
 	// Expired code.
-	exp, _ := store.createBatch(1, 5*bytesPerGB, 1, now)
+	exp, _ := store.createBatch(1, 5*bytesPerGB, 1, true, now)
 	later := now.Add(48 * time.Hour)
 	if _, err := store.hasTraffic(exp[0].Code, later); err != errCDKExpired {
 		t.Fatalf("expected errCDKExpired, got %v", err)
@@ -89,7 +185,7 @@ func TestCDKCharge(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	store := newTestCDKStore(t)
 
-	created, _ := store.createBatch(1, 5*bytesPerGB, 30, now)
+	created, _ := store.createBatch(1, 5*bytesPerGB, 30, true, now)
 	code := created[0].Code
 
 	if err := store.charge(code, 2*bytesPerGB); err != nil {
@@ -116,7 +212,7 @@ func TestCDKCharge(t *testing.T) {
 func TestCDKChargeIfEnoughDoesNotOverdrawConcurrently(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	store := newTestCDKStore(t)
-	created, _ := store.createBatch(1, 1*bytesPerGB, 30, now)
+	created, _ := store.createBatch(1, 1*bytesPerGB, 30, true, now)
 	code := created[0].Code
 	chargeSize := int64(700 * 1024 * 1024)
 
@@ -159,10 +255,10 @@ func TestCDKUpdateAndDelete(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	store := newTestCDKStore(t)
 
-	created, _ := store.createBatch(1, 5*bytesPerGB, 10, now)
+	created, _ := store.createBatch(1, 5*bytesPerGB, 10, true, now)
 	code := created[0].Code
 
-	updated, ok, err := store.update(code, 20*bytesPerGB, 60, now)
+	updated, ok, err := store.update(code, 20*bytesPerGB, 60, true, now)
 	if err != nil || !ok {
 		t.Fatalf("update: ok=%v err=%v", ok, err)
 	}
@@ -189,10 +285,10 @@ func TestCDKDeleteExpired(t *testing.T) {
 
 	// Two already-expired (created far in the past, short window) and one live.
 	past := now.Add(-40 * 24 * time.Hour)
-	if _, err := store.createBatch(2, 5*bytesPerGB, 10, past); err != nil {
+	if _, err := store.createBatch(2, 5*bytesPerGB, 10, true, past); err != nil {
 		t.Fatalf("create expired: %v", err)
 	}
-	live, err := store.createBatch(1, 5*bytesPerGB, 30, now)
+	live, err := store.createBatch(1, 5*bytesPerGB, 30, true, now)
 	if err != nil {
 		t.Fatalf("create live: %v", err)
 	}
@@ -225,10 +321,10 @@ func TestHandleDeleteExpiredCDKs(t *testing.T) {
 	handler := srv.Handler()
 
 	past := time.Now().Add(-72 * time.Hour)
-	if _, err := srv.cdk.createBatch(2, 5*bytesPerGB, 1, past); err != nil {
+	if _, err := srv.cdk.createBatch(2, 5*bytesPerGB, 1, true, past); err != nil {
 		t.Fatalf("create expired: %v", err)
 	}
-	live, err := srv.cdk.createBatch(1, 5*bytesPerGB, 30, time.Now())
+	live, err := srv.cdk.createBatch(1, 5*bytesPerGB, 30, true, time.Now())
 	if err != nil {
 		t.Fatalf("create live: %v", err)
 	}
@@ -363,7 +459,7 @@ func contains(haystack, needle string) bool {
 func TestApplyItemsSelectionRejectsOverdraw(t *testing.T) {
 	now := time.Now()
 	store := newTestCDKStore(t)
-	created, _ := store.createBatch(1, 1*bytesPerGB, 30, now)
+	created, _ := store.createBatch(1, 1*bytesPerGB, 30, true, now)
 	code := created[0].Code
 
 	noopResolver := newResolveQueue(time.Second, time.Second, 1, func(string, error) {})
@@ -497,7 +593,7 @@ func TestApplyItemsSelectionRejectsTooManyItems(t *testing.T) {
 func TestApplyItemsSelectionRejectsSourceOverdraw(t *testing.T) {
 	now := time.Now()
 	store := newTestCDKStore(t)
-	created, _ := store.createBatch(1, 1*bytesPerGB, 30, now)
+	created, _ := store.createBatch(1, 1*bytesPerGB, 30, true, now)
 	code := created[0].Code
 
 	noopResolver := newResolveQueue(time.Second, time.Second, 1, func(string, error) {})
@@ -548,7 +644,7 @@ func TestResultForToken(t *testing.T) {
 func TestCDKOverdrawError(t *testing.T) {
 	now := time.Now()
 	store := newTestCDKStore(t)
-	created, _ := store.createBatch(1, 1*bytesPerGB, 30, now)
+	created, _ := store.createBatch(1, 1*bytesPerGB, 30, true, now)
 	code := created[0].Code
 
 	s := &Server{cdk: store, jobs: newJobStore(10)}

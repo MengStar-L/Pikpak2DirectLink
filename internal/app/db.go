@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS cdks (
     remaining_bytes INTEGER NOT NULL,
     used_bytes      INTEGER NOT NULL DEFAULT 0,
     expires_at      INTEGER NOT NULL,
-    created_at      INTEGER NOT NULL
+    created_at      INTEGER NOT NULL,
+    allow_proxy     INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -61,7 +62,26 @@ CREATE TABLE IF NOT EXISTS settings (
 	if err := migrateCDKToTraffic(db); err != nil {
 		return fmt.Errorf("migrate cdks to traffic: %w", err)
 	}
+	if err := migrateCDKAddAllowProxy(db); err != nil {
+		return fmt.Errorf("migrate cdks add allow_proxy: %w", err)
+	}
 	return nil
+}
+
+// migrateCDKAddAllowProxy adds the allow_proxy column to a pre-existing cdks
+// table. Existing CDKs default to 1 (proxy allowed) so prior behavior is
+// preserved. Fresh databases already have the column from the schema above, so
+// this is a no-op for them and idempotent thereafter.
+func migrateCDKAddAllowProxy(db *sql.DB) error {
+	has, err := columnExists(db, "cdks", "allow_proxy")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE cdks ADD COLUMN allow_proxy INTEGER NOT NULL DEFAULT 1`)
+	return err
 }
 
 // legacyCDKBytesPerCredit converts an existing count-based CDK credit into a

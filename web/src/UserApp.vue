@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import {
-  Ticket, LogOut, Gauge, CalendarClock, Hourglass, Link2, Files, CheckCheck, Settings2, Send, Radar,
+  Ticket, LogOut, Gauge, CalendarClock, Hourglass, Link2, Files, CheckCheck, Settings2, Send, Radar, Waypoints,
 } from 'lucide-vue-next'
 import AuroraBg from './components/AuroraBg.vue'
 import GlassCard from './components/GlassCard.vue'
@@ -152,6 +152,7 @@ onMounted(loadStatus)
           <span v-if="queuePill?.active" class="pill pill-live"><Hourglass />队列 {{ queuePill.waiting }}</span>
           <span class="pill pill-ok"><Gauge />剩余 {{ status?.remaining_label || '-' }}</span>
           <span class="pill pill-info"><CalendarClock />{{ status?.days_left ?? '-' }} 天</span>
+          <span class="pill" :class="status?.allow_proxy ? 'pill-brand' : ''" :title="status?.allow_proxy ? '此 CDK 支持中转下载' : '此 CDK 不支持中转下载'"><Waypoints />中转{{ status?.allow_proxy ? '可用' : '不可用' }}</span>
           <button class="btn btn-ghost btn-sm" type="button" @click="logout"><LogOut />退出</button>
         </div>
       </header>
@@ -163,7 +164,7 @@ onMounted(loadStatus)
             <div><span class="eyebrow">resolve</span><h2>链接解析</h2><p>粘贴磁力或 PikPak 分享链接，勾选文件生成下载链接</p></div>
           </div>
         </div>
-        <ResolveForm :loading="submitting" @submit="onSubmit" />
+        <ResolveForm :loading="submitting" :allow-proxy="status?.allow_proxy ?? false" @submit="onSubmit" />
         <div class="dock-wrap"><JobStatus :job="job" :phase="phase" :error="error" :submitting="submitting" /></div>
       </GlassCard>
 

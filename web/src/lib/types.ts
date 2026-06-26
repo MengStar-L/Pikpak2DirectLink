@@ -194,17 +194,20 @@ export type CDKView = {
   created_at: string
   days_left: number
   expired: boolean
+  allow_proxy: boolean
 }
 
 export type CreateCDKRequest = {
   count: number
   traffic_gb: number
   days: number
+  allow_proxy: boolean
 }
 
 export type UpdateCDKRequest = {
   traffic_gb: number
   days: number
+  allow_proxy: boolean
 }
 
 // CDK user-portal projections.

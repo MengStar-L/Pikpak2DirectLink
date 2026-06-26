@@ -13,7 +13,7 @@ const cdks = ref<CDKView[]>([])
 const loading = ref(true)
 const busyCode = ref('')
 
-const form = ref({ count: 1, traffic_gb: 2, days: 30 })
+const form = ref({ count: 1, traffic_gb: 2, days: 30, allow_proxy: true })
 const formErr = ref('')
 const generating = ref(false)
 
@@ -41,6 +41,7 @@ async function generate() {
       count: form.value.count,
       traffic_gb: form.value.traffic_gb,
       days: form.value.days,
+      allow_proxy: form.value.allow_proxy,
     })
     toast(`已生成 ${created.length} 个 CDK`, 'success')
     await load()
@@ -61,7 +62,7 @@ async function purgeExpired() {
   }
 }
 
-async function action(code: string, kind: 'update' | 'delete', payload?: { traffic_gb: number; days: number }) {
+async function action(code: string, kind: 'update' | 'delete', payload?: { traffic_gb: number; days: number; allow_proxy: boolean }) {
   busyCode.value = code
   try {
     if (kind === 'update' && payload) await api.cdks.update(code, payload)
@@ -96,6 +97,7 @@ defineExpose({ refresh: load })
         <label class="field"><span class="field-label">分发数量</span><input v-model.number="form.count" class="input input-mono" type="number" min="1" max="100" step="1" inputmode="numeric" /></label>
         <label class="field"><span class="field-label">流量额度 (GB)</span><input v-model.number="form.traffic_gb" class="input input-mono" type="number" min="1" step="1" inputmode="numeric" /></label>
         <label class="field"><span class="field-label">到期天数</span><input v-model.number="form.days" class="input input-mono" type="number" min="1" step="1" inputmode="numeric" /></label>
+        <label class="check gen-check"><input v-model="form.allow_proxy" type="checkbox" />支持中转下载</label>
         <PrimaryButton type="submit" :loading="generating"><template #icon><Plus /></template>生成 CDK</PrimaryButton>
       </form>
       <Transition name="v-fade"><p v-if="formErr" class="error-block">{{ formErr }}</p></Transition>
@@ -111,7 +113,7 @@ defineExpose({ refresh: load })
           :key="c.code"
           :cdk="c"
           :busy="busyCode === c.code"
-          @update="(code, gb, days) => action(code, 'update', { traffic_gb: gb, days })"
+          @update="(code, gb, days, allowProxy) => action(code, 'update', { traffic_gb: gb, days, allow_proxy: allowProxy })"
           @delete="(code) => action(code, 'delete')"
         />
       </template>
@@ -127,10 +129,11 @@ defineExpose({ refresh: load })
 .sec-head.mb { margin-bottom: 14px; }
 .eyebrow { display: block; margin-bottom: 2px; }
 .head-actions { display: flex; align-items: center; gap: 8px; }
-.gen-form { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 10px 14px; align-items: center; }
+.gen-form { display: grid; grid-template-columns: 1fr 1fr 1fr auto auto; gap: 10px 14px; align-items: center; }
 .gen-form .field { display: flex; align-items: center; gap: 9px; }
 .gen-form .field-label { margin-bottom: 0; flex: none; white-space: nowrap; color: var(--ink-2); }
 .gen-form .field .input { flex: 1 1 auto; min-width: 0; }
+.gen-check { white-space: nowrap; }
 .gen-form .btn { height: 34px; }
 .cdk-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
 @media (max-width: 820px) { .gen-form { grid-template-columns: 1fr 1fr; } }

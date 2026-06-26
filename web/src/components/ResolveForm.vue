@@ -1,14 +1,15 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { Bolt, Database, Play, ArrowRight } from 'lucide-vue-next'
 import PrimaryButton from './PrimaryButton.vue'
 import type { JobMode } from '../lib/types'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   loading?: boolean
   disabled?: boolean
   compact?: boolean
-}>()
+  allowProxy?: boolean
+}>(), { allowProxy: true })
 
 const emit = defineEmits<{
   (e: 'submit', payload: { input: string; passCode: string; mode: JobMode }): void
@@ -17,6 +18,15 @@ const emit = defineEmits<{
 const input = ref('')
 const passCode = ref('')
 const mode = ref<JobMode>('direct')
+
+// A CDK without proxy permission can't choose proxy mode; keep it on direct.
+watch(
+  () => props.allowProxy,
+  (allow) => {
+    if (!allow && mode.value === 'proxy') mode.value = 'direct'
+  },
+  { immediate: true },
+)
 
 const lineCount = computed(() => input.value.split('\n').filter((l) => l.trim()).length)
 const isBatch = computed(() => lineCount.value > 1)
@@ -53,9 +63,9 @@ function onSubmit() {
             <input v-model="mode" type="radio" value="direct" />
             <span><Bolt />直链优先</span>
           </label>
-          <label class="seg-item">
-            <input v-model="mode" type="radio" value="proxy" />
-            <span><Database />代理优先</span>
+          <label class="seg-item" :class="{ disabled: !allowProxy }">
+            <input v-model="mode" type="radio" value="proxy" :disabled="!allowProxy" />
+            <span :title="allowProxy ? '' : '此 CDK 不支持中转下载'"><Database />代理优先</span>
           </label>
         </div>
       </div>
@@ -77,6 +87,8 @@ function onSubmit() {
 .seg { width: 100%; }
 .seg-item { flex: 1 1 0; }
 .seg-item span { width: 100%; justify-content: center; }
+.seg-item.disabled { cursor: not-allowed; }
+.seg-item.disabled span { opacity: 0.4; cursor: not-allowed; }
 
 @media (max-width: 760px) {
   .rform { grid-template-columns: 1fr; }
