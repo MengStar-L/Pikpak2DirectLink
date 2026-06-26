@@ -395,6 +395,20 @@ func (s *Server) handleDeleteCDK(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
+// handleDeleteExpiredCDKs removes every CDK that has already expired and reports
+// how many were cleared.
+func (s *Server) handleDeleteExpiredCDKs(w http.ResponseWriter, _ *http.Request) {
+	deleted, err := s.cdk.deleteExpired(time.Now())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if deleted > 0 {
+		s.logJob(LogSuccess, "", "已清理过期 CDK", "数量："+itoa(int(deleted)))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
+}
+
 // --- CDK user portal ---
 
 func (s *Server) handleUserPortal(w http.ResponseWriter, _ *http.Request) {

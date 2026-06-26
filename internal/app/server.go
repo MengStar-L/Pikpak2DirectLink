@@ -221,6 +221,7 @@ func NewServer(cfg Config) (*Server, error) {
 	// Admin-only CDK management (behind the access gate).
 	server.mux.HandleFunc("GET /api/cdks", server.handleListCDKs)
 	server.mux.HandleFunc("POST /api/cdks", server.handleCreateCDKs)
+	server.mux.HandleFunc("DELETE /api/cdks/expired", server.handleDeleteExpiredCDKs)
 	server.mux.HandleFunc("PATCH /api/cdks/{code}", server.handleUpdateCDK)
 	server.mux.HandleFunc("DELETE /api/cdks/{code}", server.handleDeleteCDK)
 

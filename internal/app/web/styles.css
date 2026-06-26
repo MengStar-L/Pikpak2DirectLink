@@ -87,6 +87,59 @@ h1 { font-size: 22px; line-height: 1.2; font-weight: 800; }
 h2 { font-size: 19px; line-height: 1.25; font-weight: 800; letter-spacing: 0; }
 h3 { font-size: 15px; line-height: 1.25; font-weight: 800; }
 
+.boot-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2500;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(237, 243, 247, 0.84);
+  backdrop-filter: blur(8px);
+  animation: view-enter 0.24s var(--ease) both;
+}
+.boot-overlay.closing {
+  animation: view-exit 0.24s var(--ease) both;
+}
+.boot-overlay.closing .boot-card {
+  animation: modal-exit 0.24s var(--ease) both;
+}
+.boot-card {
+  width: min(360px, 100%);
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+  padding: 28px 26px;
+  border: 1px solid rgba(255, 255, 255, 0.82);
+  border-radius: var(--radius-lg);
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: var(--shadow-lift);
+  text-align: center;
+  animation: rise-in 0.28s var(--ease) both;
+}
+.boot-spinner {
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  border: 4px solid var(--primary-soft);
+  border-top-color: var(--primary);
+  border-right-color: var(--green);
+  animation: aria2-spin 0.9s linear infinite;
+}
+.boot-copy {
+  display: grid;
+  gap: 7px;
+}
+.boot-copy h2 {
+  font-size: 18px;
+}
+.boot-copy p {
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 750;
+  line-height: 1.45;
+}
+
 .app-shell {
   min-height: 100vh;
   display: grid;
@@ -1435,6 +1488,10 @@ button:disabled {
   .account-error-overlay,
   .account-error-overlay.closing,
   .account-error-overlay.closing .account-error-modal,
+  .boot-overlay,
+  .boot-overlay.closing,
+  .boot-overlay.closing .boot-card,
+  .boot-spinner,
   .resource-warning-overlay,
   .resource-warning-overlay.closing,
   .resource-warning-overlay.closing .resource-warning-modal,
@@ -1621,6 +1678,9 @@ button:disabled {
   align-items: start;
 }
 .cdk-form .status-error { grid-column: 1 / -1; margin-top: 0; }
+
+.cdk-list-toolbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+.cdk-list-toolbar:empty { display: none; }
 
 .cdk-list { display: grid; gap: 14px; }
 

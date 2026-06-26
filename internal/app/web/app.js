@@ -1,4 +1,5 @@
 const navButtons = Array.from(document.querySelectorAll('.nav-button[data-page]'));
+const bootOverlay = document.getElementById('bootOverlay');
 const resolvePage = document.getElementById('resolvePage');
 const accountsPage = document.getElementById('accountsPage');
 const logsPage = document.getElementById('logsPage');
@@ -79,6 +80,7 @@ const cdkDays = document.getElementById('cdkDays');
 const cdkGenSubmit = document.getElementById('cdkGenSubmit');
 const cdkGenError = document.getElementById('cdkGenError');
 const cdkList = document.getElementById('cdkList');
+const cdkPurgeExpired = document.getElementById('cdkPurgeExpired');
 const cdkPortalLink = document.getElementById('cdkPortalLink');
 const updateNavDot = document.getElementById('updateNavDot');
 const updateStatusPill = document.getElementById('updateStatusPill');
@@ -137,6 +139,15 @@ let selectionJobId = null;
 
 const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const BAD_RESOURCE_PARSE_MESSAGE = '该磁链连续遇到解析错误，请不要反复重试此链接。';
+const ADMIN_PAGE_STORAGE_KEY = 'pikpak2directlink.admin.currentPage';
+const adminPages = {
+  resolve: resolvePage,
+  accounts: accountsPage,
+  logs: logsPage,
+  update: updatePage,
+  settings: settingsPage,
+  cdk: cdkPage,
+};
 
 boot();
 
@@ -144,8 +155,12 @@ async function boot() {
   bindActions();
   mountAria2();
   clearJobUI();
-  await refreshAppState();
-  showPage('resolve');
+  const targetPage = loadAdminPage();
+  const ready = await refreshAppState();
+  if (!ready) return;
+
+  showPage(targetPage);
+  hideBootOverlay();
   if (state.authenticated) {
     startUpdateStatusPolling();
   }
@@ -223,24 +238,18 @@ function bindActions() {
   checkUpdateButton.addEventListener('click', onCheckUpdate);
   installUpdateButton.addEventListener('click', onInstallUpdate);
   cdkGenForm.addEventListener('submit', onGenerateCDKs);
+  cdkPurgeExpired?.addEventListener('click', onPurgeExpiredCDKs);
   directCopy.addEventListener('click', () => copyText(directValue.value, directCopy));
   proxyCopy.addEventListener('click', () => copyText(proxyValue.value, proxyCopy));
   resourceInput.addEventListener('input', detectLinkType);
 }
 
 function showPage(page) {
-  const pages = {
-    resolve: resolvePage,
-    accounts: accountsPage,
-    logs: logsPage,
-    update: updatePage,
-    settings: settingsPage,
-    cdk: cdkPage,
-  };
-  if (!pages[page]) return;
+  if (!adminPages[page]) return false;
 
   state.currentPage = page;
-  Object.entries(pages).forEach(([name, element]) => {
+  persistAdminPage(page);
+  Object.entries(adminPages).forEach(([name, element]) => {
     element.classList.toggle('active', name === page);
   });
   navButtons.forEach((button) => {
@@ -258,6 +267,48 @@ function showPage(page) {
   if (page === 'settings') {
     fetchSettings();
   }
+  return true;
+}
+
+function loadAdminPage() {
+  try {
+    const page = window.localStorage.getItem(ADMIN_PAGE_STORAGE_KEY);
+    return adminPages[page] ? page : 'resolve';
+  } catch {
+    return 'resolve';
+  }
+}
+
+function persistAdminPage(page) {
+  if (!adminPages[page]) return;
+  try {
+    window.localStorage.setItem(ADMIN_PAGE_STORAGE_KEY, page);
+  } catch {
+    // Private browsing or blocked storage should not break navigation.
+  }
+}
+
+function hideBootOverlay() {
+  if (!bootOverlay || bootOverlay.classList.contains('hidden') || bootOverlay.classList.contains('closing')) {
+    return;
+  }
+
+  const finish = () => {
+    bootOverlay.classList.add('hidden');
+    bootOverlay.classList.remove('closing');
+  };
+
+  if (prefersReducedMotion) {
+    finish();
+    return;
+  }
+
+  bootOverlay.classList.add('closing');
+  bootOverlay.addEventListener('animationend', function handler(event) {
+    if (event.target !== bootOverlay) return;
+    bootOverlay.removeEventListener('animationend', handler);
+    finish();
+  });
 }
 
 async function refreshAppState() {
@@ -269,7 +320,7 @@ async function refreshAppState() {
 
     if (config.auth_required && !config.authenticated) {
       redirectToGate();
-      return;
+      return false;
     }
 
     const accountPayload = await api('/api/accounts');
@@ -281,12 +332,14 @@ async function refreshAppState() {
     renderAuthUI();
     ensureLogPolling();
     ensureQueuePolling();
+    return true;
   } catch (error) {
     if (error.message.includes('authentication required')) {
       redirectToGate();
-      return;
+      return false;
     }
     showToast(error.message, 'error');
+    return true;
   }
 }
 
@@ -2158,6 +2211,29 @@ async function deleteCDK(code) {
     showToast('CDK 已删除', 'success');
   } catch (error) {
     showToast(error.message, 'error');
+  }
+}
+
+async function onPurgeExpiredCDKs() {
+  const expiredCount = state.cdks.filter((cdk) => cdk.expired).length;
+  if (expiredCount === 0) {
+    showToast('没有已过期的 CDK', 'info');
+    return;
+  }
+  if (!window.confirm(`确定删除全部 ${expiredCount} 个已过期 CDK 吗？此操作不可撤销。`)) return;
+
+  cdkPurgeExpired.disabled = true;
+  const original = getButtonLabel(cdkPurgeExpired);
+  setButtonLabel(cdkPurgeExpired, '清理中...');
+  try {
+    const payload = await api('/api/cdks/expired', { method: 'DELETE' });
+    await fetchCDKs();
+    showToast(`已清理 ${payload.deleted || 0} 个过期 CDK`, 'success');
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    cdkPurgeExpired.disabled = false;
+    setButtonLabel(cdkPurgeExpired, original);
   }
 }
 

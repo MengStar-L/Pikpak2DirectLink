@@ -111,6 +111,16 @@
     </symbol>
   </svg>
 
+  <div id="bootOverlay" class="boot-overlay" role="status" aria-live="polite">
+    <div class="boot-card">
+      <div class="boot-spinner" aria-hidden="true"></div>
+      <div class="boot-copy">
+        <h2>信息加载中</h2>
+        <p>正在同步账号与系统状态</p>
+      </div>
+    </div>
+  </div>
+
   <div class="app-shell">
     <aside class="sidebar" aria-label="主导航">
       <div class="brand-mark" title="PikPak 直链工具" aria-hidden="true">
@@ -553,6 +563,12 @@
           </form>
         </section>
 
+        <div class="cdk-list-toolbar">
+          <button id="cdkPurgeExpired" type="button" class="danger-button compact">
+            <svg class="ui-icon"><use href="#icon-trash"></use></svg>
+            <span class="button-label">清理过期 CDK</span>
+          </button>
+        </div>
         <div id="cdkList" class="cdk-list"></div>
       </section>
     </main>

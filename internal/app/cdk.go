@@ -246,6 +246,17 @@ func (s *cdkStore) delete(code string) (bool, error) {
 	return n > 0, nil
 }
 
+// deleteExpired removes every CDK whose expiry is at or before now, returning
+// how many were deleted.
+func (s *cdkStore) deleteExpired(now time.Time) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM cdks WHERE expires_at<=?`, now.Unix())
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // hasTraffic validates that a CDK exists, is not expired, and still has traffic
 // remaining, without mutating it. Charging happens later (at resolve success)
 // once the resource size is known. Returns a typed error otherwise.

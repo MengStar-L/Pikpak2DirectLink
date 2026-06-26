@@ -1,8 +1,10 @@
 package app
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -178,6 +180,89 @@ func TestCDKUpdateAndDelete(t *testing.T) {
 	}
 	if _, ok, _ := store.get(code); ok {
 		t.Fatalf("expected code to be gone after delete")
+	}
+}
+
+func TestCDKDeleteExpired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	store := newTestCDKStore(t)
+
+	// Two already-expired (created far in the past, short window) and one live.
+	past := now.Add(-40 * 24 * time.Hour)
+	if _, err := store.createBatch(2, 5*bytesPerGB, 10, past); err != nil {
+		t.Fatalf("create expired: %v", err)
+	}
+	live, err := store.createBatch(1, 5*bytesPerGB, 30, now)
+	if err != nil {
+		t.Fatalf("create live: %v", err)
+	}
+
+	deleted, err := store.deleteExpired(now)
+	if err != nil {
+		t.Fatalf("deleteExpired: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("expected 2 expired deleted, got %d", deleted)
+	}
+
+	remaining, err := store.list()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].Code != live[0].Code {
+		t.Fatalf("expected only the live CDK to remain, got %+v", remaining)
+	}
+
+	// A second purge with nothing expired removes nothing.
+	again, err := store.deleteExpired(now)
+	if err != nil || again != 0 {
+		t.Fatalf("second purge: deleted=%d err=%v", again, err)
+	}
+}
+
+func TestHandleDeleteExpiredCDKs(t *testing.T) {
+	srv := newTestServer(t)
+	handler := srv.Handler()
+
+	past := time.Now().Add(-72 * time.Hour)
+	if _, err := srv.cdk.createBatch(2, 5*bytesPerGB, 1, past); err != nil {
+		t.Fatalf("create expired: %v", err)
+	}
+	live, err := srv.cdk.createBatch(1, 5*bytesPerGB, 30, time.Now())
+	if err != nil {
+		t.Fatalf("create live: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/cdks/expired", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated purge: expected 401, got %d", rec.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/cdks/expired", nil)
+	req.AddCookie(&http.Cookie{Name: "session", Value: srv.authSessions.create()})
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("purge: expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Deleted int64 `json:"deleted"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Deleted != 2 {
+		t.Fatalf("expected 2 expired CDKs deleted, got %d", payload.Deleted)
+	}
+
+	remaining, err := srv.cdk.list()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].Code != live[0].Code {
+		t.Fatalf("expected only the live CDK to remain, got %+v", remaining)
 	}
 }
 
