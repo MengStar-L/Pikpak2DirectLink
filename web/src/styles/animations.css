@@ -1,0 +1,119 @@
+/* ───────────────────────────────────────────────────────────────────────────
+   Motion — keyframes + Vue <Transition> presets.
+   Pervasive but quiet: reveals, hairline draws, the travelling signal,
+   hover lifts. Everything short (130–380ms) and on one easing family.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+/* reveals ----------------------------------------------------------------- */
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+/* a hairline rule drawing itself in from the left */
+@keyframes draw-x {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+
+/* spinner */
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── the signature: signal flow ──────────────────────────────────────────── */
+/* a luminous dot travelling a track while a job resolves */
+@keyframes signal-travel {
+  0%   { left: 0%; }
+  100% { left: 100%; }
+}
+/* a soft highlight sweeping the active segment */
+@keyframes signal-sheen {
+  0%   { background-position: -160% 0; }
+  100% { background-position: 260% 0; }
+}
+/* the live amber pip, breathing */
+@keyframes live-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--live-line); }
+  50%      { box-shadow: 0 0 0 5px rgba(232, 146, 12, 0); }
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
+/* skeleton shimmer */
+@keyframes shimmer {
+  0%   { background-position: -420px 0; }
+  100% { background-position: 420px 0; }
+}
+
+/* toast slide */
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(16px) scale(0.98); }
+  to   { opacity: 1; transform: translateX(0) scale(1); }
+}
+
+/* utility animation classes ----------------------------------------------- */
+.anim-rise { animation: rise-in var(--t-slow) var(--ease-out) both; }
+.anim-fade { animation: fade-in var(--t-slow) var(--ease) both; }
+.anim-pop  { animation: pop-in var(--t) var(--spring) both; }
+.spin      { animation: spin 0.7s linear infinite; }
+
+/* Staggered mount: children rise in sequence. Set --i on each child, or rely
+   on nth-child for the first several. */
+.rise-seq > * {
+  animation: rise-in var(--t-slow) var(--ease-out) both;
+  animation-delay: calc(var(--i, 0) * 60ms);
+}
+.rise-seq > *:nth-child(1) { --i: 0; }
+.rise-seq > *:nth-child(2) { --i: 1; }
+.rise-seq > *:nth-child(3) { --i: 2; }
+.rise-seq > *:nth-child(4) { --i: 3; }
+.rise-seq > *:nth-child(5) { --i: 4; }
+.rise-seq > *:nth-child(6) { --i: 5; }
+
+/* Vue <Transition> presets ------------------------------------------------ */
+.v-fade-enter-active,
+.v-fade-leave-active {
+  transition: opacity var(--t) var(--ease), transform var(--t) var(--ease);
+}
+.v-fade-enter-from,
+.v-fade-leave-to { opacity: 0; transform: translateY(6px); }
+
+/* page / tab swap */
+.v-swap-enter-active { transition: opacity var(--t) var(--ease-out), transform var(--t) var(--ease-out); }
+.v-swap-leave-active { transition: opacity var(--t-fast) var(--ease), transform var(--t-fast) var(--ease); }
+.v-swap-enter-from { opacity: 0; transform: translateY(8px); }
+.v-swap-leave-to   { opacity: 0; transform: translateY(-4px); }
+
+/* a panel rising into place */
+.v-rise-enter-active { transition: opacity var(--t-slow) var(--ease-out), transform var(--t-slow) var(--ease-out); }
+.v-rise-leave-active { transition: opacity var(--t-fast) var(--ease), transform var(--t-fast) var(--ease); }
+.v-rise-enter-from { opacity: 0; transform: translateY(12px); }
+.v-rise-leave-to   { opacity: 0; transform: translateY(-6px); }
+
+/* modal pop */
+.v-pop-enter-active { transition: opacity var(--t) var(--ease), transform var(--t) var(--spring); }
+.v-pop-leave-active { transition: opacity var(--t-fast) var(--ease), transform var(--t-fast) var(--ease); }
+.v-pop-enter-from,
+.v-pop-leave-to { opacity: 0; transform: scale(0.95) translateY(6px); }
+
+/* backdrop */
+.v-veil-enter-active,
+.v-veil-leave-active { transition: opacity var(--t) var(--ease); }
+.v-veil-enter-from,
+.v-veil-leave-to { opacity: 0; }
+
+/* list transitions (results, accounts, cdks, logs) */
+.v-list-enter-active { transition: opacity var(--t-slow) var(--ease-out), transform var(--t-slow) var(--ease-out); }
+.v-list-leave-active { transition: opacity var(--t-fast) var(--ease), transform var(--t-fast) var(--ease); position: absolute; width: 100%; }
+.v-list-enter-from { opacity: 0; transform: translateY(10px); }
+.v-list-leave-to   { opacity: 0; transform: translateY(-6px); }
+.v-list-move { transition: transform var(--t-slow) var(--ease); }

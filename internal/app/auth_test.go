@@ -86,8 +86,8 @@ func TestGateBlocksAppForUnauthenticated(t *testing.T) {
 	srv := newTestServer(t)
 	handler := srv.Handler()
 
-	// The app shell and its script must never reach an unauthenticated client.
-	// (/styles.css is intentionally public so the CDK user portal can render.)
+	// The app shell must never reach an unauthenticated client. (The hashed
+	// /assets/* bundles are public so the gate and user portal can render.)
 	for _, path := range []string{"/", "/app.js", "/anything"} {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
@@ -142,13 +142,17 @@ func TestSetupThenLoginFlow(t *testing.T) {
 	}
 	cookie := sessionCookie(t, rec.Result().Cookies())
 
-	// the session cookie now unlocks the app shell.
+	// the session cookie now unlocks the app shell. The admin shell is a
+	// client-rendered Vue entry, so its static HTML only carries the mount
+	// point and the bundled asset references — it must not be the gate page.
 	rec = httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.AddCookie(cookie)
 	handler.ServeHTTP(rec, req)
-	if !strings.Contains(rec.Body.String(), "resolveForm") {
-		t.Fatal("authenticated request should receive the app shell")
+	if rec.Code != http.StatusOK ||
+		!strings.Contains(rec.Body.String(), `<div id="app"`) ||
+		strings.Contains(rec.Body.String(), "访问验证") {
+		t.Fatalf("authenticated request should receive the app shell, got %d", rec.Code)
 	}
 
 	// setup is closed once a password exists.
@@ -341,10 +345,11 @@ func TestCDKAdminGatedUserPortalPublic(t *testing.T) {
 		t.Fatalf("expected 401 for unauthenticated /api/cdks, got %d", rec.Code)
 	}
 
-	// The user portal page is reachable without the admin session.
+	// The user portal page is reachable without the admin session. It is a
+	// client-rendered Vue entry whose static HTML carries the "用户" title.
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/u", nil))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "CDK") {
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "用户") {
 		t.Fatalf("expected the user portal page at /u, got %d", rec.Code)
 	}
 

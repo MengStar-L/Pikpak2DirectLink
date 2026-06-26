@@ -21,7 +21,7 @@ import (
 	"pikpak2directlink/internal/pikpak"
 )
 
-//go:embed web/*
+//go:embed web/dist
 var webFS embed.FS
 
 type Server struct {
@@ -93,7 +93,7 @@ type changePasswordRequest struct {
 }
 
 func NewServer(cfg Config) (*Server, error) {
-	staticFiles, err := fs.Sub(webFS, "web")
+	staticFiles, err := fs.Sub(webFS, "web/dist")
 	if err != nil {
 		return nil, err
 	}
@@ -183,14 +183,12 @@ func NewServer(cfg Config) (*Server, error) {
 	server.resolver = newResolveQueue(serialTimeout, parallelTimeout, initialConcurrency, server.failJob)
 	go server.resolver.run()
 
-	server.mux.Handle("GET /app.js", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		serveEmbeddedFile(w, r, staticFiles, "app.js", "application/javascript; charset=utf-8")
-	}))
-	server.mux.Handle("GET /aria2.js", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		serveEmbeddedFile(w, r, staticFiles, "aria2.js", "application/javascript; charset=utf-8")
-	}))
-	server.mux.Handle("GET /styles.css", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		serveEmbeddedFile(w, r, staticFiles, "styles.css", "text/css; charset=utf-8")
+	// Vite-built assets live under /assets/* (content-hashed filenames, so they
+	// can be cached aggressively). The HTML entry points are served on demand.
+	assetServer := http.FileServer(http.FS(staticFiles))
+	server.mux.Handle("GET /assets/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		assetServer.ServeHTTP(w, r)
 	}))
 	server.mux.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serveEmbeddedFile(w, r, staticFiles, "index.html", "text/html; charset=utf-8")
@@ -227,12 +225,6 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Public CDK user portal. The handlers enforce CDK validity themselves.
 	server.mux.Handle("GET /u", http.HandlerFunc(server.handleUserPortal))
-	server.mux.Handle("GET /u/app.js", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		serveEmbeddedFile(w, r, staticFiles, "user.js", "application/javascript; charset=utf-8")
-	}))
-	server.mux.Handle("GET /u/aria2.js", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		serveEmbeddedFile(w, r, staticFiles, "aria2.js", "application/javascript; charset=utf-8")
-	}))
 	server.mux.HandleFunc("POST /api/u/login", server.handleUserLogin)
 	server.mux.HandleFunc("GET /api/u/status", server.handleUserStatus)
 	server.mux.HandleFunc("POST /api/u/logout", server.handleUserLogout)
@@ -287,7 +279,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		if path == "/api/auth/status" ||
 			path == "/api/auth/setup" ||
 			path == "/api/auth/login" ||
-			path == "/styles.css" ||
+			strings.HasPrefix(path, "/assets/") ||
 			path == "/u" ||
 			strings.HasPrefix(path, "/u/") ||
 			strings.HasPrefix(path, "/api/u/") ||

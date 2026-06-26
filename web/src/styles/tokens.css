@@ -1,0 +1,121 @@
+/* ───────────────────────────────────────────────────────────────────────────
+   「Signal」design tokens — a light precision-instrument console.
+   Porcelain canvas · ink text · teal brand · amber "live" · mono readouts.
+   No gradients, no glow, no glass. Compact by intent.
+   ─────────────────────────────────────────────────────────────────────────── */
+:root {
+  color-scheme: light;
+
+  /* fonts ------------------------------------------------------------------ */
+  --font-ui: "Segoe UI", system-ui, -apple-system, "PingFang SC",
+    "Microsoft YaHei", "Hiragino Sans GB", sans-serif;
+  --font-display: "Space Grotesk Variable", var(--font-ui);
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo,
+    Consolas, monospace;
+
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+
+  /* surfaces --------------------------------------------------------------- */
+  --canvas: #eaeef0;        /* page background — cool porcelain            */
+  --canvas-2: #e3e8eb;      /* recessed grooves / inset tracks             */
+  --panel: #ffffff;         /* instrument cards                            */
+  --panel-2: #f7f9fb;       /* nested surfaces, table rows                 */
+  --panel-3: #eef2f5;       /* hover row / quiet fill                      */
+
+  /* ink -------------------------------------------------------------------- */
+  --ink: #222934;           /* primary text                                */
+  --ink-2: #59636f;         /* secondary text                              */
+  --ink-3: #8b95a1;         /* muted / captions                            */
+  --ink-on: #ffffff;        /* text on brand                               */
+
+  /* hairlines -------------------------------------------------------------- */
+  --line: #dce3e8;          /* 1px separators                              */
+  --line-2: #c8d2d9;        /* stronger edge / inputs                      */
+
+  /* brand — teal ----------------------------------------------------------- */
+  --brand: #0e8c7f;
+  --brand-strong: #0b6e64;  /* hover / pressed                             */
+  --brand-ink: #0a5a52;     /* teal text on light                          */
+  --brand-soft: rgba(14, 140, 127, 0.1);
+  --brand-soft-2: rgba(14, 140, 127, 0.16);
+  --brand-line: rgba(14, 140, 127, 0.32);
+
+  /* live — amber (running / active signal) --------------------------------- */
+  --live: #e8920c;
+  --live-ink: #9a5d00;
+  --live-soft: rgba(232, 146, 12, 0.12);
+  --live-line: rgba(232, 146, 12, 0.34);
+
+  /* status ----------------------------------------------------------------- */
+  --ok: #15a06a;
+  --ok-soft: rgba(21, 160, 106, 0.12);
+  --ok-line: rgba(21, 160, 106, 0.3);
+  --warn: #e8920c;
+  --warn-soft: rgba(232, 146, 12, 0.12);
+  --danger: #e5484d;
+  --danger-ink: #b4292d;
+  --danger-soft: rgba(229, 72, 77, 0.11);
+  --danger-line: rgba(229, 72, 77, 0.32);
+  --info: #3a7bd5;
+  --info-soft: rgba(58, 123, 213, 0.12);
+
+  /* shadows — soft, low, never glowing ------------------------------------- */
+  --shadow-xs: 0 1px 2px rgba(20, 30, 40, 0.05), 0 1px 1px rgba(20, 30, 40, 0.04);
+  --shadow-sm: 0 2px 6px -2px rgba(20, 30, 40, 0.1), 0 1px 2px rgba(20, 30, 40, 0.06);
+  --shadow-md: 0 10px 26px -14px rgba(20, 30, 40, 0.22), 0 2px 6px -3px rgba(20, 30, 40, 0.1);
+  --shadow-pop: 0 24px 56px -22px rgba(20, 30, 40, 0.34), 0 6px 16px -8px rgba(20, 30, 40, 0.16);
+  --ring: 0 0 0 3px rgba(14, 140, 127, 0.2);
+  --ring-danger: 0 0 0 3px rgba(229, 72, 77, 0.18);
+
+  /* radius — compact ------------------------------------------------------- */
+  --r-xs: 5px;
+  --r-sm: 7px;
+  --r-md: 9px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-pill: 999px;
+
+  /* spacing (4px base) ----------------------------------------------------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+
+  /* type scale — small & precise ------------------------------------------- */
+  --fs-2xs: 10.5px;   /* mono eyebrows / micro labels                       */
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-md: 13.5px;    /* body base                                          */
+  --fs-lg: 15px;
+  --fs-xl: 17px;
+  --fs-2xl: 20px;
+  --fs-3xl: 26px;     /* big mono readouts                                  */
+  --fs-display: 32px;
+
+  --fw-reg: 400;
+  --fw-med: 500;
+  --fw-semi: 600;
+  --fw-bold: 700;
+
+  --tracking-eyebrow: 0.14em;
+
+  /* motion ----------------------------------------------------------------- */
+  --ease: cubic-bezier(0.22, 0.85, 0.3, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --spring: cubic-bezier(0.34, 1.4, 0.5, 1);
+  --t-fast: 130ms;
+  --t: 200ms;
+  --t-slow: 380ms;
+
+  /* layout ----------------------------------------------------------------- */
+  --rail-w: 58px;
+  --maxw: 1200px;
+}
