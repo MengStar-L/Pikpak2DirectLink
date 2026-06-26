@@ -13,17 +13,20 @@ import ResultList from './components/ResultList.vue'
 import ToastHost from './components/ToastHost.vue'
 import Aria2ConfigModal from './components/Aria2ConfigModal.vue'
 import Aria2PushOverlay from './components/Aria2PushOverlay.vue'
+import Aria2PushChoiceModal from './components/Aria2PushChoiceModal.vue'
 import { api, setUnauthorizedHandler } from './lib/api'
 import { useJob } from './composables/useJob'
 import { aria2 } from './composables/useAria2'
 import { toast } from './composables/useToast'
-import type { UserStatusResponse } from './lib/types'
+import type { JobResult, UserStatusResponse } from './lib/types'
 
 const view = ref<'gate' | 'portal'>('gate')
 const status = ref<UserStatusResponse | null>(null)
 const cdkInput = ref('')
 const cdkError = ref('')
 const cdkLoading = ref(false)
+const pushChoiceOpen = ref(false)
+const pushChoiceResults = ref<JobResult[]>([])
 
 const { job, phase, error, submitting, submit, selectItems } = useJob({
   create: (b) => api.u.jobs.create(b),
@@ -98,8 +101,29 @@ function confirmSelection() {
 function onPush(p: { url: string; name: string }) {
   aria2.pushOne(p.url, p.name)
 }
+function canChoosePushKind(list: JobResult[]) {
+  return Boolean(status.value?.allow_proxy) && list.length > 0 && list.every((r) => r.direct_url && r.proxy_url)
+}
+function pushManyAs(kind: 'direct' | 'proxy', list: JobResult[]) {
+  aria2.pushMany(list.map((r) => ({ url: kind === 'proxy' ? r.proxy_url : r.direct_url, name: r.file.name })))
+}
 function pushAll() {
-  aria2.pushMany(results.value.map((r) => ({ url: r.url || r.direct_url || r.proxy_url, name: r.file.name })))
+  const list = results.value
+  if (canChoosePushKind(list)) {
+    pushChoiceResults.value = list
+    pushChoiceOpen.value = true
+    return
+  }
+  pushManyAs('direct', list)
+}
+function closePushChoice() {
+  pushChoiceOpen.value = false
+  pushChoiceResults.value = []
+}
+function choosePushKind(kind: 'direct' | 'proxy') {
+  const list = [...pushChoiceResults.value]
+  closePushChoice()
+  pushManyAs(kind, list)
 }
 
 onMounted(loadStatus)
@@ -110,6 +134,13 @@ onMounted(loadStatus)
   <ToastHost />
   <Aria2ConfigModal />
   <Aria2PushOverlay />
+  <Aria2PushChoiceModal
+    :open="pushChoiceOpen"
+    :count="pushChoiceResults.length"
+    :show-proxy="Boolean(status?.allow_proxy)"
+    @select="choosePushKind"
+    @close="closePushChoice"
+  />
 
   <Transition name="v-fade" mode="out-in">
     <!-- CDK gate -->

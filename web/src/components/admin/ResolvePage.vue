@@ -7,10 +7,12 @@ import ResolveForm from '../ResolveForm.vue'
 import JobStatus from '../JobStatus.vue'
 import FileTree from '../FileTree.vue'
 import ResultList from '../ResultList.vue'
+import Aria2PushChoiceModal from '../Aria2PushChoiceModal.vue'
 import { api } from '../../lib/api'
 import { useJob } from '../../composables/useJob'
 import { aria2 } from '../../composables/useAria2'
 import { toast } from '../../composables/useToast'
+import type { JobResult } from '../../lib/types'
 
 const { job, phase, error, submitting, submit, selectItems } = useJob({
   create: (b) => api.jobs.create(b),
@@ -19,6 +21,8 @@ const { job, phase, error, submitting, submit, selectItems } = useJob({
 })
 
 const selectedIds = ref<string[]>([])
+const pushChoiceOpen = ref(false)
+const pushChoiceResults = ref<JobResult[]>([])
 const needSelection = computed(() => phase.value === 'selection_required' && job.value?.items?.length)
 const results = computed(() => {
   const j = job.value
@@ -39,8 +43,29 @@ function confirmSelection() {
 function onPush(p: { url: string; name: string }) {
   aria2.pushOne(p.url, p.name)
 }
+function canChoosePushKind(list: JobResult[]) {
+  return list.length > 0 && list.every((r) => r.direct_url && r.proxy_url)
+}
+function pushManyAs(kind: 'direct' | 'proxy', list: JobResult[]) {
+  aria2.pushMany(list.map((r) => ({ url: kind === 'proxy' ? r.proxy_url : r.direct_url, name: r.file.name })))
+}
 function pushAll() {
-  aria2.pushMany(results.value.map((r) => ({ url: r.url || r.direct_url || r.proxy_url, name: r.file.name })))
+  const list = results.value
+  if (canChoosePushKind(list)) {
+    pushChoiceResults.value = list
+    pushChoiceOpen.value = true
+    return
+  }
+  pushManyAs('direct', list)
+}
+function closePushChoice() {
+  pushChoiceOpen.value = false
+  pushChoiceResults.value = []
+}
+function choosePushKind(kind: 'direct' | 'proxy') {
+  const list = [...pushChoiceResults.value]
+  closePushChoice()
+  pushManyAs(kind, list)
 }
 </script>
 
@@ -87,6 +112,13 @@ function pushAll() {
         <ResultList :results="results" show-push @push="onPush" />
       </GlassCard>
     </Transition>
+    <Aria2PushChoiceModal
+      :open="pushChoiceOpen"
+      :count="pushChoiceResults.length"
+      show-proxy
+      @select="choosePushKind"
+      @close="closePushChoice"
+    />
   </div>
 </template>
 
