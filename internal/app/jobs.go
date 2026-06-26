@@ -113,21 +113,21 @@ type ShareState struct {
 }
 
 type Job struct {
-	ID              string       `json:"id"`
-	Kind            ResourceKind `json:"kind"`
-	Mode            string       `json:"mode"`
-	Input           string       `json:"input"`
-	PassCode        string       `json:"pass_code,omitempty"`
-	Status          JobStatus    `json:"status"`
-	Stage           JobStage     `json:"stage"`
-	Message         string       `json:"message,omitempty"`
-	Error           string       `json:"error,omitempty"`
-	BaseURL         string       `json:"-"`
-	FolderID        string       `json:"-"`
-	CDKCode         string       `json:"-"`
-	AccountID       string       `json:"account_id,omitempty"`
-	Share           *ShareState  `json:"share,omitempty"`
-	Items           []DownloadItem
+	ID              string           `json:"id"`
+	Kind            ResourceKind     `json:"kind"`
+	Mode            string           `json:"mode"`
+	Input           string           `json:"input"`
+	PassCode        string           `json:"pass_code,omitempty"`
+	Status          JobStatus        `json:"status"`
+	Stage           JobStage         `json:"stage"`
+	Message         string           `json:"message,omitempty"`
+	Error           string           `json:"error,omitempty"`
+	BaseURL         string           `json:"-"`
+	FolderID        string           `json:"-"`
+	CDKCode         string           `json:"-"`
+	AccountID       string           `json:"account_id,omitempty"`
+	Share           *ShareState      `json:"share,omitempty"`
+	Items           []DownloadItem   `json:"items,omitempty"`
 	AccountAttempts []AccountAttempt `json:"account_attempts,omitempty"`
 	Result          *JobResult       `json:"result,omitempty"`
 	Results         []JobResult      `json:"results,omitempty"`

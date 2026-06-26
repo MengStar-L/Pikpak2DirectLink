@@ -1,6 +1,38 @@
 package app
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestJobJSONUsesLowercaseItems(t *testing.T) {
+	t.Parallel()
+
+	data, err := json.Marshal(Job{
+		ID:     "job-1",
+		Kind:   ResourceShare,
+		Status: JobSelectionRequired,
+		Items: []DownloadItem{{
+			ID:   "file-1",
+			Name: "file.mkv",
+			Path: "folder/file.mkv",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal job: %v", err)
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if _, ok := payload["items"]; !ok {
+		t.Fatalf("payload missing lowercase items field: %s", data)
+	}
+	if _, ok := payload["Items"]; ok {
+		t.Fatalf("payload should not contain uppercase Items field: %s", data)
+	}
+}
 
 func TestDetectResourceKind(t *testing.T) {
 	t.Parallel()

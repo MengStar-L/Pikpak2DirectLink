@@ -538,9 +538,15 @@
                 <p>生成兑换码，用户凭码进入用户页面使用解析功能</p>
               </div>
             </div>
-            <a id="cdkPortalLink" class="secondary-link compact" href="/u" target="_blank" rel="noreferrer noopener">
-              <svg class="ui-icon"><use href="#icon-open"></use></svg>用户入口
-            </a>
+            <div class="cdk-head-actions">
+              <a id="cdkPortalLink" class="secondary-link compact" href="/u" target="_blank" rel="noreferrer noopener">
+                <svg class="ui-icon"><use href="#icon-open"></use></svg>用户入口
+              </a>
+              <button id="cdkPurgeExpired" type="button" class="danger-button compact">
+                <svg class="ui-icon"><use href="#icon-trash"></use></svg>
+                <span class="button-label">清理过期 CDK</span>
+              </button>
+            </div>
           </div>
           <form id="cdkGenForm" class="cdk-form">
             <label class="field floating">
@@ -563,12 +569,6 @@
           </form>
         </section>
 
-        <div class="cdk-list-toolbar">
-          <button id="cdkPurgeExpired" type="button" class="danger-button compact">
-            <svg class="ui-icon"><use href="#icon-trash"></use></svg>
-            <span class="button-label">清理过期 CDK</span>
-          </button>
-        </div>
         <div id="cdkList" class="cdk-list"></div>
       </section>
     </main>

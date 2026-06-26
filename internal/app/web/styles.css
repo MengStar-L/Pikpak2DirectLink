@@ -788,9 +788,14 @@ button:disabled {
   border-radius: 18px;
   background: #fff;
   box-shadow: 0 10px 28px rgba(31, 46, 76, 0.04);
-  animation: rise-in 300ms var(--ease) both;
   transition: border-color 170ms var(--ease), box-shadow 170ms var(--ease), transform 170ms var(--ease);
 }
+
+.selection-item,
+.account-card {
+  animation: rise-in 300ms var(--ease) both;
+}
+
 .attempt-item:hover,
 .selection-item:hover,
 .account-card:hover {
@@ -1671,6 +1676,14 @@ button:disabled {
 
 
 /* --- CDK distribution --- */
+.cdk-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .cdk-form {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
@@ -1678,9 +1691,6 @@ button:disabled {
   align-items: start;
 }
 .cdk-form .status-error { grid-column: 1 / -1; margin-top: 0; }
-
-.cdk-list-toolbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
-.cdk-list-toolbar:empty { display: none; }
 
 .cdk-list { display: grid; gap: 14px; }
 
@@ -1995,8 +2005,7 @@ button:focus-visible,
 }
 
 .selection-item::after,
-.account-card.success::after,
-.attempt-item.success::after {
+.account-card.success::after {
   content: "";
   grid-column: 1 / -1;
   height: 8px;
