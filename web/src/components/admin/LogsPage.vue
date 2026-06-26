@@ -12,12 +12,18 @@ const listEl = ref<HTMLElement | null>(null)
 let lastId = 0
 let timer: number | undefined
 let stopped = false
+let primed = false
 
 const levelIcon: Record<LogLevel, any> = {
   info: Info,
   success: CheckCircle2,
   warn: AlertTriangle,
   error: XCircle,
+}
+
+function scrollToBottom(smooth = true) {
+  const el = listEl.value
+  if (el) el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
 }
 
 async function poll() {
@@ -29,7 +35,12 @@ async function poll() {
       logs.value.push(...entries)
       if (logs.value.length > 300) logs.value = logs.value.slice(-300)
       await nextTick()
-      listEl.value?.scrollTo({ top: listEl.value.scrollHeight, behavior: 'smooth' })
+      scrollToBottom(primed) // first load: jump instantly; afterwards: smooth
+    }
+    if (!primed) {
+      primed = true
+      await nextTick()
+      requestAnimationFrame(() => scrollToBottom(false))
     }
   } catch { /* ignore transient */ }
   timer = window.setTimeout(poll, 1500)
@@ -78,7 +89,7 @@ onUnmounted(() => { stopped = true; if (timer) clearTimeout(timer) })
 <style scoped>
 .sec-head.mb { margin-bottom: 14px; }
 .eyebrow { display: block; margin-bottom: 2px; }
-.console { min-height: 100%; display: flex; flex-direction: column; }
+.console { height: 100%; display: flex; flex-direction: column; }
 .log-list {
   flex: 1 1 auto; min-height: 0; overflow-y: auto;
   border-radius: var(--r-md);
@@ -102,7 +113,7 @@ onUnmounted(() => { stopped = true; if (timer) clearTimeout(timer) })
 .empty { font-family: var(--font-ui); }
 
 @media (max-width: 720px) {
-  .console { min-height: 0; }
+  .console { height: auto; }
   .log-list { flex: none; max-height: 60vh; }
 }
 </style>
