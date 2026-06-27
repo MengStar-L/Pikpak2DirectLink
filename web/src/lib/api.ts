@@ -12,6 +12,8 @@ import type {
   CreateJobRequest,
   Job,
   LogEntry,
+  ResolveHistoryDetail,
+  ResolveHistorySummary,
   SelectItemsRequest,
   SettingsResponse,
   UpdateCDKRequest,
@@ -137,6 +139,10 @@ export const api = {
       get: (id: string) => request<UserJobView>('GET', `/api/u/jobs/${id}`),
       select: (id: string, body: SelectItemsRequest) =>
         request<UserJobView>('POST', `/api/u/jobs/${id}/select`, body),
+    },
+    history: {
+      list: () => request<{ history: ResolveHistorySummary[] }>('GET', '/api/u/history'),
+      get: (id: string) => request<ResolveHistoryDetail>('GET', `/api/u/history/${encodeURIComponent(id)}`),
     },
   },
 }

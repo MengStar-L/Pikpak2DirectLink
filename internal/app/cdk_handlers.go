@@ -604,19 +604,20 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job := &Job{
-		ID:        newJobID(),
-		Kind:      kind,
-		Mode:      req.Mode,
-		Input:     req.Input,
-		PassCode:  req.PassCode,
-		Status:    JobQueued,
-		Stage:     StageTransfer,
-		Message:   "queued",
-		BaseURL:   s.baseURL(r),
-		CDKCode:   c.Code,
-		Share:     share,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		ID:            newJobID(),
+		Kind:          kind,
+		Mode:          req.Mode,
+		Input:         req.Input,
+		OriginalInput: rawInput,
+		PassCode:      req.PassCode,
+		Status:        JobQueued,
+		Stage:         StageTransfer,
+		Message:       "queued",
+		BaseURL:       s.baseURL(r),
+		CDKCode:       c.Code,
+		Share:         share,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
 	}
 
 	s.jobs.create(job)
@@ -644,6 +645,42 @@ func (s *Server) handleUserGetJob(w http.ResponseWriter, r *http.Request) {
 	view := toUserJobView(job)
 	view.QueueAhead = s.resolver.position(job.ID)
 	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) handleUserHistoryList(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.currentCDK(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "CDK 无效或已过期")
+		return
+	}
+	now := s.now()
+	s.cleanupResolveHistory(now)
+	history, err := s.history.list(c.Code, now)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"history": history})
+}
+
+func (s *Server) handleUserHistoryGet(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.currentCDK(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "CDK 无效或已过期")
+		return
+	}
+	now := s.now()
+	s.cleanupResolveHistory(now)
+	detail, ok, err := s.history.get(c.Code, r.PathValue("id"), now)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "history not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
 }
 
 // selectItemsRequest carries the CDK-user multi-select payload. item_ids is the

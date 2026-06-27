@@ -66,6 +66,7 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 
 	specs := make([]childSpec, 0, len(lines))
 	cleanLines := make([]string, 0, len(lines))
+	rawLines := make([]string, 0, len(lines))
 	for i, line := range lines {
 		kind, err := detectResourceKind(line.clean)
 		if err != nil {
@@ -83,23 +84,25 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 		}
 		specs = append(specs, spec)
 		cleanLines = append(cleanLines, line.clean)
+		rawLines = append(rawLines, line.raw)
 	}
 
 	now := time.Now()
 	parentID := newJobID()
 	parent := &Job{
-		ID:        parentID,
-		Kind:      ResourceBatch,
-		Mode:      mode,
-		Input:     strings.Join(cleanLines, "\n"),
-		Status:    JobRunning,
-		Stage:     StageTransfer,
-		Message:   fmt.Sprintf("解析中：0/%d 条完成", len(specs)),
-		BaseURL:   baseURL,
-		CDKCode:   cdkCode,
-		Batch:     &BatchProgress{Total: len(specs)},
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:            parentID,
+		Kind:          ResourceBatch,
+		Mode:          mode,
+		Input:         strings.Join(cleanLines, "\n"),
+		OriginalInput: strings.Join(rawLines, "\n"),
+		Status:        JobRunning,
+		Stage:         StageTransfer,
+		Message:       fmt.Sprintf("解析中：0/%d 条完成", len(specs)),
+		BaseURL:       baseURL,
+		CDKCode:       cdkCode,
+		Batch:         &BatchProgress{Total: len(specs)},
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 	s.jobs.create(parent)
 
@@ -224,6 +227,7 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 	if final {
 		s.removeBatch(parentID)
 		s.logJob(LogSuccess, parentID, fmt.Sprintf("批量解析完成，成功 %d/%d 条", succeeded, total))
+		s.saveCDKHistory(parentID)
 	}
 }
 

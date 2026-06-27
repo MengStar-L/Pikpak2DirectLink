@@ -117,6 +117,7 @@ type Job struct {
 	Kind            ResourceKind     `json:"kind"`
 	Mode            string           `json:"mode"`
 	Input           string           `json:"input"`
+	OriginalInput   string           `json:"-"`
 	PassCode        string           `json:"pass_code,omitempty"`
 	Status          JobStatus        `json:"status"`
 	Stage           JobStage         `json:"stage"`

@@ -2,6 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import {
   Ticket, LogOut, Gauge, CalendarClock, Hourglass, Link2, Files, CheckCheck, Settings2, Send, Radar, Waypoints,
+  History, ArrowLeft, RefreshCw, Inbox,
 } from 'lucide-vue-next'
 import AuroraBg from './components/AuroraBg.vue'
 import GlassCard from './components/GlassCard.vue'
@@ -18,7 +19,8 @@ import { api, setUnauthorizedHandler } from './lib/api'
 import { useJob } from './composables/useJob'
 import { aria2 } from './composables/useAria2'
 import { toast } from './composables/useToast'
-import type { JobResult, UserStatusResponse } from './lib/types'
+import { formatDateTime, formatRelative } from './lib/format'
+import type { JobResult, ResolveHistoryDetail, ResolveHistorySummary, UserStatusResponse } from './lib/types'
 
 const view = ref<'gate' | 'portal'>('gate')
 const status = ref<UserStatusResponse | null>(null)
@@ -27,6 +29,11 @@ const cdkError = ref('')
 const cdkLoading = ref(false)
 const pushChoiceOpen = ref(false)
 const pushChoiceResults = ref<JobResult[]>([])
+const historyOpen = ref(false)
+const historyLoading = ref(false)
+const historyError = ref('')
+const historyItems = ref<ResolveHistorySummary[]>([])
+const historyDetail = ref<ResolveHistoryDetail | null>(null)
 
 const { job, phase, error, submitting, submit, selectItems } = useJob({
   create: (b) => api.u.jobs.create(b),
@@ -44,10 +51,12 @@ const results = computed(() => {
   return []
 })
 const queuePill = computed(() => status.value?.queue)
+const historyResults = computed(() => historyDetail.value?.results ?? [])
 
 setUnauthorizedHandler(() => {
   view.value = 'gate'
   status.value = null
+  closeHistory()
   toast('会话已过期，请重新输入 CDK', 'info')
 })
 
@@ -85,6 +94,7 @@ async function logout() {
   view.value = 'gate'
   status.value = null
   cdkInput.value = ''
+  closeHistory()
 }
 
 function onSubmit(payload: { input: string; passCode: string; mode: 'direct' | 'proxy' }) {
@@ -124,6 +134,86 @@ function choosePushKind(kind: 'direct' | 'proxy') {
   const list = [...pushChoiceResults.value]
   closePushChoice()
   pushManyAs(kind, list)
+}
+function closeHistory() {
+  historyOpen.value = false
+  historyLoading.value = false
+  historyError.value = ''
+  historyItems.value = []
+  historyDetail.value = null
+}
+async function toggleHistory() {
+  if (historyOpen.value) {
+    closeHistory()
+    return
+  }
+  historyOpen.value = true
+  await loadHistory()
+}
+async function loadHistory() {
+  historyLoading.value = true
+  historyError.value = ''
+  historyDetail.value = null
+  try {
+    const payload = await api.u.history.list()
+    historyItems.value = payload.history || []
+  } catch (e: any) {
+    historyError.value = e?.message || '加载解析历史失败'
+  } finally {
+    historyLoading.value = false
+  }
+}
+async function openHistoryDetail(id: string) {
+  historyLoading.value = true
+  historyError.value = ''
+  try {
+    historyDetail.value = await api.u.history.get(id)
+  } catch (e: any) {
+    historyError.value = e?.message || '加载历史详情失败'
+  } finally {
+    historyLoading.value = false
+  }
+}
+function backToHistoryList() {
+  historyDetail.value = null
+}
+function pushHistoryAll() {
+  const list = historyResults.value
+  if (canChoosePushKind(list)) {
+    pushChoiceResults.value = list
+    pushChoiceOpen.value = true
+    return
+  }
+  pushManyAs('direct', list)
+}
+function historyInputPreview(input: string) {
+  const lines = String(input || '').split(/\r?\n/).map((v) => v.trim()).filter(Boolean)
+  if (!lines.length) return '-'
+  if (lines.length > 1) return `${lines[0]} 等 ${lines.length} 条`
+  return lines[0]
+}
+function historyKindLabel(kind: string) {
+  if (kind === 'magnet') return '磁力'
+  if (kind === 'share') return '分享'
+  if (kind === 'batch') return '批量'
+  return kind || '-'
+}
+function historyResultLabel(item: ResolveHistorySummary) {
+  if (item.batch?.total) return `成功 ${item.batch.succeeded}/${item.batch.total}`
+  return `${item.result_count} 个结果`
+}
+function historyDuration(item: ResolveHistorySummary | ResolveHistoryDetail) {
+  const start = new Date(item.created_at).getTime()
+  const end = new Date(item.completed_at).getTime()
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return '-'
+  const sec = Math.max(1, Math.round((end - start) / 1000))
+  if (sec < 60) return `${sec} 秒`
+  const min = Math.floor(sec / 60)
+  const rest = sec % 60
+  if (min < 60) return rest ? `${min} 分 ${rest} 秒` : `${min} 分`
+  const hr = Math.floor(min / 60)
+  const minRest = min % 60
+  return minRest ? `${hr} 小时 ${minRest} 分` : `${hr} 小时`
 }
 
 onMounted(loadStatus)
@@ -184,6 +274,7 @@ onMounted(loadStatus)
           <span class="pill pill-ok"><Gauge />剩余 {{ status?.remaining_label || '-' }}</span>
           <span class="pill pill-info"><CalendarClock />{{ status?.days_left ?? '-' }} 天</span>
           <span class="pill" :class="status?.allow_proxy ? 'pill-brand' : ''" :title="status?.allow_proxy ? '此 CDK 支持中转下载' : '此 CDK 不支持中转下载'"><Waypoints />中转{{ status?.allow_proxy ? '可用' : '不可用' }}</span>
+          <button class="btn btn-ghost btn-sm" type="button" @click="toggleHistory"><History />解析历史</button>
           <button class="btn btn-ghost btn-sm" type="button" @click="logout"><LogOut />退出</button>
         </div>
       </header>
@@ -198,6 +289,71 @@ onMounted(loadStatus)
         <ResolveForm :loading="submitting" @submit="onSubmit" />
         <div class="dock-wrap"><JobStatus :job="job" :phase="phase" :error="error" :submitting="submitting" /></div>
       </GlassCard>
+
+      <Transition name="v-rise">
+        <GlassCard v-if="historyOpen" :key="'hist'">
+          <div class="sec-head mb">
+            <div class="sec-title">
+              <span class="sec-glyph"><History /></span>
+              <div><span class="eyebrow">history</span><h2>解析历史</h2></div>
+            </div>
+            <div class="res-actions">
+              <PrimaryButton v-if="historyDetail" variant="line" size="sm" @click="backToHistoryList"><template #icon><ArrowLeft /></template>返回列表</PrimaryButton>
+              <PrimaryButton variant="soft" size="sm" :loading="historyLoading" @click="loadHistory"><template #icon><RefreshCw /></template>刷新</PrimaryButton>
+            </div>
+          </div>
+
+          <Transition name="v-fade">
+            <p v-if="historyError" class="error-block">{{ historyError }}</p>
+          </Transition>
+
+          <template v-if="historyDetail">
+            <div class="history-detail-head">
+              <div>
+                <span class="eyebrow">{{ historyKindLabel(historyDetail.kind) }} · {{ historyResultLabel(historyDetail) }}</span>
+                <h3>{{ formatDateTime(historyDetail.completed_at) }}</h3>
+              </div>
+              <div class="history-metrics">
+                <span class="pill">用时 {{ historyDuration(historyDetail) }}</span>
+                <span class="pill pill-live">{{ formatRelative(historyDetail.expires_at) }}过期</span>
+              </div>
+            </div>
+            <pre class="history-input mono">{{ historyDetail.input }}</pre>
+            <div class="sec-head mb compact">
+              <div><span class="eyebrow">output · {{ historyResults.length }}</span><h2>历史结果</h2></div>
+              <div class="res-actions">
+                <button class="link-btn" type="button" @click="aria2.openConfig()"><Settings2 />aria2</button>
+                <PrimaryButton v-if="historyResults.length > 1" variant="soft" size="sm" @click="pushHistoryAll"><template #icon><Send /></template>全部推送</PrimaryButton>
+              </div>
+            </div>
+            <ResultList :results="historyResults" show-push @push="onPush" />
+          </template>
+
+          <template v-else>
+            <div v-if="historyLoading" class="history-state mono">加载中...</div>
+            <div v-else-if="historyItems.length" class="history-list">
+              <button
+                v-for="item in historyItems"
+                :key="item.id"
+                class="history-item"
+                type="button"
+                @click="openHistoryDetail(item.id)"
+              >
+                <span class="history-main">
+                  <span class="history-title">{{ historyInputPreview(item.input) }}</span>
+                  <span class="history-sub mono">{{ formatDateTime(item.completed_at) }} · 用时 {{ historyDuration(item) }}</span>
+                </span>
+                <span class="history-tags">
+                  <span class="tag">{{ historyKindLabel(item.kind) }}</span>
+                  <span class="pill pill-ok">{{ historyResultLabel(item) }}</span>
+                  <span class="pill pill-live">{{ formatRelative(item.expires_at) }}过期</span>
+                </span>
+              </button>
+            </div>
+            <div v-else class="empty history-empty"><Inbox /><p>暂无解析历史</p></div>
+          </template>
+        </GlassCard>
+      </Transition>
 
       <Transition name="v-rise">
         <GlassCard v-if="needSelection" :key="'sel'">
@@ -261,8 +417,46 @@ onMounted(loadStatus)
 .sec-glyph.ok { background: var(--ok-soft); color: var(--ok); }
 .sec-glyph.live { background: var(--live-soft); color: var(--live); }
 .sec-head.mb { margin-bottom: 14px; }
+.sec-head.compact h2 { font-size: var(--fs-md); }
 .dock-wrap { padding-top: 13px; border-top: 1px solid var(--line); }
 .res-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.history-list { display: grid; gap: 9px; }
+.history-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--panel-2);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: transform var(--t) var(--ease), box-shadow var(--t) var(--ease), border-color var(--t) var(--ease);
+}
+.history-item:hover { transform: translateY(-1px); box-shadow: var(--shadow-sm); border-color: var(--brand-soft); }
+.history-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.history-title { font-size: var(--fs-sm); font-weight: var(--fw-semi); line-height: 1.45; word-break: break-all; }
+.history-sub { font-size: var(--fs-2xs); color: var(--ink-3); }
+.history-tags { flex: none; display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+.history-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.history-detail-head h3 { font-size: var(--fs-md); font-weight: var(--fw-semi); }
+.history-metrics { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.history-input {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--panel-2);
+  color: var(--ink-2);
+  font-size: var(--fs-xs);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.history-state { padding: 16px 0; color: var(--ink-3); font-size: var(--fs-xs); }
+.history-empty { min-height: 120px; }
 
 @keyframes wireRun {
   0% { left: -36%; }
@@ -271,5 +465,7 @@ onMounted(loadStatus)
 
 @media (max-width: 600px) {
   .portal { padding: 16px 14px 48px; }
+  .history-item { align-items: flex-start; flex-direction: column; }
+  .history-tags { justify-content: flex-start; }
 }
 </style>

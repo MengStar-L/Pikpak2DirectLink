@@ -36,6 +36,7 @@ type Server struct {
 	db                   *sql.DB
 	cdk                  *cdkStore
 	settings             *settingsStore
+	history              *resolveHistoryStore
 	gateHTML             []byte
 	userHTML             []byte
 	mux                  *http.ServeMux
@@ -43,6 +44,8 @@ type Server struct {
 	batches              map[string]*batchState
 	healthCancel         context.CancelFunc
 	healthDone           chan struct{}
+	historyCancel        context.CancelFunc
+	historyDone          chan struct{}
 	accountHealthProbe   accountHealthProbeFunc
 	accountHealthRefresh accountRefreshLoginFunc
 	nowFunc              func() time.Time
@@ -150,6 +153,7 @@ func NewServer(cfg Config) (*Server, error) {
 		db:           db,
 		cdk:          newCDKStore(db),
 		settings:     newSettingsStore(db),
+		history:      newResolveHistoryStore(db),
 		gateHTML:     gateHTML,
 		userHTML:     userHTML,
 		mux:          http.NewServeMux(),
@@ -231,6 +235,8 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("POST /api/u/jobs", server.handleUserCreateJob)
 	server.mux.HandleFunc("GET /api/u/jobs/{id}", server.handleUserGetJob)
 	server.mux.HandleFunc("POST /api/u/jobs/{id}/select", server.handleUserSelectItem)
+	server.mux.HandleFunc("GET /api/u/history", server.handleUserHistoryList)
+	server.mux.HandleFunc("GET /api/u/history/{id}", server.handleUserHistoryGet)
 
 	server.mux.HandleFunc("GET /proxy/{id}", server.handleProxy)
 	server.mux.HandleFunc("HEAD /proxy/{id}", server.handleProxy)
@@ -239,6 +245,7 @@ func NewServer(cfg Config) (*Server, error) {
 	// update. Installs are always user-initiated.
 	go server.updater.runPeriodicCheck(context.Background(), cfg.UpdateCheckPeriod)
 	server.startAccountHealthMonitor()
+	server.startResolveHistoryCleanup()
 
 	return server, nil
 }
@@ -255,6 +262,12 @@ func (s *Server) Close() error {
 	}
 	if s.healthDone != nil {
 		<-s.healthDone
+	}
+	if s.historyCancel != nil {
+		s.historyCancel()
+	}
+	if s.historyDone != nil {
+		<-s.historyDone
 	}
 	if s.db != nil {
 		return s.db.Close()
@@ -634,17 +647,18 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job := &Job{
-		ID:        newJobID(),
-		Kind:      kind,
-		Mode:      req.Mode,
-		Input:     req.Input,
-		PassCode:  req.PassCode,
-		Status:    JobQueued,
-		Stage:     StageTransfer,
-		Message:   "queued",
-		BaseURL:   s.baseURL(r),
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		ID:            newJobID(),
+		Kind:          kind,
+		Mode:          req.Mode,
+		Input:         req.Input,
+		OriginalInput: rawInput,
+		PassCode:      req.PassCode,
+		Status:        JobQueued,
+		Stage:         StageTransfer,
+		Message:       "queued",
+		BaseURL:       s.baseURL(r),
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
 	}
 
 	if kind == ResourceShare {
@@ -1666,6 +1680,7 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 		// allowance, when the job came from a CDK user).
 		s.accounts.AddTraffic(account.ID, size)
 		s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(size))
+		s.saveCDKHistory(jobID)
 	}
 	return err
 }
@@ -1778,6 +1793,7 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 		s.logJob(LogSuccess, jobID, fmt.Sprintf("解析任务完成，共 %d 个文件", len(results)))
 		s.accounts.AddTraffic(account.ID, totalSize)
 		s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(totalSize))
+		s.saveCDKHistory(jobID)
 	}
 	return err
 }

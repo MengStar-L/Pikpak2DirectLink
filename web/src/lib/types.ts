@@ -233,6 +233,23 @@ export type UserJobView = {
   updated_at: string
 }
 
+export type ResolveHistorySummary = {
+  id: string
+  job_id: string
+  kind: JobKind
+  mode: JobMode
+  input: string
+  result_count: number
+  batch?: BatchSummary
+  created_at: string
+  completed_at: string
+  expires_at: string
+}
+
+export type ResolveHistoryDetail = ResolveHistorySummary & {
+  results: JobResult[]
+}
+
 export type QueueView = { waiting: number; active: boolean }
 
 export type AuthResult = { status: string }

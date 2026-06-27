@@ -55,7 +55,24 @@ CREATE TABLE IF NOT EXISTS cdks (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);`
+);
+CREATE TABLE IF NOT EXISTS cdk_resolve_history (
+    id           TEXT PRIMARY KEY,
+    cdk_code     TEXT NOT NULL,
+    job_id       TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    mode         TEXT NOT NULL,
+    input        TEXT NOT NULL,
+    results_json TEXT NOT NULL,
+    batch_json   TEXT,
+    created_at   INTEGER NOT NULL,
+    completed_at INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cdk_resolve_history_cdk_completed
+ON cdk_resolve_history(cdk_code, completed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cdk_resolve_history_expires
+ON cdk_resolve_history(expires_at);`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
