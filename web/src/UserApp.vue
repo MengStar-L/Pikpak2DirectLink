@@ -195,7 +195,7 @@ onMounted(loadStatus)
             <div><span class="eyebrow">resolve</span><h2>链接解析</h2><p>粘贴磁力或 PikPak 分享链接，勾选文件生成下载链接</p></div>
           </div>
         </div>
-        <ResolveForm :loading="submitting" :allow-proxy="status?.allow_proxy ?? false" @submit="onSubmit" />
+        <ResolveForm :loading="submitting" @submit="onSubmit" />
         <div class="dock-wrap"><JobStatus :job="job" :phase="phase" :error="error" :submitting="submitting" /></div>
       </GlassCard>
 

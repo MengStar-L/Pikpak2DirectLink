@@ -1,32 +1,20 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
-import { Bolt, Database, Play, ArrowRight } from 'lucide-vue-next'
+import { ref, computed } from 'vue'
+import { Play } from 'lucide-vue-next'
 import PrimaryButton from './PrimaryButton.vue'
-import type { JobMode } from '../lib/types'
 
-const props = withDefaults(defineProps<{
+const props = defineProps<{
   loading?: boolean
   disabled?: boolean
   compact?: boolean
-  allowProxy?: boolean
-}>(), { allowProxy: true })
+}>()
 
 const emit = defineEmits<{
-  (e: 'submit', payload: { input: string; passCode: string; mode: JobMode }): void
+  (e: 'submit', payload: { input: string; passCode: string; mode: 'direct' }): void
 }>()
 
 const input = ref('')
 const passCode = ref('')
-const mode = ref<JobMode>('direct')
-
-// A CDK without proxy permission can't choose proxy mode; keep it on direct.
-watch(
-  () => props.allowProxy,
-  (allow) => {
-    if (!allow && mode.value === 'proxy') mode.value = 'direct'
-  },
-  { immediate: true },
-)
 
 const lineCount = computed(() => input.value.split('\n').filter((l) => l.trim()).length)
 const isBatch = computed(() => lineCount.value > 1)
@@ -34,7 +22,7 @@ const isBatch = computed(() => lineCount.value > 1)
 function onSubmit() {
   if (props.loading || props.disabled) return
   if (!input.value.trim()) return
-  emit('submit', { input: input.value, passCode: passCode.value, mode: mode.value })
+  emit('submit', { input: input.value, passCode: passCode.value, mode: 'direct' })
 }
 </script>
 
@@ -45,7 +33,9 @@ function onSubmit() {
         v-model="input"
         class="textarea"
         :rows="compact ? 4 : 5"
-        placeholder="magnet:?xt=urn:btih:…&#10;https://mypikpak.com/s/…&#10;每行一个链接 = 批量解析"
+        placeholder="magnet:?xt=urn:btih:...
+https://mypikpak.com/s/...
+每行一个链接 = 批量解析"
         aria-label="磁力链接或 PikPak 分享链接"
       />
     </div>
@@ -53,24 +43,10 @@ function onSubmit() {
     <div class="side">
       <label class="field">
         <span class="field-label">提取码（可选）</span>
-        <input v-model="passCode" class="input input-mono" type="text" autocomplete="off" placeholder="——" />
+        <input v-model="passCode" class="input input-mono" type="text" autocomplete="off" placeholder="-" />
       </label>
 
-      <div class="field">
-        <span class="field-label">链接方式</span>
-        <div class="seg" role="radiogroup" aria-label="链接方式">
-          <label class="seg-item">
-            <input v-model="mode" type="radio" value="direct" />
-            <span><Bolt />直链优先</span>
-          </label>
-          <label class="seg-item" :class="{ disabled: !allowProxy }">
-            <input v-model="mode" type="radio" value="proxy" :disabled="!allowProxy" />
-            <span :title="allowProxy ? '' : '此 CDK 不支持中转下载'"><Database />代理优先</span>
-          </label>
-        </div>
-      </div>
-
-      <PrimaryButton type="submit" block size="lg" :loading="loading" :disabled="disabled || !input.trim()">
+      <PrimaryButton class="submit-btn" type="submit" block size="lg" :loading="loading" :disabled="disabled || !input.trim()">
         <template #icon><Play /></template>
         {{ isBatch ? `批量解析 ${lineCount} 条` : '开始解析' }}
       </PrimaryButton>
@@ -83,15 +59,10 @@ function onSubmit() {
 .main { display: flex; }
 .main .textarea { width: 100%; min-height: 132px; }
 .side { display: flex; flex-direction: column; gap: 12px; }
-.side .field:nth-child(2) { margin-top: auto; }
-.seg { width: 100%; }
-.seg-item { flex: 1 1 0; }
-.seg-item span { width: 100%; justify-content: center; }
-.seg-item.disabled { cursor: not-allowed; }
-.seg-item.disabled span { opacity: 0.4; cursor: not-allowed; }
+.submit-btn { margin-top: auto; }
 
 @media (max-width: 760px) {
   .rform { grid-template-columns: 1fr; }
-  .side .field:nth-child(2) { margin-top: 0; }
+  .submit-btn { margin-top: 0; }
 }
 </style>
