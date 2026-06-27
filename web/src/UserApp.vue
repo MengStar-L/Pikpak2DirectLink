@@ -345,6 +345,7 @@ onMounted(loadStatus)
           <span class="pill pill-ok"><Gauge />剩余 {{ status?.remaining_label || '-' }}</span>
           <span class="pill pill-info"><CalendarClock />{{ status?.days_left ?? '-' }} 天</span>
           <span class="pill" :class="status?.allow_proxy ? 'pill-brand' : ''" :title="status?.allow_proxy ? '此 CDK 支持中转下载' : '此 CDK 不支持中转下载'"><Waypoints />中转{{ status?.allow_proxy ? '可用' : '不可用' }}</span>
+          <button class="btn btn-ghost btn-sm" type="button" @click="aria2.openConfig()"><Settings2 />aria2</button>
           <button class="btn btn-ghost btn-sm" type="button" @click="toggleHistory"><History />解析历史</button>
           <button class="btn btn-ghost btn-sm" type="button" @click="logout"><LogOut />退出</button>
         </div>
@@ -426,7 +427,7 @@ onMounted(loadStatus)
 .sec-head.compact h2 { font-size: var(--fs-md); }
 .dock-wrap { padding-top: 13px; border-top: 1px solid var(--line); }
 .res-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.history-overlay { z-index: 8050; align-items: start; padding-top: 42px; }
+.history-overlay { z-index: 7900; align-items: start; padding-top: 42px; }
 .history-dialog {
   width: min(100%, 1180px);
   max-height: calc(100vh - 84px);
