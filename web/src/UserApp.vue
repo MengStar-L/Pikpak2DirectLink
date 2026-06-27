@@ -2,7 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import {
   Ticket, LogOut, Gauge, CalendarClock, Hourglass, Link2, Files, CheckCheck, Settings2, Send, Radar, Waypoints,
-  History, ArrowLeft, RefreshCw, Inbox,
+  History, ArrowLeft, RefreshCw, Inbox, X,
 } from 'lucide-vue-next'
 import AuroraBg from './components/AuroraBg.vue'
 import GlassCard from './components/GlassCard.vue'
@@ -232,6 +232,77 @@ onMounted(loadStatus)
     @close="closePushChoice"
   />
 
+  <Teleport to="body">
+    <Transition name="v-veil">
+      <div v-if="historyOpen" class="overlay history-overlay" @click.self="closeHistory">
+        <Transition name="v-pop" appear>
+          <div v-if="historyOpen" class="dialog history-dialog" role="dialog" aria-modal="true" aria-label="解析历史">
+            <div class="dialog-head history-dialog-head">
+              <h2><History />解析历史</h2>
+              <div class="history-dialog-actions">
+                <PrimaryButton v-if="historyDetail" variant="line" size="sm" @click="backToHistoryList"><template #icon><ArrowLeft /></template>返回列表</PrimaryButton>
+                <PrimaryButton variant="soft" size="sm" :loading="historyLoading" @click="loadHistory"><template #icon><RefreshCw /></template>刷新</PrimaryButton>
+                <button type="button" class="dialog-close" aria-label="关闭" @click="closeHistory"><X /></button>
+              </div>
+            </div>
+
+            <Transition name="v-fade">
+              <p v-if="historyError" class="error-block">{{ historyError }}</p>
+            </Transition>
+
+            <div class="history-dialog-body">
+              <template v-if="historyDetail">
+                <div class="history-detail-head">
+                  <div>
+                    <span class="eyebrow">{{ historyKindLabel(historyDetail.kind) }} · {{ historyResultLabel(historyDetail) }}</span>
+                    <h3>{{ formatDateTime(historyDetail.completed_at) }}</h3>
+                  </div>
+                  <div class="history-metrics">
+                    <span class="pill">用时 {{ historyDuration(historyDetail) }}</span>
+                    <span class="pill pill-live">{{ formatRelative(historyDetail.expires_at) }}过期</span>
+                  </div>
+                </div>
+                <pre class="history-input mono">{{ historyDetail.input }}</pre>
+                <div class="sec-head mb compact">
+                  <div><span class="eyebrow">output · {{ historyResults.length }}</span><h2>历史结果</h2></div>
+                  <div class="res-actions">
+                    <button class="link-btn" type="button" @click="aria2.openConfig()"><Settings2 />aria2</button>
+                    <PrimaryButton v-if="historyResults.length > 1" variant="soft" size="sm" @click="pushHistoryAll"><template #icon><Send /></template>全部推送</PrimaryButton>
+                  </div>
+                </div>
+                <ResultList :results="historyResults" show-push @push="onPush" />
+              </template>
+
+              <template v-else>
+                <div v-if="historyLoading" class="history-state mono">加载中...</div>
+                <div v-else-if="historyItems.length" class="history-list">
+                  <button
+                    v-for="item in historyItems"
+                    :key="item.id"
+                    class="history-item"
+                    type="button"
+                    @click="openHistoryDetail(item.id)"
+                  >
+                    <span class="history-main">
+                      <span class="history-title">{{ historyInputPreview(item.input) }}</span>
+                      <span class="history-sub mono">{{ formatDateTime(item.completed_at) }} · 用时 {{ historyDuration(item) }}</span>
+                    </span>
+                    <span class="history-tags">
+                      <span class="tag">{{ historyKindLabel(item.kind) }}</span>
+                      <span class="pill pill-ok">{{ historyResultLabel(item) }}</span>
+                      <span class="pill pill-live">{{ formatRelative(item.expires_at) }}过期</span>
+                    </span>
+                  </button>
+                </div>
+                <div v-else class="empty history-empty"><Inbox /><p>暂无解析历史</p></div>
+              </template>
+            </div>
+          </div>
+        </Transition>
+      </div>
+    </Transition>
+  </Teleport>
+
   <Transition name="v-fade" mode="out-in">
     <!-- CDK gate -->
     <main v-if="view === 'gate'" class="gate-wrap" key="gate">
@@ -289,71 +360,6 @@ onMounted(loadStatus)
         <ResolveForm :loading="submitting" @submit="onSubmit" />
         <div class="dock-wrap"><JobStatus :job="job" :phase="phase" :error="error" :submitting="submitting" /></div>
       </GlassCard>
-
-      <Transition name="v-rise">
-        <GlassCard v-if="historyOpen" :key="'hist'">
-          <div class="sec-head mb">
-            <div class="sec-title">
-              <span class="sec-glyph"><History /></span>
-              <div><span class="eyebrow">history</span><h2>解析历史</h2></div>
-            </div>
-            <div class="res-actions">
-              <PrimaryButton v-if="historyDetail" variant="line" size="sm" @click="backToHistoryList"><template #icon><ArrowLeft /></template>返回列表</PrimaryButton>
-              <PrimaryButton variant="soft" size="sm" :loading="historyLoading" @click="loadHistory"><template #icon><RefreshCw /></template>刷新</PrimaryButton>
-            </div>
-          </div>
-
-          <Transition name="v-fade">
-            <p v-if="historyError" class="error-block">{{ historyError }}</p>
-          </Transition>
-
-          <template v-if="historyDetail">
-            <div class="history-detail-head">
-              <div>
-                <span class="eyebrow">{{ historyKindLabel(historyDetail.kind) }} · {{ historyResultLabel(historyDetail) }}</span>
-                <h3>{{ formatDateTime(historyDetail.completed_at) }}</h3>
-              </div>
-              <div class="history-metrics">
-                <span class="pill">用时 {{ historyDuration(historyDetail) }}</span>
-                <span class="pill pill-live">{{ formatRelative(historyDetail.expires_at) }}过期</span>
-              </div>
-            </div>
-            <pre class="history-input mono">{{ historyDetail.input }}</pre>
-            <div class="sec-head mb compact">
-              <div><span class="eyebrow">output · {{ historyResults.length }}</span><h2>历史结果</h2></div>
-              <div class="res-actions">
-                <button class="link-btn" type="button" @click="aria2.openConfig()"><Settings2 />aria2</button>
-                <PrimaryButton v-if="historyResults.length > 1" variant="soft" size="sm" @click="pushHistoryAll"><template #icon><Send /></template>全部推送</PrimaryButton>
-              </div>
-            </div>
-            <ResultList :results="historyResults" show-push @push="onPush" />
-          </template>
-
-          <template v-else>
-            <div v-if="historyLoading" class="history-state mono">加载中...</div>
-            <div v-else-if="historyItems.length" class="history-list">
-              <button
-                v-for="item in historyItems"
-                :key="item.id"
-                class="history-item"
-                type="button"
-                @click="openHistoryDetail(item.id)"
-              >
-                <span class="history-main">
-                  <span class="history-title">{{ historyInputPreview(item.input) }}</span>
-                  <span class="history-sub mono">{{ formatDateTime(item.completed_at) }} · 用时 {{ historyDuration(item) }}</span>
-                </span>
-                <span class="history-tags">
-                  <span class="tag">{{ historyKindLabel(item.kind) }}</span>
-                  <span class="pill pill-ok">{{ historyResultLabel(item) }}</span>
-                  <span class="pill pill-live">{{ formatRelative(item.expires_at) }}过期</span>
-                </span>
-              </button>
-            </div>
-            <div v-else class="empty history-empty"><Inbox /><p>暂无解析历史</p></div>
-          </template>
-        </GlassCard>
-      </Transition>
 
       <Transition name="v-rise">
         <GlassCard v-if="needSelection" :key="'sel'">
@@ -420,6 +426,19 @@ onMounted(loadStatus)
 .sec-head.compact h2 { font-size: var(--fs-md); }
 .dock-wrap { padding-top: 13px; border-top: 1px solid var(--line); }
 .res-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.history-overlay { z-index: 8050; align-items: start; padding-top: 42px; }
+.history-dialog {
+  width: min(100%, 1180px);
+  max-height: calc(100vh - 84px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.history-dialog-head { flex: none; margin-bottom: 12px; }
+.history-dialog-head h2 { display: flex; align-items: center; gap: 7px; font-size: var(--fs-lg); }
+.history-dialog-head h2 svg { width: 17px; height: 17px; color: var(--brand); }
+.history-dialog-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.history-dialog-body { min-height: 0; overflow-y: auto; padding-right: 2px; }
 .history-list { display: grid; gap: 9px; }
 .history-item {
   width: 100%;
@@ -465,6 +484,10 @@ onMounted(loadStatus)
 
 @media (max-width: 600px) {
   .portal { padding: 16px 14px 48px; }
+  .history-overlay { align-items: stretch; padding: 12px; }
+  .history-dialog { max-height: calc(100vh - 24px); }
+  .history-dialog-head { align-items: flex-start; }
+  .history-dialog-actions { width: 100%; justify-content: flex-start; }
   .history-item { align-items: flex-start; flex-direction: column; }
   .history-tags { justify-content: flex-start; }
 }
