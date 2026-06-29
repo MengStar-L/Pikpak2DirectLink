@@ -2,6 +2,8 @@ package app
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -377,6 +379,83 @@ func TestRecordParseErrorKeepsAccountAvailable(t *testing.T) {
 	}
 	if got.ParseErrors[0].JobID != "job1" || got.ParseErrors[0].Message != "record not found" {
 		t.Fatalf("parse error entry = %+v", got.ParseErrors[0])
+	}
+}
+
+func TestDeleteParseErrorRemovesSelectedEntry(t *testing.T) {
+	t.Parallel()
+	pool := newTrafficTestPool(t)
+	pool.injectAccount(accountRecord{
+		ID:            "a",
+		Username:      "a@example.com",
+		Status:        AccountAvailable,
+		TrafficLimit:  700 * bytesPerGB,
+		TrafficPeriod: monthKey(time.Now()),
+		ParseErrors: []ParseError{
+			{Time: "2026-06-29T10:00:00Z", JobID: "job1", Message: "first"},
+			{Time: "2026-06-29T11:00:00Z", JobID: "job2", Message: "second"},
+		},
+	})
+
+	if err := pool.DeleteParseError("a", 0); err != nil {
+		t.Fatalf("DeleteParseError: %v", err)
+	}
+	got := pool.List()[0]
+	if got.ParseErrorCount != 1 || len(got.ParseErrors) != 1 {
+		t.Fatalf("parse errors = count %d list %+v, want one", got.ParseErrorCount, got.ParseErrors)
+	}
+	if got.ParseErrors[0].JobID != "job2" || got.ParseErrors[0].Message != "second" {
+		t.Fatalf("remaining parse error = %+v, want job2", got.ParseErrors[0])
+	}
+
+	reloaded, err := NewAccountPool(pool.config)
+	if err != nil {
+		t.Fatalf("reload pool: %v", err)
+	}
+	reloadedGot := reloaded.List()[0]
+	if reloadedGot.ParseErrorCount != 1 || reloadedGot.ParseErrors[0].JobID != "job2" {
+		t.Fatalf("reloaded parse errors = count %d list %+v, want job2", reloadedGot.ParseErrorCount, reloadedGot.ParseErrors)
+	}
+	if err := pool.DeleteParseError("missing", 0); err == nil {
+		t.Fatal("expected error for missing account")
+	}
+	if err := pool.DeleteParseError("a", 99); err == nil {
+		t.Fatal("expected error for missing parse error index")
+	}
+}
+
+func TestHandleDeleteAccountParseError(t *testing.T) {
+	t.Parallel()
+	pool := newTrafficTestPool(t)
+	pool.injectAccount(accountRecord{
+		ID:            "a",
+		Username:      "a@example.com",
+		Status:        AccountAvailable,
+		TrafficLimit:  700 * bytesPerGB,
+		TrafficPeriod: monthKey(time.Now()),
+		ParseErrors:   []ParseError{{Time: "2026-06-29T10:00:00Z", JobID: "job1", Message: "record not found"}},
+	})
+	srv := &Server{accounts: pool}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/accounts/a/parse-errors/0", nil)
+	req.SetPathValue("id", "a")
+	req.SetPathValue("index", "0")
+	rec := httptest.NewRecorder()
+	srv.handleDeleteAccountParseError(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
+	}
+	if got := pool.List()[0].ParseErrorCount; got != 0 {
+		t.Fatalf("parse error count = %d, want 0", got)
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/accounts/a/parse-errors/bad", nil)
+	req.SetPathValue("id", "a")
+	req.SetPathValue("index", "bad")
+	rec = httptest.NewRecorder()
+	srv.handleDeleteAccountParseError(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s, want 400", rec.Code, rec.Body.String())
 	}
 }
 

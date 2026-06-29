@@ -113,6 +113,8 @@ export const api = {
     remove: (id: string) => request<AuthResult>('DELETE', `/api/accounts/${id}`),
     reset: (id: string) => request<AuthResult>('POST', `/api/accounts/${id}/reset`),
     refreshLogin: (id: string) => request<AccountSummary>('POST', `/api/accounts/${id}/refresh-login`),
+    deleteParseError: (id: string, index: number) =>
+      request<AuthResult>('DELETE', `/api/accounts/${id}/parse-errors/${index}`),
   },
 
   jobs: {

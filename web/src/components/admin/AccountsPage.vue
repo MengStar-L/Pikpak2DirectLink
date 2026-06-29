@@ -55,15 +55,16 @@ async function addAccount() {
   }
 }
 
-async function action(id: string, kind: 'update' | 'delete' | 'reset' | 'refresh', payload?: number) {
+async function action(id: string, kind: 'update' | 'delete' | 'reset' | 'refresh' | 'delete-parse-error', payload?: number) {
   busyId.value = id
   try {
-    if (kind === 'update' && payload) await api.accounts.update(id, payload)
+    if (kind === 'update' && payload !== undefined) await api.accounts.update(id, payload)
     else if (kind === 'delete') await api.accounts.remove(id)
     else if (kind === 'reset') await api.accounts.reset(id)
     else if (kind === 'refresh') await api.accounts.refreshLogin(id)
+    else if (kind === 'delete-parse-error' && payload !== undefined) await api.accounts.deleteParseError(id, payload)
     toast(
-      kind === 'delete' ? '已删除账号' : kind === 'reset' ? '已重置状态' : kind === 'refresh' ? '已重新登录' : '已更新流量上限',
+      kind === 'delete' ? '已删除账号' : kind === 'reset' ? '已重置状态' : kind === 'refresh' ? '已重新登录' : kind === 'delete-parse-error' ? '已删除解析错误' : '已更新流量上限',
       'success',
     )
     await load()
@@ -111,6 +112,7 @@ defineExpose({ refresh: load })
           @delete="(id) => action(id, 'delete')"
           @reset="(id) => action(id, 'reset')"
           @refresh="(id) => action(id, 'refresh')"
+          @delete-parse-error="(id, index) => action(id, 'delete-parse-error', index)"
         />
       </template>
       <GlassCard v-else>

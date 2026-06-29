@@ -636,6 +636,22 @@ func (p *AccountPool) RecordParseError(id, jobID, message string) {
 	_ = p.saveLocked()
 }
 
+func (p *AccountPool) DeleteParseError(id string, index int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state := p.accounts[id]
+	if state == nil {
+		return errors.New("account not found")
+	}
+	if index < 0 || index >= len(state.record.ParseErrors) {
+		return errors.New("parse error not found")
+	}
+	state.record.ParseErrors = append(state.record.ParseErrors[:index], state.record.ParseErrors[index+1:]...)
+	state.record.UpdatedAt = time.Now()
+	return p.saveLocked()
+}
+
 // SetTrafficLimit updates an account's monthly downstream budget (in bytes).
 func (p *AccountPool) SetTrafficLimit(id string, limitBytes int64) error {
 	if limitBytes <= 0 {

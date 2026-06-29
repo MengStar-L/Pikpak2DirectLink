@@ -213,6 +213,7 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("GET /api/accounts", server.handleListAccounts)
 	server.mux.HandleFunc("POST /api/accounts", server.handleAddAccount)
 	server.mux.HandleFunc("PATCH /api/accounts/{id}", server.handleUpdateAccount)
+	server.mux.HandleFunc("DELETE /api/accounts/{id}/parse-errors/{index}", server.handleDeleteAccountParseError)
 	server.mux.HandleFunc("DELETE /api/accounts/{id}", server.handleDeleteAccount)
 	server.mux.HandleFunc("POST /api/accounts/{id}/reset", server.handleResetAccount)
 	server.mux.HandleFunc("POST /api/accounts/{id}/refresh-login", server.handleRefreshAccountLogin)
@@ -533,6 +534,23 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	if err := s.accounts.Delete(r.PathValue("id")); err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) handleDeleteAccountParseError(w http.ResponseWriter, r *http.Request) {
+	index, err := strconv.Atoi(strings.TrimSpace(r.PathValue("index")))
+	if err != nil || index < 0 {
+		writeError(w, http.StatusBadRequest, "invalid parse error index")
+		return
+	}
+	if err := s.accounts.DeleteParseError(r.PathValue("id"), index); err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})

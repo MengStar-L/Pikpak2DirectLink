@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import {
   User, Crown, RefreshCw, RotateCcw, Trash2, Pencil, Save, X, AlertTriangle, CheckCircle2, XCircle,
 } from 'lucide-vue-next'
 import PrimaryButton from './PrimaryButton.vue'
 import type { AccountSummary } from '../lib/types'
-import { formatBytes, formatRelative, formatPercent } from '../lib/format'
+import { formatBytes, formatRelative, formatPercent, formatDateTime } from '../lib/format'
 
 const props = defineProps<{ account: AccountSummary; busy?: boolean }>()
 
@@ -14,9 +14,11 @@ const emit = defineEmits<{
   (e: 'delete', id: string): void
   (e: 'reset', id: string): void
   (e: 'refresh', id: string): void
+  (e: 'delete-parse-error', id: string, index: number): void
 }>()
 
 const editing = ref(false)
+const parseErrorsOpen = ref(false)
 const draftLimit = ref(Math.round(props.account.traffic_limit / (1 << 30)))
 
 const trafficPct = computed(() => formatPercent(props.account.traffic_used, props.account.traffic_limit))
@@ -36,6 +38,21 @@ function saveEdit() {
 function cancelEdit() {
   editing.value = false
 }
+function openParseErrors() {
+  if (props.account.parse_error_count) {
+    parseErrorsOpen.value = true
+  }
+}
+function closeParseErrors() {
+  parseErrorsOpen.value = false
+}
+
+watch(
+  () => props.account.parse_error_count,
+  (count) => {
+    if (!count) parseErrorsOpen.value = false
+  },
+)
 </script>
 
 <template>
@@ -67,9 +84,9 @@ function cancelEdit() {
         <AlertTriangle /><span>{{ account.last_error }}</span>
         <span v-if="account.last_failed_at" class="time">{{ formatRelative(account.last_failed_at) }}</span>
       </div>
-      <div v-if="account.parse_error_count" class="errline warn">
+      <button v-if="account.parse_error_count" class="errline warn errbtn" type="button" @click="openParseErrors">
         <AlertTriangle /><span>解析错误 {{ account.parse_error_count }} 次</span>
-      </div>
+      </button>
       <div v-if="account.credential_check_error" class="errline">
         <AlertTriangle /><span>凭据检查：{{ account.credential_check_error }}</span>
       </div>
@@ -91,6 +108,38 @@ function cancelEdit() {
       </template>
     </footer>
   </article>
+
+  <Teleport to="body">
+    <Transition name="v-veil">
+      <div v-if="parseErrorsOpen" class="overlay parse-overlay" @click.self="closeParseErrors">
+        <Transition name="v-pop">
+          <div v-if="parseErrorsOpen" class="dialog parse-dialog" role="dialog" aria-modal="true" :aria-label="`${account.username} 解析错误`">
+            <div class="dialog-head">
+              <div class="dialog-title">
+                <h2><AlertTriangle />解析错误</h2>
+                <p :title="account.username">{{ account.username }}</p>
+              </div>
+              <button type="button" class="dialog-close" aria-label="关闭" @click="closeParseErrors"><X /></button>
+            </div>
+
+            <div v-if="account.parse_errors?.length" class="parse-list">
+              <div v-for="(err, index) in account.parse_errors" :key="`${err.time}-${err.job_id}-${index}`" class="parse-item">
+                <div class="parse-main">
+                  <div class="parse-meta">
+                    <time class="mono" :datetime="err.time">{{ formatDateTime(err.time) }}</time>
+                    <span v-if="err.job_id" class="job mono">{{ err.job_id }}</span>
+                  </div>
+                  <p>{{ err.message || 'record not found' }}</p>
+                </div>
+                <button class="btn btn-danger btn-sm btn-icon" type="button" :disabled="busy" aria-label="删除解析错误" @click="emit('delete-parse-error', account.id, index)"><Trash2 /></button>
+              </div>
+            </div>
+            <p v-else class="empty-note">暂无解析错误</p>
+          </div>
+        </Transition>
+      </div>
+    </Transition>
+  </Teleport>
 </template>
 
 <style scoped>
@@ -114,10 +163,33 @@ function cancelEdit() {
 .errline svg { width: 12px; height: 12px; flex: none; }
 .errline span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .errline .time { color: var(--ink-3); margin-left: auto; flex: none; }
+.errbtn { align-self: flex-start; max-width: 100%; padding: 0; border: 0; background: transparent; font: inherit; text-align: left; cursor: pointer; }
+.errbtn:hover span { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+.errbtn:focus-visible { outline: 2px solid var(--brand-line); outline-offset: 3px; border-radius: var(--r-xs); }
 .meta { font-size: var(--fs-xs); color: var(--ink-3); }
+
+.parse-overlay { z-index: 8050; }
+.parse-dialog { width: min(640px, calc(100vw - 32px)); max-height: min(76vh, 640px); display: flex; flex-direction: column; }
+.dialog-title { min-width: 0; }
+.dialog-title h2 { display: flex; align-items: center; gap: 7px; font-size: var(--fs-lg); }
+.dialog-title h2 svg { width: 17px; height: 17px; color: var(--live); }
+.dialog-title p { margin-top: 2px; font-size: var(--fs-xs); color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.parse-list { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 2px; }
+.parse-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--panel-2); }
+.parse-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.parse-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; font-size: var(--fs-2xs); color: var(--ink-3); }
+.parse-meta .job { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 2px 5px; border-radius: var(--r-xs); background: var(--panel); border: 1px solid var(--line); }
+.parse-item p { font-size: var(--fs-xs); color: var(--ink-2); line-height: 1.5; word-break: break-word; }
+.parse-item .btn { flex: none; }
+.empty-note { padding: 20px; border: 1px dashed var(--line-2); border-radius: var(--r-sm); color: var(--ink-3); text-align: center; font-size: var(--fs-sm); }
 
 .actions { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 11px; border-top: 1px solid var(--line); }
 .edit-limit { display: flex; align-items: center; gap: 6px; width: 100%; }
 .input.sm { width: 84px; height: 28px; }
 .unit { font-size: var(--fs-xs); color: var(--ink-3); margin-right: auto; }
+
+@media (max-width: 560px) {
+  .parse-overlay { padding: 12px; }
+  .parse-dialog { width: 100%; max-height: calc(100vh - 24px); }
+}
 </style>

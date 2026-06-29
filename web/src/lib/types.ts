@@ -38,6 +38,12 @@ export type UpdateSettingsRequest = {
 
 export type AccountStatus = 'available' | 'failed'
 
+export type ParseError = {
+  time: string
+  job_id?: string
+  message: string
+}
+
 export type AccountSummary = {
   id: string
   username: string
@@ -59,7 +65,7 @@ export type AccountSummary = {
   credential_next_check_at: string
   credential_check_error: string
   parse_error_count: number
-  parse_errors: string[]
+  parse_errors?: ParseError[]
   created_at: string
   updated_at: string
 }
