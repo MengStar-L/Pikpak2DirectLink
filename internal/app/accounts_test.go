@@ -526,8 +526,10 @@ func TestIsResourceParseError(t *testing.T) {
 	}{
 		{name: "record not found", err: errors.New("record not found"), want: true},
 		{name: "wrapped api response", err: errors.New("pikpak api failed: record not found"), want: true},
+		{name: "restored selected share file missing", err: errors.New(`selected share file "folder/file.jpg" could not be found after restore`), want: true},
 		{name: "nil", err: nil, want: false},
 		{name: "ordinary auth failure", err: errors.New("login failed"), want: false},
+		{name: "ordinary restore failure", err: errors.New("share restore did not return any file id"), want: false},
 		{name: "copyright takedown", err: errors.New("no longer available"), want: false},
 	}
 

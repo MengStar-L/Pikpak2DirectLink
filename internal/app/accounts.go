@@ -943,7 +943,8 @@ func isResourceParseError(err error) bool {
 }
 
 func isResourceParseMessage(lower string) bool {
-	return strings.Contains(lower, "record not found")
+	return strings.Contains(lower, "record not found") ||
+		(strings.Contains(lower, "selected share file") && strings.Contains(lower, "could not be found after restore"))
 }
 
 func isBadResourceUserError(message string) bool {

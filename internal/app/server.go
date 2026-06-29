@@ -1216,9 +1216,9 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 			return
 		}
 
-		// "record not found" is a bad-resource parse failure, not proof that the
-		// account is broken. Two independent account hits are enough signal to
-		// stop this link while leaving the rest of a multi-link batch running.
+		// Resource-specific parse failures are not proof that the account is
+		// broken. Two independent account hits are enough signal to stop this
+		// link while leaving the rest of a multi-link batch running.
 		if isResourceParseError(err) {
 			parseErrors++
 			message := friendlyPikPakError(err)
