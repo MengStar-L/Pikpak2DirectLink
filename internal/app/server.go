@@ -754,21 +754,44 @@ var proxyHTTPClient = &http.Client{
 }
 
 type proxyMultipartConfig struct {
-	Concurrency int
-	ChunkSize   int64
-	MinSize     int64
+	Concurrency    int
+	ChunkSize      int64
+	MinSize        int64
+	MaxAttempts    int
+	RetryBaseDelay time.Duration
+	WindowChunks   int
 }
 
 var defaultProxyMultipartConfig = proxyMultipartConfig{
-	Concurrency: 4,
-	ChunkSize:   16 << 20,
-	MinSize:     64 << 20,
+	Concurrency:    4,
+	ChunkSize:      16 << 20,
+	MinSize:        64 << 20,
+	MaxAttempts:    3,
+	RetryBaseDelay: 250 * time.Millisecond,
+	WindowChunks:   8,
 }
 
 type proxyByteRange struct {
 	Index int
 	Start int64
 	End   int64
+}
+
+func normalizeProxyMultipartConfig(cfg proxyMultipartConfig) proxyMultipartConfig {
+	if cfg.MaxAttempts < 1 {
+		cfg.MaxAttempts = 1
+	}
+	if cfg.RetryBaseDelay < 0 {
+		cfg.RetryBaseDelay = 0
+	}
+	if cfg.WindowChunks < 1 {
+		cfg.WindowChunks = cfg.Concurrency
+	}
+	return cfg
+}
+
+func formatProxyRange(br proxyByteRange) string {
+	return fmt.Sprintf("bytes=%d-%d", br.Start, br.End)
 }
 
 // jobAllowsProxy reports whether a job may expose proxy (中转) links. Admin jobs
@@ -915,15 +938,21 @@ func (s *Server) serveProxySingleStream(w http.ResponseWriter, r *http.Request, 
 	rc := http.NewResponseController(w)
 	_ = rc.Flush()
 	buf := make([]byte, 1<<20) // 1 MiB
+	written := int64(0)
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
+			wrote, werr := w.Write(buf[:n])
+			written += int64(wrote)
+			if werr != nil {
 				return
 			}
 			_ = rc.Flush()
 		}
 		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) {
+				s.logJob(LogError, jobID, "proxy single stream interrupted", "bytes="+strconv.FormatInt(written, 10), rerr.Error())
+			}
 			break
 		}
 	}
@@ -935,12 +964,15 @@ type proxyRangeProbe struct {
 }
 
 type proxyRangeResult struct {
-	Range proxyByteRange
-	Data  []byte
-	Err   error
+	Range    proxyByteRange
+	Data     []byte
+	Attempts int
+	LastErr  error
+	Err      error
 }
 
 func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sourceURL string, result *JobResult, jobID string, cfg proxyMultipartConfig) bool {
+	cfg = normalizeProxyMultipartConfig(cfg)
 	if cfg.Concurrency < 1 || cfg.ChunkSize <= 0 || cfg.MinSize <= 0 {
 		return false
 	}
@@ -965,42 +997,54 @@ func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sou
 	if workers > len(ranges) {
 		workers = len(ranges)
 	}
-	jobs := make(chan proxyByteRange)
-	results := make(chan proxyRangeResult, workers)
-	for i := 0; i < workers; i++ {
-		go func() {
-			for br := range jobs {
-				results <- fetchProxyRange(ctx, sourceURL, br)
-			}
-		}()
+	if workers > cfg.WindowChunks {
+		workers = cfg.WindowChunks
 	}
-	go func() {
-		defer close(jobs)
-		for _, br := range ranges {
-			select {
-			case <-ctx.Done():
-				return
-			case jobs <- br:
-			}
-		}
-	}()
-
+	if workers < 1 {
+		return false
+	}
+	results := make(chan proxyRangeResult, workers)
 	pending := make(map[int]proxyRangeResult)
 	next := 0
+	nextDispatch := 0
+	inFlight := 0
 	wroteHeader := false
+	loggedRetryRecovery := false
 	rc := http.NewResponseController(w)
+
+	dispatch := func() {
+		for inFlight < workers &&
+			nextDispatch < len(ranges) &&
+			nextDispatch-next < cfg.WindowChunks &&
+			ctx.Err() == nil {
+			br := ranges[nextDispatch]
+			nextDispatch++
+			inFlight++
+			go func() {
+				results <- fetchProxyRange(ctx, sourceURL, br, cfg)
+			}()
+		}
+	}
+
+	dispatch()
 	for completed := 0; completed < len(ranges); completed++ {
 		select {
 		case <-ctx.Done():
 			return true
 		case res := <-results:
+			inFlight--
 			if res.Err != nil {
 				cancel()
 				if !wroteHeader {
+					s.logJob(LogWarn, jobID, "proxy multipart range failed before fallback", proxyRangeFailureDetails(res)...)
 					return false
 				}
-				s.logJob(LogError, jobID, "proxy multipart download interrupted", res.Err.Error())
+				s.logJob(LogError, jobID, "proxy multipart download interrupted", proxyRangeFailureDetails(res)...)
 				return true
+			}
+			if res.Attempts > 1 && !loggedRetryRecovery {
+				s.logJob(LogWarn, jobID, "proxy multipart range recovered after retry", proxyRangeRecoveryDetails(res)...)
+				loggedRetryRecovery = true
 			}
 
 			pending[res.Range.Index] = res
@@ -1029,6 +1073,7 @@ func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sou
 				delete(pending, next)
 				next++
 			}
+			dispatch()
 		}
 	}
 	return wroteHeader
@@ -1060,32 +1105,134 @@ func probeProxyRangeSupport(ctx context.Context, sourceURL string) (proxyRangePr
 	return proxyRangeProbe{Header: resp.Header.Clone(), Size: size}, true, nil
 }
 
-func fetchProxyRange(ctx context.Context, sourceURL string, br proxyByteRange) proxyRangeResult {
+type proxyRangeError struct {
+	err       error
+	retryable bool
+}
+
+func (e *proxyRangeError) Error() string {
+	return e.err.Error()
+}
+
+func (e *proxyRangeError) Unwrap() error {
+	return e.err
+}
+
+func newProxyRangeError(err error, retryable bool) error {
+	if err == nil {
+		return nil
+	}
+	return &proxyRangeError{err: err, retryable: retryable}
+}
+
+func retryableProxyStatus(status int) bool {
+	return status == http.StatusRequestTimeout ||
+		status == http.StatusTooManyRequests ||
+		status >= http.StatusInternalServerError
+}
+
+func isRetryableProxyRangeError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var rangeErr *proxyRangeError
+	if errors.As(err, &rangeErr) {
+		return rangeErr.retryable
+	}
+	return false
+}
+
+func fetchProxyRange(ctx context.Context, sourceURL string, br proxyByteRange, cfg proxyMultipartConfig) proxyRangeResult {
+	cfg = normalizeProxyMultipartConfig(cfg)
+	var lastErr error
+	delay := cfg.RetryBaseDelay
+	for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
+		res := fetchProxyRangeOnce(ctx, sourceURL, br)
+		res.Attempts = attempt
+		if res.Err == nil {
+			if attempt > 1 {
+				res.LastErr = lastErr
+			}
+			return res
+		}
+
+		lastErr = res.Err
+		if attempt >= cfg.MaxAttempts || !isRetryableProxyRangeError(ctx, res.Err) {
+			res.LastErr = lastErr
+			return res
+		}
+		if delay <= 0 {
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return proxyRangeResult{Range: br, Attempts: attempt, LastErr: lastErr, Err: ctx.Err()}
+		case <-timer.C:
+		}
+		delay *= 2
+	}
+	return proxyRangeResult{Range: br, Attempts: cfg.MaxAttempts, LastErr: lastErr, Err: lastErr}
+}
+
+func fetchProxyRangeOnce(ctx context.Context, sourceURL string, br proxyByteRange) proxyRangeResult {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
 	if err != nil {
-		return proxyRangeResult{Range: br, Err: err}
+		return proxyRangeResult{Range: br, Err: newProxyRangeError(err, false)}
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", br.Start, br.End))
+	req.Header.Set("Range", formatProxyRange(br))
 	req.Header.Set("Accept-Encoding", "identity")
 
 	resp, err := proxyHTTPClient.Do(req)
 	if err != nil {
-		return proxyRangeResult{Range: br, Err: err}
+		return proxyRangeResult{Range: br, Err: newProxyRangeError(err, true)}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusPartialContent {
-		return proxyRangeResult{Range: br, Err: fmt.Errorf("upstream returned %s for range %d-%d", resp.Status, br.Start, br.End)}
+		err := fmt.Errorf("upstream returned %s for range %d-%d", resp.Status, br.Start, br.End)
+		return proxyRangeResult{Range: br, Err: newProxyRangeError(err, retryableProxyStatus(resp.StatusCode))}
 	}
 
 	want := br.End - br.Start + 1
 	data, err := io.ReadAll(io.LimitReader(resp.Body, want+1))
 	if err != nil {
-		return proxyRangeResult{Range: br, Err: err}
+		return proxyRangeResult{Range: br, Err: newProxyRangeError(err, true)}
 	}
 	if int64(len(data)) != want {
-		return proxyRangeResult{Range: br, Err: fmt.Errorf("upstream returned %d bytes for range %d-%d, want %d", len(data), br.Start, br.End, want)}
+		err := fmt.Errorf("upstream returned %d bytes for range %d-%d, want %d", len(data), br.Start, br.End, want)
+		return proxyRangeResult{Range: br, Err: newProxyRangeError(err, true)}
 	}
 	return proxyRangeResult{Range: br, Data: data}
+}
+
+func proxyRangeFailureDetails(res proxyRangeResult) []string {
+	details := []string{
+		"range=" + formatProxyRange(res.Range),
+		"attempts=" + strconv.Itoa(res.Attempts),
+	}
+	if res.Err != nil {
+		details = append(details, "error="+res.Err.Error())
+	}
+	return details
+}
+
+func proxyRangeRecoveryDetails(res proxyRangeResult) []string {
+	details := []string{
+		"range=" + formatProxyRange(res.Range),
+		"attempts=" + strconv.Itoa(res.Attempts),
+	}
+	if res.LastErr != nil {
+		details = append(details, "last_error="+res.LastErr.Error())
+	}
+	return details
 }
 
 func parseContentRangeSize(value string) (int64, bool) {

@@ -253,6 +253,265 @@ func TestProxyMultipartFallsBackWhenUpstreamIgnoresRange(t *testing.T) {
 	}
 }
 
+func TestProxyMultipartRetriesShortRangeRead(t *testing.T) {
+	payload := []byte("abcdefghijklmnopqrstuvwxyz")
+	var mu sync.Mutex
+	attempts := map[string]int{}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		start, end, ok := parseTestRange(rangeHeader, int64(len(payload)))
+		if !ok {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		mu.Lock()
+		attempts[rangeHeader]++
+		attempt := attempts[rangeHeader]
+		mu.Unlock()
+
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		if rangeHeader == "bytes=5-9" && attempt == 1 {
+			_, _ = w.Write(payload[start : start+2])
+			return
+		}
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer upstream.Close()
+
+	s := &Server{logs: newLogStore(10)}
+	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
+	rec := httptest.NewRecorder()
+	served := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+		Concurrency:    2,
+		ChunkSize:      5,
+		MinSize:        4,
+		MaxAttempts:    2,
+		RetryBaseDelay: time.Millisecond,
+		WindowChunks:   4,
+	})
+
+	if !served {
+		t.Fatal("expected multipart proxy to recover and serve the response")
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, payload) {
+		t.Fatalf("body = %q, want %q", got, payload)
+	}
+	mu.Lock()
+	gotAttempts := attempts["bytes=5-9"]
+	mu.Unlock()
+	if gotAttempts < 2 {
+		t.Fatalf("range bytes=5-9 attempts = %d, want retry", gotAttempts)
+	}
+	if !logsContain(s.logs.list(0), "proxy multipart range recovered after retry", "range=bytes=5-9") {
+		t.Fatalf("expected retry recovery log, got %+v", s.logs.list(0))
+	}
+}
+
+func TestProxyMultipartFallsBackWhenFirstRangeKeepsFailing(t *testing.T) {
+	payload := []byte("abcdefghijklmnopqrstuvwxyz")
+	var mu sync.Mutex
+	attempts := map[string]int{}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		start, end, ok := parseTestRange(rangeHeader, int64(len(payload)))
+		if !ok {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		mu.Lock()
+		attempts[rangeHeader]++
+		mu.Unlock()
+		if rangeHeader == "bytes=0-4" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		writeTestRangeResponse(w, payload, start, end)
+	}))
+	defer upstream.Close()
+
+	s := &Server{logs: newLogStore(10)}
+	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
+	rec := httptest.NewRecorder()
+	served := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+		Concurrency:    2,
+		ChunkSize:      5,
+		MinSize:        4,
+		MaxAttempts:    2,
+		RetryBaseDelay: time.Millisecond,
+		WindowChunks:   4,
+	})
+
+	if served {
+		t.Fatal("multipart should decline before writing headers so caller can fall back")
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("body length = %d, want 0 before fallback", rec.Body.Len())
+	}
+	mu.Lock()
+	gotAttempts := attempts["bytes=0-4"]
+	mu.Unlock()
+	if gotAttempts != 2 {
+		t.Fatalf("range bytes=0-4 attempts = %d, want 2", gotAttempts)
+	}
+	if !logsContain(s.logs.list(0), "proxy multipart range failed before fallback", "range=bytes=0-4") {
+		t.Fatalf("expected fallback diagnostic log, got %+v", s.logs.list(0))
+	}
+}
+
+func TestProxyMultipartLogsFailureAfterPartialWrite(t *testing.T) {
+	payload := []byte("abcdefghijklmnopqrstuvwxyz")
+	var mu sync.Mutex
+	attempts := map[string]int{}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		start, end, ok := parseTestRange(rangeHeader, int64(len(payload)))
+		if !ok {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		mu.Lock()
+		attempts[rangeHeader]++
+		mu.Unlock()
+
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		if rangeHeader == "bytes=5-9" {
+			_, _ = w.Write(payload[start : start+2])
+			return
+		}
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer upstream.Close()
+
+	s := &Server{logs: newLogStore(10)}
+	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
+	rec := httptest.NewRecorder()
+	served := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+		Concurrency:    1,
+		ChunkSize:      5,
+		MinSize:        4,
+		MaxAttempts:    2,
+		RetryBaseDelay: time.Millisecond,
+		WindowChunks:   2,
+	})
+
+	if !served {
+		t.Fatal("multipart should report it handled the already-started response")
+	}
+	if got, want := rec.Body.String(), string(payload[:5]); got != want {
+		t.Fatalf("body = %q, want only first chunk %q", got, want)
+	}
+	if !logsContain(s.logs.list(0), "proxy multipart download interrupted", "range=bytes=5-9") {
+		t.Fatalf("expected interrupted log with range detail, got %+v", s.logs.list(0))
+	}
+}
+
+func TestProxyMultipartLimitsPrefetchWindow(t *testing.T) {
+	payload := []byte("abcdefghijklmnopqrstuvwxyz")
+	releaseFirst := make(chan struct{})
+	bodyRequestsChanged := make(chan struct{}, 8)
+	var mu sync.Mutex
+	bodyRequests := 0
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		start, end, ok := parseTestRange(rangeHeader, int64(len(payload)))
+		if !ok {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		if rangeHeader != "bytes=0-0" {
+			mu.Lock()
+			bodyRequests++
+			mu.Unlock()
+			select {
+			case bodyRequestsChanged <- struct{}{}:
+			default:
+			}
+		}
+
+		if rangeHeader == "bytes=0-4" {
+			<-releaseFirst
+		}
+		writeTestRangeResponse(w, payload, start, end)
+	}))
+	defer upstream.Close()
+
+	s := &Server{logs: newLogStore(10)}
+	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
+	rec := httptest.NewRecorder()
+	done := make(chan bool, 1)
+	go func() {
+		done <- s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+			Concurrency:    4,
+			ChunkSize:      5,
+			MinSize:        4,
+			MaxAttempts:    1,
+			RetryBaseDelay: time.Millisecond,
+			WindowChunks:   2,
+		})
+	}()
+
+	waitForTestCondition(t, time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return bodyRequests >= 2
+	}, bodyRequestsChanged)
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	gotBeforeRelease := bodyRequests
+	mu.Unlock()
+	if gotBeforeRelease != 2 {
+		close(releaseFirst)
+		t.Fatalf("body range requests before first chunk released = %d, want 2", gotBeforeRelease)
+	}
+
+	close(releaseFirst)
+	select {
+	case served := <-done:
+		if !served {
+			t.Fatal("expected multipart proxy to serve after releasing first chunk")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("multipart proxy did not finish")
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, payload) {
+		t.Fatalf("body = %q, want %q", got, payload)
+	}
+}
+
+func TestProxySingleStreamLogsUpstreamReadError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "10")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("short"))
+	}))
+	defer upstream.Close()
+
+	s := &Server{logs: newLogStore(10)}
+	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
+	rec := httptest.NewRecorder()
+	s.serveProxySingleStream(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy")
+
+	if got := rec.Body.String(); got != "short" {
+		t.Fatalf("body = %q, want short", got)
+	}
+	if !logsContain(s.logs.list(0), "proxy single stream interrupted", "bytes=5") {
+		t.Fatalf("expected single-stream interruption log, got %+v", s.logs.list(0))
+	}
+}
+
 func parseTestRange(header string, size int64) (int64, int64, bool) {
 	if !strings.HasPrefix(header, "bytes=") {
 		return 0, 0, false
@@ -275,6 +534,15 @@ func parseTestRange(header string, size int64) (int64, int64, bool) {
 	return start, end, true
 }
 
+func writeTestRangeResponse(w http.ResponseWriter, payload []byte, start, end int64) {
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+	w.WriteHeader(http.StatusPartialContent)
+	_, _ = w.Write(payload[start : end+1])
+}
+
 func seenAllRanges(got, want []string) bool {
 	counts := make(map[string]int, len(got))
 	for _, value := range got {
@@ -287,6 +555,39 @@ func seenAllRanges(got, want []string) bool {
 		counts[value]--
 	}
 	return true
+}
+
+func logsContain(entries []LogEntry, message, detail string) bool {
+	for _, entry := range entries {
+		if entry.Message != message {
+			continue
+		}
+		if detail == "" {
+			return true
+		}
+		for _, got := range entry.Details {
+			if strings.Contains(got, detail) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func waitForTestCondition(t *testing.T, timeout time.Duration, ok func() bool, changed <-chan struct{}) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		if ok() {
+			return
+		}
+		select {
+		case <-changed:
+		case <-deadline.C:
+			t.Fatal("timed out waiting for test condition")
+		}
+	}
 }
 
 func TestRestoreFileIDsDedupesResponseIDs(t *testing.T) {
