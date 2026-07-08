@@ -279,6 +279,116 @@ func TestCDKUpdateAndDelete(t *testing.T) {
 	}
 }
 
+func TestCDKMergeAddsTrafficKeepsPrimaryFieldsAndDeletesSecondary(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	store := newTestCDKStore(t)
+
+	primary, err := store.createBatch(1, 5*bytesPerGB, 10, true, now)
+	if err != nil {
+		t.Fatalf("create primary: %v", err)
+	}
+	secondary, err := store.createBatch(1, 4*bytesPerGB, 30, true, now)
+	if err != nil {
+		t.Fatalf("create secondary: %v", err)
+	}
+	if err := store.charge(primary[0].Code, 2*bytesPerGB); err != nil {
+		t.Fatalf("charge primary: %v", err)
+	}
+	if err := store.charge(secondary[0].Code, bytesPerGB); err != nil {
+		t.Fatalf("charge secondary: %v", err)
+	}
+
+	merged, err := store.merge(primary[0].Code, secondary[0].Code, now)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if merged.Code != primary[0].Code {
+		t.Fatalf("merged code = %q, want primary %q", merged.Code, primary[0].Code)
+	}
+	if merged.RemainingBytes != 6*bytesPerGB {
+		t.Fatalf("remaining = %d, want 6 GiB", merged.RemainingBytes)
+	}
+	if merged.UsedBytes != 2*bytesPerGB {
+		t.Fatalf("used = %d, want primary used unchanged at 2 GiB", merged.UsedBytes)
+	}
+	if merged.ExpiresAt != secondary[0].ExpiresAt {
+		t.Fatalf("expires_at = %d, want later secondary expiry %d", merged.ExpiresAt, secondary[0].ExpiresAt)
+	}
+	if !merged.AllowProxy || merged.CreatedAt != primary[0].CreatedAt {
+		t.Fatalf("primary fields changed unexpectedly: %+v", merged)
+	}
+	if _, ok, err := store.get(secondary[0].Code); err != nil || ok {
+		t.Fatalf("secondary should be deleted, ok=%v err=%v", ok, err)
+	}
+}
+
+func TestCDKMergeRejectsInvalidInputs(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+
+	t.Run("same code", func(t *testing.T) {
+		store := newTestCDKStore(t)
+		created, _ := store.createBatch(1, bytesPerGB, 30, true, now)
+		if _, err := store.merge(created[0].Code, created[0].Code, now); !errors.Is(err, errCDKSameMergeCode) {
+			t.Fatalf("err = %v, want errCDKSameMergeCode", err)
+		}
+	})
+
+	t.Run("missing primary", func(t *testing.T) {
+		store := newTestCDKStore(t)
+		secondary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
+		if _, err := store.merge("NOPE-NOPE-NOPE-NOPE", secondary[0].Code, now); !errors.Is(err, errCDKNotFound) {
+			t.Fatalf("err = %v, want errCDKNotFound", err)
+		}
+	})
+
+	t.Run("missing secondary", func(t *testing.T) {
+		store := newTestCDKStore(t)
+		primary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
+		if _, err := store.merge(primary[0].Code, "NOPE-NOPE-NOPE-NOPE", now); !errors.Is(err, errCDKNotFound) {
+			t.Fatalf("err = %v, want errCDKNotFound", err)
+		}
+	})
+
+	t.Run("expired primary", func(t *testing.T) {
+		store := newTestCDKStore(t)
+		expired, _ := store.createBatch(1, bytesPerGB, 1, true, now.Add(-48*time.Hour))
+		secondary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
+		if _, err := store.merge(expired[0].Code, secondary[0].Code, now); !errors.Is(err, errCDKExpired) {
+			t.Fatalf("err = %v, want errCDKExpired", err)
+		}
+	})
+
+	t.Run("expired secondary", func(t *testing.T) {
+		store := newTestCDKStore(t)
+		primary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
+		expired, _ := store.createBatch(1, bytesPerGB, 1, true, now.Add(-48*time.Hour))
+		if _, err := store.merge(primary[0].Code, expired[0].Code, now); !errors.Is(err, errCDKExpired) {
+			t.Fatalf("err = %v, want errCDKExpired", err)
+		}
+	})
+
+	t.Run("secondary exhausted", func(t *testing.T) {
+		store := newTestCDKStore(t)
+		primary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
+		secondary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
+		if err := store.charge(secondary[0].Code, bytesPerGB); err != nil {
+			t.Fatalf("charge secondary: %v", err)
+		}
+		if _, err := store.merge(primary[0].Code, secondary[0].Code, now); !errors.Is(err, errCDKExhausted) {
+			t.Fatalf("err = %v, want errCDKExhausted", err)
+		}
+	})
+
+	t.Run("proxy mismatch", func(t *testing.T) {
+		store := newTestCDKStore(t)
+		primary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
+		secondary, _ := store.createBatch(1, bytesPerGB, 30, false, now)
+		if _, err := store.merge(primary[0].Code, secondary[0].Code, now); !errors.Is(err, errCDKProxyMismatch) {
+			t.Fatalf("err = %v, want errCDKProxyMismatch", err)
+		}
+	})
+}
+
 func TestCDKDeleteExpired(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	store := newTestCDKStore(t)
@@ -360,6 +470,117 @@ func TestHandleDeleteExpiredCDKs(t *testing.T) {
 	if len(remaining) != 1 || remaining[0].Code != live[0].Code {
 		t.Fatalf("expected only the live CDK to remain, got %+v", remaining)
 	}
+}
+
+func TestHandleUserMergeCDKWithCurrentPrimary(t *testing.T) {
+	srv := newTestServer(t)
+	handler := srv.Handler()
+	now := time.Now()
+	created, err := srv.cdk.createBatch(2, bytesPerGB, 30, true, now)
+	if err != nil {
+		t.Fatalf("create cdks: %v", err)
+	}
+	primary, secondary := created[0].Code, created[1].Code
+
+	req := jsonRequest(http.MethodPost, "/api/u/cdks/merge", `{"primary_code":"`+primary+`","secondary_code":"`+secondary+`"}`)
+	req.AddCookie(&http.Cookie{Name: "cdk", Value: primary})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("merge status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var payload userStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Code != primary || payload.RemainingBytes != 2*bytesPerGB {
+		t.Fatalf("payload code/remaining = %s/%d, want %s/%d", payload.Code, payload.RemainingBytes, primary, 2*bytesPerGB)
+	}
+	if got := cdkCookieValue(rec.Result().Cookies()); got != primary {
+		t.Fatalf("set cdk cookie = %q, want primary %q", got, primary)
+	}
+	if _, ok, err := srv.cdk.get(secondary); err != nil || ok {
+		t.Fatalf("secondary should be deleted, ok=%v err=%v", ok, err)
+	}
+}
+
+func TestHandleUserMergeCDKWithCurrentSecondarySwitchesSession(t *testing.T) {
+	srv := newTestServer(t)
+	handler := srv.Handler()
+	now := time.Now()
+	created, err := srv.cdk.createBatch(2, bytesPerGB, 30, true, now)
+	if err != nil {
+		t.Fatalf("create cdks: %v", err)
+	}
+	primary, secondary := created[0].Code, created[1].Code
+
+	req := jsonRequest(http.MethodPost, "/api/u/cdks/merge", `{"primary_code":"`+primary+`","secondary_code":"`+secondary+`"}`)
+	req.AddCookie(&http.Cookie{Name: "cdk", Value: secondary})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("merge status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := cdkCookieValue(rec.Result().Cookies()); got != primary {
+		t.Fatalf("set cdk cookie = %q, want primary %q", got, primary)
+	}
+}
+
+func TestHandleUserMergeCDKRejectsCurrentCDKOutsideMerge(t *testing.T) {
+	srv := newTestServer(t)
+	handler := srv.Handler()
+	now := time.Now()
+	created, err := srv.cdk.createBatch(3, bytesPerGB, 30, true, now)
+	if err != nil {
+		t.Fatalf("create cdks: %v", err)
+	}
+	current, primary, secondary := created[0].Code, created[1].Code, created[2].Code
+
+	req := jsonRequest(http.MethodPost, "/api/u/cdks/merge", `{"primary_code":"`+primary+`","secondary_code":"`+secondary+`"}`)
+	req.AddCookie(&http.Cookie{Name: "cdk", Value: current})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("merge status = %d body=%s, want 403", rec.Code, rec.Body.String())
+	}
+	if _, ok, err := srv.cdk.get(secondary); err != nil || !ok {
+		t.Fatalf("secondary should remain, ok=%v err=%v", ok, err)
+	}
+}
+
+func TestHandleUserMergeCDKRejectsProxyMismatch(t *testing.T) {
+	srv := newTestServer(t)
+	handler := srv.Handler()
+	now := time.Now()
+	primary, err := srv.cdk.createBatch(1, bytesPerGB, 30, true, now)
+	if err != nil {
+		t.Fatalf("create primary: %v", err)
+	}
+	secondary, err := srv.cdk.createBatch(1, bytesPerGB, 30, false, now)
+	if err != nil {
+		t.Fatalf("create secondary: %v", err)
+	}
+
+	req := jsonRequest(http.MethodPost, "/api/u/cdks/merge", `{"primary_code":"`+primary[0].Code+`","secondary_code":"`+secondary[0].Code+`"}`)
+	req.AddCookie(&http.Cookie{Name: "cdk", Value: primary[0].Code})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("merge status = %d body=%s, want 409", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "CDK 中转权限不同，不允许合并") {
+		t.Fatalf("expected proxy mismatch message, got %s", rec.Body.String())
+	}
+}
+
+func cdkCookieValue(cookies []*http.Cookie) string {
+	for _, c := range cookies {
+		if c.Name == "cdk" {
+			return c.Value
+		}
+	}
+	return ""
 }
 
 func TestCDKViewDaysLeft(t *testing.T) {

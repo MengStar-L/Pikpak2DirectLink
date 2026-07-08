@@ -2,7 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import {
   Ticket, LogOut, Gauge, CalendarClock, Hourglass, Link2, Files, CheckCheck, Settings2, Send, Radar, Waypoints,
-  History, ArrowLeft, RefreshCw, Inbox, X,
+  History, ArrowLeft, RefreshCw, Inbox, X, GitMerge,
 } from 'lucide-vue-next'
 import AuroraBg from './components/AuroraBg.vue'
 import GlassCard from './components/GlassCard.vue'
@@ -34,6 +34,11 @@ const historyLoading = ref(false)
 const historyError = ref('')
 const historyItems = ref<ResolveHistorySummary[]>([])
 const historyDetail = ref<ResolveHistoryDetail | null>(null)
+const mergeOpen = ref(false)
+const mergePrimary = ref('')
+const mergeSecondary = ref('')
+const mergeError = ref('')
+const mergeLoading = ref(false)
 
 const { job, phase, error, submitting, submit, selectItems } = useJob({
   create: (b) => api.u.jobs.create(b),
@@ -56,6 +61,7 @@ const historyResults = computed(() => historyDetail.value?.results ?? [])
 setUnauthorizedHandler(() => {
   view.value = 'gate'
   status.value = null
+  closeMerge()
   closeHistory()
   toast('会话已过期，请重新输入 CDK', 'info')
 })
@@ -94,7 +100,45 @@ async function logout() {
   view.value = 'gate'
   status.value = null
   cdkInput.value = ''
+  closeMerge()
   closeHistory()
+}
+
+function openMerge() {
+  mergePrimary.value = status.value?.code || ''
+  mergeSecondary.value = ''
+  mergeError.value = ''
+  mergeOpen.value = true
+}
+function closeMerge() {
+  mergeOpen.value = false
+  mergeError.value = ''
+  mergeLoading.value = false
+}
+async function submitMerge() {
+  const primary = mergePrimary.value.trim().toUpperCase()
+  const secondary = mergeSecondary.value.trim().toUpperCase()
+  mergeError.value = ''
+  if (!primary || !secondary) {
+    mergeError.value = '请输入主 CDK 和副 CDK'
+    return
+  }
+  if (primary === secondary) {
+    mergeError.value = '主 CDK 和副 CDK 不能相同'
+    return
+  }
+  mergeLoading.value = true
+  try {
+    status.value = await api.u.mergeCDK(primary, secondary)
+    closeMerge()
+    toast('CDK 已合并', 'success')
+  } catch (e: any) {
+    const message = e?.message || 'CDK 合并失败'
+    mergeError.value = message
+    toast(message, 'error')
+  } finally {
+    mergeLoading.value = false
+  }
 }
 
 function onSubmit(payload: { input: string; passCode: string; mode: 'direct' | 'proxy' }) {
@@ -234,6 +278,40 @@ onMounted(loadStatus)
 
   <Teleport to="body">
     <Transition name="v-veil">
+      <div v-if="mergeOpen" class="overlay merge-overlay" @click.self="closeMerge">
+        <Transition name="v-pop" appear>
+          <form v-if="mergeOpen" class="dialog merge-dialog" role="dialog" aria-modal="true" aria-label="合并 CDK" @submit.prevent="submitMerge">
+            <div class="dialog-head merge-dialog-head">
+              <h2><GitMerge />合并 CDK</h2>
+              <button type="button" class="dialog-close" aria-label="关闭" @click="closeMerge"><X /></button>
+            </div>
+            <div class="merge-form">
+              <label class="field">
+                <span class="field-label">主 CDK</span>
+                <input v-model="mergePrimary" class="input input-mono" type="text" autocomplete="off" placeholder="保留的 CDK" />
+              </label>
+              <label class="field">
+                <span class="field-label">副 CDK</span>
+                <input v-model="mergeSecondary" class="input input-mono" type="text" autocomplete="off" placeholder="合并后删除的 CDK" />
+              </label>
+            </div>
+            <Transition name="v-fade">
+              <p v-if="mergeError" class="error-block">{{ mergeError }}</p>
+            </Transition>
+            <div class="merge-actions">
+              <button class="btn btn-ghost btn-sm" type="button" @click="closeMerge">取消</button>
+              <PrimaryButton type="submit" size="sm" :loading="mergeLoading">
+                <template #icon><GitMerge /></template>合并
+              </PrimaryButton>
+            </div>
+          </form>
+        </Transition>
+      </div>
+    </Transition>
+  </Teleport>
+
+  <Teleport to="body">
+    <Transition name="v-veil">
       <div v-if="historyOpen" class="overlay history-overlay" @click.self="closeHistory">
         <Transition name="v-pop" appear>
           <div v-if="historyOpen" class="dialog history-dialog" role="dialog" aria-modal="true" aria-label="解析历史">
@@ -346,6 +424,7 @@ onMounted(loadStatus)
           <span class="pill pill-info"><CalendarClock />{{ status?.days_left ?? '-' }} 天</span>
           <span class="pill" :class="status?.allow_proxy ? 'pill-brand' : ''" :title="status?.allow_proxy ? '此 CDK 支持中转下载' : '此 CDK 不支持中转下载'"><Waypoints />中转{{ status?.allow_proxy ? '可用' : '不可用' }}</span>
           <button class="btn btn-ghost btn-sm" type="button" @click="aria2.openConfig()"><Settings2 />aria2</button>
+          <button class="btn btn-ghost btn-sm" type="button" @click="openMerge"><GitMerge />合并 CDK</button>
           <button class="btn btn-ghost btn-sm" type="button" @click="toggleHistory"><History />解析历史</button>
           <button class="btn btn-ghost btn-sm" type="button" @click="logout"><LogOut />退出</button>
         </div>
@@ -427,6 +506,14 @@ onMounted(loadStatus)
 .sec-head.compact h2 { font-size: var(--fs-md); }
 .dock-wrap { padding-top: 13px; border-top: 1px solid var(--line); }
 .res-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.merge-overlay { z-index: 7950; }
+.merge-dialog { width: min(430px, calc(100vw - 32px)); }
+.merge-dialog-head { margin-bottom: 14px; }
+.merge-dialog-head h2 { display: flex; align-items: center; gap: 7px; font-size: var(--fs-lg); }
+.merge-dialog-head h2 svg { width: 17px; height: 17px; color: var(--brand); }
+.merge-form { display: grid; gap: 10px; }
+.merge-form .input { height: 36px; text-transform: uppercase; }
+.merge-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .history-overlay { z-index: 7900; align-items: start; padding-top: 42px; }
 .history-dialog {
   width: min(100%, 1180px);
@@ -485,6 +572,10 @@ onMounted(loadStatus)
 
 @media (max-width: 600px) {
   .portal { padding: 16px 14px 48px; }
+  .merge-overlay { padding: 12px; }
+  .merge-dialog { width: 100%; }
+  .merge-actions { justify-content: stretch; }
+  .merge-actions .btn { flex: 1 1 0; }
   .history-overlay { align-items: stretch; padding: 12px; }
   .history-dialog { max-height: calc(100vh - 24px); }
   .history-dialog-head { align-items: flex-start; }

@@ -445,6 +445,29 @@ type userLoginRequest struct {
 	Code string `json:"code"`
 }
 
+type userMergeCDKRequest struct {
+	PrimaryCode   string `json:"primary_code"`
+	SecondaryCode string `json:"secondary_code"`
+}
+
+func setUserCDKCookie(w http.ResponseWriter, c CDK, now time.Time) {
+	maxAge := int(c.ExpiresAt - now.Unix())
+	if maxAge < 0 {
+		maxAge = 0
+	}
+	if maxAge > 86400*30 {
+		maxAge = 86400 * 30
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "cdk",
+		Value:    c.Code,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   maxAge,
+	})
+}
+
 func (s *Server) handleUserLogin(w http.ResponseWriter, r *http.Request) {
 	var req userLoginRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -472,18 +495,7 @@ func (s *Server) handleUserLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	maxAge := int(c.ExpiresAt - now.Unix())
-	if maxAge > 86400*30 {
-		maxAge = 86400 * 30
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     "cdk",
-		Value:    c.Code,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   maxAge,
-	})
+	setUserCDKCookie(w, c, now)
 	writeJSON(w, http.StatusOK, s.userStatusPayload(c, now))
 }
 
@@ -522,6 +534,58 @@ func (s *Server) handleUserLogout(w http.ResponseWriter, _ *http.Request) {
 		MaxAge:   -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
+}
+
+func (s *Server) handleUserMergeCDK(w http.ResponseWriter, r *http.Request) {
+	current, ok := s.currentCDK(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "CDK 无效或已过期")
+		return
+	}
+
+	var req userMergeCDKRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	primaryCode := normalizeCode(req.PrimaryCode)
+	secondaryCode := normalizeCode(req.SecondaryCode)
+	if primaryCode == "" || secondaryCode == "" {
+		writeError(w, http.StatusBadRequest, "请输入主 CDK 和副 CDK")
+		return
+	}
+	if primaryCode == secondaryCode {
+		writeError(w, http.StatusBadRequest, "主 CDK 和副 CDK 不能相同")
+		return
+	}
+	if current.Code != primaryCode && current.Code != secondaryCode {
+		writeError(w, http.StatusForbidden, "当前登录 CDK 必须参与合并")
+		return
+	}
+
+	now := time.Now()
+	merged, err := s.cdk.merge(primaryCode, secondaryCode, now)
+	if err != nil {
+		switch {
+		case errors.Is(err, errCDKSameMergeCode):
+			writeError(w, http.StatusBadRequest, "主 CDK 和副 CDK 不能相同")
+		case errors.Is(err, errCDKNotFound):
+			writeError(w, http.StatusNotFound, "CDK 不存在")
+		case errors.Is(err, errCDKExpired):
+			writeError(w, http.StatusForbidden, "CDK 已过期")
+		case errors.Is(err, errCDKExhausted):
+			writeError(w, http.StatusForbidden, "副 CDK 剩余流量为 0，无法合并")
+		case errors.Is(err, errCDKProxyMismatch):
+			writeError(w, http.StatusConflict, "CDK 中转权限不同，不允许合并")
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	setUserCDKCookie(w, merged, now)
+	s.logJob(LogSuccess, "", "CDK 合并完成", "主 CDK："+maskCDK(primaryCode), "副 CDK："+maskCDK(secondaryCode), "当前剩余："+formatTrafficLabel(merged.RemainingBytes))
+	writeJSON(w, http.StatusOK, s.userStatusPayload(merged, now))
 }
 
 func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {

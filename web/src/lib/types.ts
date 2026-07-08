@@ -216,6 +216,11 @@ export type UpdateCDKRequest = {
   allow_proxy: boolean
 }
 
+export type MergeCDKRequest = {
+  primary_code: string
+  secondary_code: string
+}
+
 // CDK user-portal projections.
 export type UserStatusResponse = CDKView & {
   queue: { waiting: number; active: boolean }

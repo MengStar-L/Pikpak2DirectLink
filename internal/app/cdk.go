@@ -16,9 +16,11 @@ const cdkAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 const maxCDKBatch = 100
 
 var (
-	errCDKNotFound  = errors.New("CDK not found")
-	errCDKExpired   = errors.New("CDK expired")
-	errCDKExhausted = errors.New("CDK traffic exhausted")
+	errCDKNotFound      = errors.New("CDK not found")
+	errCDKExpired       = errors.New("CDK expired")
+	errCDKExhausted     = errors.New("CDK traffic exhausted")
+	errCDKSameMergeCode = errors.New("primary and secondary CDK must be different")
+	errCDKProxyMismatch = errors.New("CDK proxy permissions differ")
 )
 
 // errCDKOverdraw signals that a resolved file is larger than the CDK's remaining
@@ -217,19 +219,30 @@ func (s *cdkStore) list() ([]CDK, error) {
 }
 
 func (s *cdkStore) get(code string) (CDK, bool, error) {
-	var c CDK
-	var allow int64
-	err := s.db.QueryRow(
+	c, err := scanCDK(s.db.QueryRow(
 		`SELECT code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy FROM cdks WHERE code=?`, code,
-	).Scan(&c.Code, &c.RemainingBytes, &c.UsedBytes, &c.ExpiresAt, &c.CreatedAt, &allow)
+	))
 	if errors.Is(err, sql.ErrNoRows) {
 		return CDK{}, false, nil
 	}
 	if err != nil {
 		return CDK{}, false, err
 	}
-	c.AllowProxy = allow != 0
 	return c, true, nil
+}
+
+type cdkScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanCDK(scanner cdkScanner) (CDK, error) {
+	var c CDK
+	var allow int64
+	if err := scanner.Scan(&c.Code, &c.RemainingBytes, &c.UsedBytes, &c.ExpiresAt, &c.CreatedAt, &allow); err != nil {
+		return CDK{}, err
+	}
+	c.AllowProxy = allow != 0
+	return c, nil
 }
 
 // update resets a CDK's remaining traffic quota (bytes), pushes its expiry to
@@ -259,6 +272,97 @@ func (s *cdkStore) delete(code string) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// merge moves the secondary CDK's remaining traffic into the primary CDK, keeps
+// the later expiry, and deletes the secondary CDK in one transaction.
+func (s *cdkStore) merge(primaryCode, secondaryCode string, now time.Time) (CDK, error) {
+	primaryCode = normalizeCode(primaryCode)
+	secondaryCode = normalizeCode(secondaryCode)
+	if primaryCode == "" || secondaryCode == "" {
+		return CDK{}, errCDKNotFound
+	}
+	if primaryCode == secondaryCode {
+		return CDK{}, errCDKSameMergeCode
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return CDK{}, err
+	}
+	defer tx.Rollback()
+
+	// SQLite serializes writers. Acquiring the writer lock before reading avoids
+	// two concurrent merges both observing the same secondary CDK.
+	if _, err := tx.Exec(`UPDATE cdks SET code=code WHERE code IN (?,?)`, primaryCode, secondaryCode); err != nil {
+		return CDK{}, err
+	}
+
+	load := func(code string) (CDK, bool, error) {
+		c, err := scanCDK(tx.QueryRow(
+			`SELECT code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy FROM cdks WHERE code=?`,
+			code,
+		))
+		if errors.Is(err, sql.ErrNoRows) {
+			return CDK{}, false, nil
+		}
+		if err != nil {
+			return CDK{}, false, err
+		}
+		return c, true, nil
+	}
+
+	primary, ok, err := load(primaryCode)
+	if err != nil {
+		return CDK{}, err
+	}
+	if !ok {
+		return CDK{}, errCDKNotFound
+	}
+	secondary, ok, err := load(secondaryCode)
+	if err != nil {
+		return CDK{}, err
+	}
+	if !ok {
+		return CDK{}, errCDKNotFound
+	}
+
+	nowUnix := now.Unix()
+	if primary.ExpiresAt <= nowUnix || secondary.ExpiresAt <= nowUnix {
+		return CDK{}, errCDKExpired
+	}
+	if secondary.RemainingBytes <= 0 {
+		return CDK{}, errCDKExhausted
+	}
+	if primary.AllowProxy != secondary.AllowProxy {
+		return CDK{}, errCDKProxyMismatch
+	}
+
+	expiresAt := primary.ExpiresAt
+	if secondary.ExpiresAt > expiresAt {
+		expiresAt = secondary.ExpiresAt
+	}
+	if _, err := tx.Exec(
+		`UPDATE cdks SET remaining_bytes=remaining_bytes+?, expires_at=? WHERE code=?`,
+		secondary.RemainingBytes, expiresAt, primary.Code,
+	); err != nil {
+		return CDK{}, err
+	}
+	if _, err := tx.Exec(`DELETE FROM cdks WHERE code=?`, secondary.Code); err != nil {
+		return CDK{}, err
+	}
+
+	merged, ok, err := load(primaryCode)
+	if err != nil {
+		return CDK{}, err
+	}
+	if !ok {
+		return CDK{}, errCDKNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return CDK{}, err
+	}
+	return merged, nil
 }
 
 // deleteExpired removes every CDK whose expiry is at or before now, returning

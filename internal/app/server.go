@@ -233,6 +233,7 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("POST /api/u/login", server.handleUserLogin)
 	server.mux.HandleFunc("GET /api/u/status", server.handleUserStatus)
 	server.mux.HandleFunc("POST /api/u/logout", server.handleUserLogout)
+	server.mux.HandleFunc("POST /api/u/cdks/merge", server.handleUserMergeCDK)
 	server.mux.HandleFunc("POST /api/u/jobs", server.handleUserCreateJob)
 	server.mux.HandleFunc("GET /api/u/jobs/{id}", server.handleUserGetJob)
 	server.mux.HandleFunc("POST /api/u/jobs/{id}/select", server.handleUserSelectItem)

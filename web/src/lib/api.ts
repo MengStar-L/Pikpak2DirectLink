@@ -12,6 +12,7 @@ import type {
   CreateJobRequest,
   Job,
   LogEntry,
+  MergeCDKRequest,
   ResolveHistoryDetail,
   ResolveHistorySummary,
   SelectItemsRequest,
@@ -136,6 +137,11 @@ export const api = {
     login: (code: string) => request<UserStatusResponse>('POST', '/api/u/login', { code }),
     status: () => request<UserStatusResponse>('GET', '/api/u/status'),
     logout: () => request<AuthResult>('POST', '/api/u/logout'),
+    mergeCDK: (primaryCode: string, secondaryCode: string) =>
+      request<UserStatusResponse>('POST', '/api/u/cdks/merge', {
+        primary_code: primaryCode,
+        secondary_code: secondaryCode,
+      } satisfies MergeCDKRequest),
     jobs: {
       create: (body: CreateJobRequest) => request<UserJobView>('POST', '/api/u/jobs', body),
       get: (id: string) => request<UserJobView>('GET', `/api/u/jobs/${id}`),
