@@ -33,6 +33,113 @@ func (f *fakeRestoredLister) ListFiles(ctx context.Context, parentID string) ([]
 	return append([]pikpak.FileEntry(nil), files...), nil
 }
 
+type fakePikPakClient struct {
+	mu          sync.Mutex
+	getFile     func(context.Context, string) (*pikpak.FileEntry, error)
+	deleteFiles func(context.Context, []string) error
+	getCalls    int
+	deleteCalls int
+	deletedIDs  [][]string
+}
+
+func (f *fakePikPakClient) Login(context.Context, string, string) error {
+	return nil
+}
+
+func (f *fakePikPakClient) Status() pikpak.SessionStatus {
+	return pikpak.SessionStatus{Ready: true, LoggedIn: true}
+}
+
+func (f *fakePikPakClient) EnsureRootFolder(context.Context) (string, error) {
+	return "", errors.New("EnsureRootFolder not implemented")
+}
+
+func (f *fakePikPakClient) CreateFolder(context.Context, string, string) (*pikpak.FileEntry, error) {
+	return nil, errors.New("CreateFolder not implemented")
+}
+
+func (f *fakePikPakClient) CreateOfflineTask(context.Context, string, string, string) (*pikpak.TaskEntry, error) {
+	return nil, errors.New("CreateOfflineTask not implemented")
+}
+
+func (f *fakePikPakClient) ListOfflineTasks(context.Context, []string) ([]pikpak.TaskEntry, error) {
+	return nil, errors.New("ListOfflineTasks not implemented")
+}
+
+func (f *fakePikPakClient) ListFiles(context.Context, string) ([]pikpak.FileEntry, error) {
+	return nil, errors.New("ListFiles not implemented")
+}
+
+func (f *fakePikPakClient) GetFile(ctx context.Context, fileID string) (*pikpak.FileEntry, error) {
+	f.mu.Lock()
+	f.getCalls++
+	fn := f.getFile
+	f.mu.Unlock()
+	if fn == nil {
+		return nil, errors.New("GetFile not implemented")
+	}
+	return fn(ctx, fileID)
+}
+
+func (f *fakePikPakClient) GetVIPInfo(context.Context) (*pikpak.VIPInfo, error) {
+	return nil, errors.New("GetVIPInfo not implemented")
+}
+
+func (f *fakePikPakClient) GetShareInfo(context.Context, string, string, string) (*pikpak.ShareListResponse, error) {
+	return nil, errors.New("GetShareInfo not implemented")
+}
+
+func (f *fakePikPakClient) GetShareFolder(context.Context, string, string, string) (*pikpak.ShareListResponse, error) {
+	return nil, errors.New("GetShareFolder not implemented")
+}
+
+func (f *fakePikPakClient) RestoreShare(context.Context, string, string, []string) (*pikpak.RestoreShareResponse, error) {
+	return nil, errors.New("RestoreShare not implemented")
+}
+
+func (f *fakePikPakClient) WaitForFileDownloadURL(context.Context, string, time.Duration, time.Duration) (*pikpak.FileEntry, error) {
+	return nil, errors.New("WaitForFileDownloadURL not implemented")
+}
+
+func (f *fakePikPakClient) DeleteFiles(ctx context.Context, ids []string) error {
+	f.mu.Lock()
+	f.deleteCalls++
+	f.deletedIDs = append(f.deletedIDs, append([]string(nil), ids...))
+	fn := f.deleteFiles
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, ids)
+	}
+	return nil
+}
+
+func (f *fakePikPakClient) counts() (int, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getCalls, f.deleteCalls
+}
+
+func fakeDownloadFile(id, url string, expiresAt time.Time) *pikpak.FileEntry {
+	file := &pikpak.FileEntry{ID: id, Name: "file.bin", Size: "2"}
+	file.ApplicationLink.ApplicationOctetStream.URL = url
+	if !expiresAt.IsZero() {
+		file.ApplicationLink.ApplicationOctetStream.Expire = expiresAt.Format(time.RFC3339)
+	}
+	return file
+}
+
+func fakeAccountPool(accountID string, client pikpakClient) *AccountPool {
+	return &AccountPool{
+		accounts: map[string]*accountState{
+			accountID: {
+				record: accountRecord{ID: accountID, Username: accountID + "@example.com", Status: AccountAvailable},
+				client: client,
+			},
+		},
+		order: []string{accountID},
+	}
+}
+
 func TestBuildContentDispositionIncludesFallbackFilename(t *testing.T) {
 	t.Parallel()
 
@@ -86,6 +193,188 @@ func TestProxyErrorsDoNotExposeInternalDetails(t *testing.T) {
 	}
 	if len(logs[0].Details) == 0 || !strings.Contains(logs[0].Details[0], leakedAccount) {
 		t.Fatalf("expected internal log to retain the diagnostic detail, got %+v", logs[0])
+	}
+}
+
+func TestProxyRefreshesExpiredDirectURLBeforeDownload(t *testing.T) {
+	now := time.Now()
+	payload := []byte("fresh payload")
+	var oldHits int
+	oldUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		oldHits++
+		w.WriteHeader(http.StatusGone)
+	}))
+	defer oldUpstream.Close()
+	newUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
+	}))
+	defer newUpstream.Close()
+
+	client := &fakePikPakClient{
+		getFile: func(context.Context, string) (*pikpak.FileEntry, error) {
+			return fakeDownloadFile("file-1", newUpstream.URL, now.Add(time.Hour)), nil
+		},
+	}
+	s := &Server{
+		config:        Config{RequestTimeout: time.Second},
+		accounts:      fakeAccountPool("acct", client),
+		jobs:          newJobStore(10),
+		logs:          newLogStore(20),
+		proxyFailures: make(map[string]proxyFailureCacheEntry),
+		nowFunc:       func() time.Time { return now },
+	}
+	s.jobs.create(&Job{
+		ID:        "job-proxy",
+		Status:    JobCompleted,
+		AccountID: "acct",
+		Result: &JobResult{
+			File:       DownloadItem{ID: "file-1", Name: "file.bin"},
+			DirectURL:  oldUpstream.URL,
+			ProxyToken: "tok",
+			ExpiresAt:  now.Add(-time.Minute).Format(time.RFC3339),
+			AccountID:  "acct",
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
+	req.SetPathValue("id", "job-proxy")
+	rec := httptest.NewRecorder()
+	s.handleProxy(rec, req)
+
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("response = %d/%q, want 200/%q", rec.Code, rec.Body.String(), payload)
+	}
+	if oldHits != 0 {
+		t.Fatalf("expired old URL was hit %d times", oldHits)
+	}
+	getCalls, _ := client.counts()
+	if getCalls != 1 {
+		t.Fatalf("GetFile calls = %d, want 1", getCalls)
+	}
+	job, _ := s.jobs.get("job-proxy")
+	if got := job.Result.DirectURL; got != newUpstream.URL {
+		t.Fatalf("job direct URL = %q, want refreshed %q", got, newUpstream.URL)
+	}
+}
+
+func TestProxySingleStreamRefreshesAfterInitialEOF(t *testing.T) {
+	now := time.Now()
+	payload := []byte("fresh stream")
+	var oldHits int
+	oldUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		oldHits++
+		w.Header().Set("Content-Length", "10")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer oldUpstream.Close()
+	newUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
+	}))
+	defer newUpstream.Close()
+
+	client := &fakePikPakClient{
+		getFile: func(context.Context, string) (*pikpak.FileEntry, error) {
+			return fakeDownloadFile("file-1", newUpstream.URL, now.Add(time.Hour)), nil
+		},
+	}
+	s := &Server{
+		config:        Config{RequestTimeout: time.Second},
+		accounts:      fakeAccountPool("acct", client),
+		jobs:          newJobStore(10),
+		logs:          newLogStore(20),
+		proxyFailures: make(map[string]proxyFailureCacheEntry),
+		nowFunc:       func() time.Time { return now },
+	}
+	s.jobs.create(&Job{
+		ID:        "job-proxy",
+		Status:    JobCompleted,
+		AccountID: "acct",
+		Result: &JobResult{
+			File:       DownloadItem{ID: "file-1", Name: "file.bin"},
+			DirectURL:  oldUpstream.URL,
+			ProxyToken: "tok",
+			ExpiresAt:  now.Add(time.Hour).Format(time.RFC3339),
+			AccountID:  "acct",
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
+	req.Header.Set("Range", "bytes=0-")
+	req.SetPathValue("id", "job-proxy")
+	rec := httptest.NewRecorder()
+	s.handleProxy(rec, req)
+
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("response = %d/%q, want 200/%q", rec.Code, rec.Body.String(), payload)
+	}
+	if oldHits != 1 {
+		t.Fatalf("old URL hits = %d, want 1", oldHits)
+	}
+	getCalls, _ := client.counts()
+	if getCalls != 1 {
+		t.Fatalf("GetFile calls = %d, want 1", getCalls)
+	}
+}
+
+func TestProxyFailureCacheSuppressesRepeatedBadLink(t *testing.T) {
+	now := time.Now()
+	var oldHits int
+	oldUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		oldHits++
+		w.Header().Set("Content-Length", "10")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer oldUpstream.Close()
+
+	client := &fakePikPakClient{
+		getFile: func(context.Context, string) (*pikpak.FileEntry, error) {
+			return nil, errors.New("refresh failed")
+		},
+	}
+	s := &Server{
+		config:        Config{RequestTimeout: time.Second},
+		accounts:      fakeAccountPool("acct", client),
+		jobs:          newJobStore(10),
+		logs:          newLogStore(20),
+		proxyFailures: make(map[string]proxyFailureCacheEntry),
+		nowFunc:       func() time.Time { return now },
+	}
+	s.jobs.create(&Job{
+		ID:        "job-proxy",
+		Status:    JobCompleted,
+		AccountID: "acct",
+		Result: &JobResult{
+			File:       DownloadItem{ID: "file-1", Name: "file.bin"},
+			DirectURL:  oldUpstream.URL,
+			ProxyToken: "tok",
+			ExpiresAt:  now.Add(time.Hour).Format(time.RFC3339),
+			AccountID:  "acct",
+		},
+	})
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
+		req.Header.Set("Range", "bytes=0-")
+		req.SetPathValue("id", "job-proxy")
+		rec := httptest.NewRecorder()
+		s.handleProxy(rec, req)
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("request %d status = %d, want 502", i+1, rec.Code)
+		}
+	}
+	if oldHits != 1 {
+		t.Fatalf("old URL hits = %d, want cached second request", oldHits)
+	}
+	getCalls, _ := client.counts()
+	if getCalls != 1 {
+		t.Fatalf("GetFile calls = %d, want cached second request", getCalls)
+	}
+	if !logsContain(s.logs.list(0), "proxy failure suppressed", "cache_ttl=30s") {
+		t.Fatalf("expected suppression log, got %+v", s.logs.list(0))
 	}
 }
 
@@ -143,12 +432,15 @@ func TestProxyMultipartServesFullDownloadWithUpstreamRanges(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
 	rec := httptest.NewRecorder()
 
-	served := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+	served, err := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
 		Concurrency: 3,
 		ChunkSize:   5,
 		MinSize:     4,
 	})
 
+	if err != nil {
+		t.Fatalf("serveProxyMultipart: %v", err)
+	}
 	if !served {
 		t.Fatal("expected multipart proxy to serve the response")
 	}
@@ -234,11 +526,14 @@ func TestProxyMultipartFallsBackWhenUpstreamIgnoresRange(t *testing.T) {
 	s := &Server{logs: newLogStore(10)}
 	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
 	rec := httptest.NewRecorder()
-	served := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+	served, err := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
 		Concurrency: 2,
 		ChunkSize:   4,
 		MinSize:     4,
 	})
+	if err != nil {
+		t.Fatalf("serveProxyMultipart: %v", err)
+	}
 	if served {
 		t.Fatal("multipart path should not serve when upstream ignores Range")
 	}
@@ -287,7 +582,7 @@ func TestProxyMultipartRetriesShortRangeRead(t *testing.T) {
 	s := &Server{logs: newLogStore(10)}
 	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
 	rec := httptest.NewRecorder()
-	served := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+	served, err := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
 		Concurrency:    2,
 		ChunkSize:      5,
 		MinSize:        4,
@@ -296,6 +591,9 @@ func TestProxyMultipartRetriesShortRangeRead(t *testing.T) {
 		WindowChunks:   4,
 	})
 
+	if err != nil {
+		t.Fatalf("serveProxyMultipart: %v", err)
+	}
 	if !served {
 		t.Fatal("expected multipart proxy to recover and serve the response")
 	}
@@ -339,7 +637,7 @@ func TestProxyMultipartFallsBackWhenFirstRangeKeepsFailing(t *testing.T) {
 	s := &Server{logs: newLogStore(10)}
 	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
 	rec := httptest.NewRecorder()
-	served := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+	served, err := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
 		Concurrency:    2,
 		ChunkSize:      5,
 		MinSize:        4,
@@ -348,6 +646,9 @@ func TestProxyMultipartFallsBackWhenFirstRangeKeepsFailing(t *testing.T) {
 		WindowChunks:   4,
 	})
 
+	if err == nil {
+		t.Fatal("expected multipart fallback error")
+	}
 	if served {
 		t.Fatal("multipart should decline before writing headers so caller can fall back")
 	}
@@ -396,7 +697,7 @@ func TestProxyMultipartLogsFailureAfterPartialWrite(t *testing.T) {
 	s := &Server{logs: newLogStore(10)}
 	req := httptest.NewRequest(http.MethodGet, "/proxy/job-proxy?token=tok", nil)
 	rec := httptest.NewRecorder()
-	served := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+	served, err := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
 		Concurrency:    1,
 		ChunkSize:      5,
 		MinSize:        4,
@@ -405,6 +706,9 @@ func TestProxyMultipartLogsFailureAfterPartialWrite(t *testing.T) {
 		WindowChunks:   2,
 	})
 
+	if err != nil {
+		t.Fatalf("serveProxyMultipart: %v", err)
+	}
 	if !served {
 		t.Fatal("multipart should report it handled the already-started response")
 	}
@@ -453,7 +757,7 @@ func TestProxyMultipartLimitsPrefetchWindow(t *testing.T) {
 	rec := httptest.NewRecorder()
 	done := make(chan bool, 1)
 	go func() {
-		done <- s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
+		served, err := s.serveProxyMultipart(rec, req, upstream.URL, &JobResult{File: DownloadItem{Name: "file.bin"}}, "job-proxy", proxyMultipartConfig{
 			Concurrency:    4,
 			ChunkSize:      5,
 			MinSize:        4,
@@ -461,6 +765,10 @@ func TestProxyMultipartLimitsPrefetchWindow(t *testing.T) {
 			RetryBaseDelay: time.Millisecond,
 			WindowChunks:   2,
 		})
+		if err != nil {
+			t.Errorf("serveProxyMultipart: %v", err)
+		}
+		done <- served
 	}()
 
 	waitForTestCondition(t, time.Second, func() bool {
@@ -509,6 +817,119 @@ func TestProxySingleStreamLogsUpstreamReadError(t *testing.T) {
 	}
 	if !logsContain(s.logs.list(0), "proxy single stream interrupted", "bytes=5") {
 		t.Fatalf("expected single-stream interruption log, got %+v", s.logs.list(0))
+	}
+}
+
+func TestCompleteJobDefersTempCleanupUntilDirectLinkExpiry(t *testing.T) {
+	now := time.Now()
+	db, err := openDatabase(":memory:")
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	client := &fakePikPakClient{
+		getFile: func(context.Context, string) (*pikpak.FileEntry, error) {
+			return fakeDownloadFile("file-1", "https://cdn.example/file.bin", now.Add(time.Hour)), nil
+		},
+	}
+	s := &Server{
+		config:       Config{RequestTimeout: time.Second},
+		accounts:     fakeAccountPool("acct", client),
+		jobs:         newJobStore(10),
+		logs:         newLogStore(20),
+		tempCleanups: newProxyTempCleanupStore(db),
+		nowFunc:      func() time.Time { return now },
+	}
+	s.jobs.create(&Job{
+		ID:            "job-cleanup",
+		Kind:          ResourceMagnet,
+		Mode:          "proxy",
+		Status:        JobRunning,
+		BaseURL:       "https://proxy.example",
+		TempAccountID: "acct",
+		TempIDs:       []string{"temp-file"},
+	})
+
+	if err := s.completeJob(context.Background(), "job-cleanup", AccountRuntime{ID: "acct", Username: "acct", Client: client}, DownloadItem{ID: "file-1", Name: "file.bin"}); err != nil {
+		t.Fatalf("completeJob: %v", err)
+	}
+	_, deleteCalls := client.counts()
+	if deleteCalls != 0 {
+		t.Fatalf("DeleteFiles calls immediately after completeJob = %d, want 0", deleteCalls)
+	}
+	dueAt := now.Add(4 * time.Hour)
+	due, err := s.tempCleanups.due(dueAt, 10)
+	if err != nil {
+		t.Fatalf("cleanup due: %v", err)
+	}
+	if len(due) != 1 {
+		t.Fatalf("deferred cleanup records = %d, want 1", len(due))
+	}
+	if !sameStringSet(due[0].FileIDs, []string{"temp-file", "file-1"}) {
+		t.Fatalf("cleanup file ids = %v, want temp-file and file-1", due[0].FileIDs)
+	}
+
+	s.cleanupProxyTempResources(dueAt)
+	_, deleteCalls = client.counts()
+	if deleteCalls != 1 {
+		t.Fatalf("DeleteFiles calls after due cleanup = %d, want 1", deleteCalls)
+	}
+	due, err = s.tempCleanups.due(dueAt, 10)
+	if err != nil {
+		t.Fatalf("cleanup due after delete: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("cleanup records after delete = %d, want 0", len(due))
+	}
+}
+
+func TestProxyTempCleanupFailureDelaysRetry(t *testing.T) {
+	now := time.Now()
+	db, err := openDatabase(":memory:")
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	client := &fakePikPakClient{
+		deleteFiles: func(context.Context, []string) error {
+			return errors.New("delete failed")
+		},
+	}
+	store := newProxyTempCleanupStore(db)
+	if err := store.record("job-cleanup", "acct", []string{"temp-file"}, now.Add(-time.Minute), now.Add(-time.Hour)); err != nil {
+		t.Fatalf("record cleanup: %v", err)
+	}
+	s := &Server{
+		config:       Config{RequestTimeout: time.Second},
+		accounts:     fakeAccountPool("acct", client),
+		jobs:         newJobStore(10),
+		logs:         newLogStore(20),
+		tempCleanups: store,
+		nowFunc:      func() time.Time { return now },
+	}
+
+	s.cleanupProxyTempResources(now)
+
+	_, deleteCalls := client.counts()
+	if deleteCalls != 1 {
+		t.Fatalf("DeleteFiles calls = %d, want 1", deleteCalls)
+	}
+	due, err := store.due(now.Add(time.Minute), 10)
+	if err != nil {
+		t.Fatalf("cleanup due: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("cleanup should be delayed after failure, due records = %d", len(due))
+	}
+	var attempts int
+	var lastErr string
+	if err := db.QueryRow(`SELECT attempts, last_error FROM proxy_temp_cleanups WHERE job_id='job-cleanup'`).Scan(&attempts, &lastErr); err != nil {
+		t.Fatalf("scan cleanup failure: %v", err)
+	}
+	if attempts != 1 || !strings.Contains(lastErr, "delete failed") {
+		t.Fatalf("failure record attempts/error = %d/%q", attempts, lastErr)
 	}
 }
 
@@ -572,6 +993,23 @@ func logsContain(entries []LogEntry, message, detail string) bool {
 		}
 	}
 	return false
+}
+
+func sameStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	counts := make(map[string]int, len(got))
+	for _, value := range got {
+		counts[value]++
+	}
+	for _, value := range want {
+		if counts[value] == 0 {
+			return false
+		}
+		counts[value]--
+	}
+	return true
 }
 
 func waitForTestCondition(t *testing.T, timeout time.Duration, ok func() bool, changed <-chan struct{}) {

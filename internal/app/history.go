@@ -49,11 +49,13 @@ func (s *Server) runResolveHistoryCleanup(ctx context.Context) {
 
 func (s *Server) cleanupResolveHistory(now time.Time) {
 	if s.history == nil {
+		s.cleanupProxyTempResources(now)
 		return
 	}
 	if _, err := s.history.deleteExpired(now); err != nil {
 		s.logJob(LogWarn, "", "CDK resolve history cleanup failed", err.Error())
 	}
+	s.cleanupProxyTempResources(now)
 }
 
 func (s *Server) saveCDKHistory(jobID string) {

@@ -69,7 +69,24 @@ type AccountSummary struct {
 type AccountRuntime struct {
 	ID       string
 	Username string
-	Client   *pikpak.Client
+	Client   pikpakClient
+}
+
+type pikpakClient interface {
+	Login(ctx context.Context, username, password string) error
+	Status() pikpak.SessionStatus
+	EnsureRootFolder(ctx context.Context) (string, error)
+	CreateFolder(ctx context.Context, name, parentID string) (*pikpak.FileEntry, error)
+	CreateOfflineTask(ctx context.Context, sourceURL, parentID, name string) (*pikpak.TaskEntry, error)
+	ListOfflineTasks(ctx context.Context, phases []string) ([]pikpak.TaskEntry, error)
+	ListFiles(ctx context.Context, parentID string) ([]pikpak.FileEntry, error)
+	GetFile(ctx context.Context, fileID string) (*pikpak.FileEntry, error)
+	GetVIPInfo(ctx context.Context) (*pikpak.VIPInfo, error)
+	GetShareInfo(ctx context.Context, shareID, passCode, parentID string) (*pikpak.ShareListResponse, error)
+	GetShareFolder(ctx context.Context, shareID, passCodeToken, parentID string) (*pikpak.ShareListResponse, error)
+	RestoreShare(ctx context.Context, shareID, passCodeToken string, fileIDs []string) (*pikpak.RestoreShareResponse, error)
+	WaitForFileDownloadURL(ctx context.Context, fileID string, timeout, pollInterval time.Duration) (*pikpak.FileEntry, error)
+	DeleteFiles(ctx context.Context, fileIDs []string) error
 }
 
 type accountRecord struct {
@@ -104,7 +121,7 @@ type ParseError struct {
 
 type accountState struct {
 	record accountRecord
-	client *pikpak.Client
+	client pikpakClient
 }
 
 type AccountPool struct {
@@ -327,7 +344,7 @@ func (p *AccountPool) RefreshPremiumInfo(ctx context.Context) {
 
 	type target struct {
 		id     string
-		client *pikpak.Client
+		client pikpakClient
 	}
 
 	p.mu.RLock()

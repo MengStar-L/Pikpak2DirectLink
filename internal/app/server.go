@@ -37,11 +37,14 @@ type Server struct {
 	cdk                  *cdkStore
 	settings             *settingsStore
 	history              *resolveHistoryStore
+	tempCleanups         *proxyTempCleanupStore
 	gateHTML             []byte
 	userHTML             []byte
 	mux                  *http.ServeMux
 	batchMu              sync.Mutex
 	batches              map[string]*batchState
+	proxyFailuresMu      sync.Mutex
+	proxyFailures        map[string]proxyFailureCacheEntry
 	healthCancel         context.CancelFunc
 	healthDone           chan struct{}
 	historyCancel        context.CancelFunc
@@ -144,20 +147,22 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	server := &Server{
-		config:       cfg,
-		accounts:     accounts,
-		jobs:         newJobStore(200),
-		logs:         newLogStore(500),
-		authSessions: newAuthSessionStore(),
-		creds:        creds,
-		db:           db,
-		cdk:          newCDKStore(db),
-		settings:     newSettingsStore(db),
-		history:      newResolveHistoryStore(db),
-		gateHTML:     gateHTML,
-		userHTML:     userHTML,
-		mux:          http.NewServeMux(),
-		batches:      make(map[string]*batchState),
+		config:        cfg,
+		accounts:      accounts,
+		jobs:          newJobStore(200),
+		logs:          newLogStore(500),
+		authSessions:  newAuthSessionStore(),
+		creds:         creds,
+		db:            db,
+		cdk:           newCDKStore(db),
+		settings:      newSettingsStore(db),
+		history:       newResolveHistoryStore(db),
+		tempCleanups:  newProxyTempCleanupStore(db),
+		gateHTML:      gateHTML,
+		userHTML:      userHTML,
+		mux:           http.NewServeMux(),
+		batches:       make(map[string]*batchState),
+		proxyFailures: make(map[string]proxyFailureCacheEntry),
 	}
 
 	if err := server.accounts.EnsureCredentialSchedule(time.Now(), server.accountHealthInterval()); err != nil {
@@ -772,10 +777,21 @@ var defaultProxyMultipartConfig = proxyMultipartConfig{
 	WindowChunks:   8,
 }
 
+const (
+	proxyDirectLinkRefreshSkew = 2 * time.Minute
+	proxyFailureCacheTTL       = 30 * time.Second
+)
+
 type proxyByteRange struct {
 	Index int
 	Start int64
 	End   int64
+}
+
+type proxyFailureCacheEntry struct {
+	Until             time.Time
+	Status            int
+	SuppressionLogged bool
 }
 
 func normalizeProxyMultipartConfig(cfg proxyMultipartConfig) proxyMultipartConfig {
@@ -795,6 +811,74 @@ func formatProxyRange(br proxyByteRange) string {
 	return fmt.Sprintf("bytes=%d-%d", br.Start, br.End)
 }
 
+func shouldRefreshProxyStatus(status int) bool {
+	return status == http.StatusForbidden ||
+		status == http.StatusNotFound ||
+		status == http.StatusGone ||
+		status >= http.StatusInternalServerError
+}
+
+func (s *Server) proxyFailureKey(jobID, token string) string {
+	return jobID + ":" + token + ":download"
+}
+
+func (s *Server) cachedProxyFailure(jobID, token string) (int, bool) {
+	s.proxyFailuresMu.Lock()
+	if s.proxyFailures == nil {
+		s.proxyFailuresMu.Unlock()
+		return 0, false
+	}
+	key := s.proxyFailureKey(jobID, token)
+	entry, ok := s.proxyFailures[key]
+	if !ok {
+		s.proxyFailuresMu.Unlock()
+		return 0, false
+	}
+	now := s.now()
+	if !entry.Until.After(now) {
+		delete(s.proxyFailures, key)
+		s.proxyFailuresMu.Unlock()
+		return 0, false
+	}
+	logSuppression := false
+	if !entry.SuppressionLogged {
+		entry.SuppressionLogged = true
+		s.proxyFailures[key] = entry
+		logSuppression = true
+	}
+	if entry.Status == 0 {
+		entry.Status = http.StatusBadGateway
+	}
+	s.proxyFailuresMu.Unlock()
+	if logSuppression {
+		s.logJob(LogWarn, jobID, "proxy failure suppressed", "cache_ttl="+proxyFailureCacheTTL.String())
+	}
+	return entry.Status, true
+}
+
+func (s *Server) rememberProxyFailure(jobID, token string, status int) {
+	s.proxyFailuresMu.Lock()
+	defer s.proxyFailuresMu.Unlock()
+	if s.proxyFailures == nil {
+		s.proxyFailures = make(map[string]proxyFailureCacheEntry)
+	}
+	if status == 0 {
+		status = http.StatusBadGateway
+	}
+	s.proxyFailures[s.proxyFailureKey(jobID, token)] = proxyFailureCacheEntry{
+		Until:  s.now().Add(proxyFailureCacheTTL),
+		Status: status,
+	}
+}
+
+func (s *Server) clearProxyFailure(jobID, token string) {
+	s.proxyFailuresMu.Lock()
+	defer s.proxyFailuresMu.Unlock()
+	if s.proxyFailures != nil {
+		delete(s.proxyFailures, s.proxyFailureKey(jobID, token))
+	}
+}
+
 // jobAllowsProxy reports whether a job may expose proxy (中转) links. Admin jobs
 // (no CDK) always may; a CDK job may only if its CDK has AllowProxy set. A
 // missing/deleted CDK is treated as allowed so the admin path and edge cases
@@ -808,6 +892,97 @@ func (s *Server) jobAllowsProxy(cdkCode string) bool {
 		return true
 	}
 	return c.AllowProxy
+}
+
+func proxyResultAccountID(job *Job, result *JobResult) string {
+	if result != nil && strings.TrimSpace(result.AccountID) != "" {
+		return strings.TrimSpace(result.AccountID)
+	}
+	if job != nil {
+		return strings.TrimSpace(job.AccountID)
+	}
+	return ""
+}
+
+func proxyResultNeedsRefresh(result *JobResult, now time.Time) bool {
+	if result == nil {
+		return false
+	}
+	expiresAt, ok := parseProxyResultExpiry(result.ExpiresAt)
+	if !ok {
+		return false
+	}
+	return !expiresAt.After(now.Add(proxyDirectLinkRefreshSkew))
+}
+
+func jobProxyResultForUpdate(job *Job, token string) *JobResult {
+	if job == nil {
+		return nil
+	}
+	if token != "" {
+		return job.resultForToken(token)
+	}
+	if job.Result != nil && job.Result.ProxyToken == "" {
+		return job.Result
+	}
+	return nil
+}
+
+func (s *Server) refreshProxyDirectLink(ctx context.Context, jobID, token string, job *Job, result *JobResult) (string, error) {
+	if result == nil || strings.TrimSpace(result.File.ID) == "" {
+		return "", errors.New("proxy result file id is missing")
+	}
+	accountID := proxyResultAccountID(job, result)
+	if accountID == "" {
+		return "", errors.New("proxy result account is missing")
+	}
+	if s.accounts == nil {
+		return "", errors.New("account pool is missing")
+	}
+	account, ok := s.accounts.Get(accountID)
+	if !ok || account.Client == nil {
+		return "", fmt.Errorf("job account %q is no longer available", accountID)
+	}
+	timeout := s.config.RequestTimeout
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	file, err := account.Client.GetFile(refreshCtx, result.File.ID)
+	if err != nil {
+		return "", err
+	}
+	directURL := strings.TrimSpace(file.BestDownloadURL())
+	if directURL == "" {
+		return "", errors.New("PikPak returned an empty download URL")
+	}
+	expiresAt := ""
+	if expiry := file.ExpireAt(); !expiry.IsZero() {
+		expiresAt = expiry.Format(time.RFC3339)
+	}
+	_, err = s.jobs.update(jobID, func(current *Job) error {
+		target := jobProxyResultForUpdate(current, token)
+		if target == nil {
+			return errors.New("proxy result is no longer available")
+		}
+		target.DirectURL = directURL
+		target.AccountID = account.ID
+		target.ExpiresAt = expiresAt
+		target.applyPreferredURL(current.Mode)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	result.DirectURL = directURL
+	result.AccountID = account.ID
+	result.ExpiresAt = expiresAt
+	result.File.MimeType = firstNonEmpty(result.File.MimeType, file.MimeType)
+	result.File.Size = firstNonEmpty(result.File.Size, file.Size)
+	s.logJob(LogInfo, jobID, "proxy direct link refreshed", "file="+firstNonEmpty(result.File.Name, result.File.Path, result.File.ID))
+	return directURL, nil
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -838,41 +1013,33 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if status, ok := s.cachedProxyFailure(jobID, providedToken); ok {
+		writeError(w, status, proxyDownloadFailedError)
+		return
+	}
 	if result.File.ID == "" {
 		writeError(w, http.StatusConflict, proxyNotReadyError)
 		return
 	}
 
 	sourceURL := strings.TrimSpace(result.DirectURL)
-	if sourceURL == "" {
-		// A multi-link parent merges results from several children, each possibly
-		// resolved on a different account, so prefer the result's own account and
-		// fall back to the job's for single-result (admin) jobs.
-		accountID := result.AccountID
-		if accountID == "" {
-			accountID = job.AccountID
-		}
-		if accountID == "" {
-			s.writeProxyFailure(w, http.StatusConflict, jobID, fmt.Errorf("job account is missing"))
-			return
-		}
-		account, ok := s.accounts.Get(accountID)
-		if !ok {
-			s.writeProxyFailure(w, http.StatusConflict, jobID, fmt.Errorf("job account %q is no longer available", accountID))
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
-		defer cancel()
-
-		file, err := account.Client.GetFile(ctx, result.File.ID)
+	refreshed := false
+	if sourceURL == "" || proxyResultNeedsRefresh(result, s.now()) {
+		refreshedURL, err := s.refreshProxyDirectLink(r.Context(), jobID, providedToken, job, result)
 		if err != nil {
-			s.writeProxyFailure(w, http.StatusBadGateway, jobID, err)
-			return
+			if sourceURL == "" {
+				s.rememberProxyFailure(jobID, providedToken, http.StatusBadGateway)
+				s.writeProxyFailure(w, http.StatusBadGateway, jobID, err)
+				return
+			}
+			s.logJob(LogWarn, jobID, "proxy direct link refresh failed", err.Error())
+		} else {
+			sourceURL = refreshedURL
+			refreshed = true
 		}
-		sourceURL = file.BestDownloadURL()
 	}
 	if sourceURL == "" {
+		s.rememberProxyFailure(jobID, providedToken, http.StatusBadGateway)
 		s.writeProxyFailure(w, http.StatusBadGateway, jobID, errors.New("download URL is empty"))
 		return
 	}
@@ -882,14 +1049,47 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		strings.TrimSpace(r.Header.Get("If-Range")) == "" &&
 		strings.TrimSpace(r.Header.Get("If-None-Match")) == "" &&
 		strings.TrimSpace(r.Header.Get("If-Modified-Since")) == "" {
-		if s.serveProxyMultipart(w, r, sourceURL, result, jobID, defaultProxyMultipartConfig) {
+		served, multipartErr := s.serveProxyMultipart(w, r, sourceURL, result, jobID, defaultProxyMultipartConfig)
+		if served {
+			s.clearProxyFailure(jobID, providedToken)
 			return
 		}
+		if multipartErr != nil && !refreshed && isRefreshableProxyError(multipartErr) && r.Context().Err() == nil {
+			refreshedURL, err := s.refreshProxyDirectLink(r.Context(), jobID, providedToken, job, result)
+			if err != nil {
+				s.logJob(LogWarn, jobID, "proxy direct link refresh failed", err.Error())
+			} else {
+				sourceURL = refreshedURL
+				refreshed = true
+				if served, _ := s.serveProxyMultipart(w, r, sourceURL, result, jobID, defaultProxyMultipartConfig); served {
+					s.clearProxyFailure(jobID, providedToken)
+					return
+				}
+			}
+		}
 	}
-	s.serveProxySingleStream(w, r, sourceURL, result, jobID)
+	if err := s.serveProxySingleStream(w, r, sourceURL, result, jobID); err != nil {
+		if !refreshed && isRefreshableProxyStreamError(err) && r.Context().Err() == nil {
+			refreshedURL, refreshErr := s.refreshProxyDirectLink(r.Context(), jobID, providedToken, job, result)
+			if refreshErr == nil {
+				if retryErr := s.serveProxySingleStream(w, r, refreshedURL, result, jobID); retryErr == nil {
+					s.clearProxyFailure(jobID, providedToken)
+					return
+				} else {
+					err = retryErr
+				}
+			} else {
+				s.logJob(LogWarn, jobID, "proxy direct link refresh failed", refreshErr.Error())
+			}
+		}
+		s.rememberProxyFailure(jobID, providedToken, http.StatusBadGateway)
+		s.writeProxyFailure(w, http.StatusBadGateway, jobID, err)
+		return
+	}
+	s.clearProxyFailure(jobID, providedToken)
 }
 
-func (s *Server) serveProxySingleStream(w http.ResponseWriter, r *http.Request, sourceURL string, result *JobResult, jobID string) {
+func (s *Server) serveProxySingleStream(w http.ResponseWriter, r *http.Request, sourceURL string, result *JobResult, jobID string) error {
 	upstreamMethod := r.Method
 	if upstreamMethod == http.MethodHead {
 		upstreamMethod = http.MethodGet
@@ -897,8 +1097,7 @@ func (s *Server) serveProxySingleStream(w http.ResponseWriter, r *http.Request, 
 
 	proxyReq, err := http.NewRequestWithContext(r.Context(), upstreamMethod, sourceURL, nil)
 	if err != nil {
-		s.writeProxyFailure(w, http.StatusBadGateway, jobID, err)
-		return
+		return err
 	}
 	copyHeaderIfPresent(proxyReq.Header, r.Header, "Range")
 	copyHeaderIfPresent(proxyReq.Header, r.Header, "If-Range")
@@ -907,46 +1106,53 @@ func (s *Server) serveProxySingleStream(w http.ResponseWriter, r *http.Request, 
 
 	resp, err := proxyHTTPClient.Do(proxyReq)
 	if err != nil {
-		s.writeProxyFailure(w, http.StatusBadGateway, jobID, err)
-		return
+		return newProxyStreamRefreshError(err)
 	}
 	defer resp.Body.Close()
-
-	for _, key := range []string{
-		"Accept-Ranges",
-		"Cache-Control",
-		"Content-Disposition",
-		"Content-Length",
-		"Content-Range",
-		"Content-Type",
-		"ETag",
-		"Last-Modified",
-	} {
-		copyHeaderIfPresent(w.Header(), resp.Header, key)
-	}
-	if w.Header().Get("Content-Disposition") == "" && result.File.Name != "" {
-		w.Header().Set("Content-Disposition", buildContentDisposition(result.File.Name))
+	if shouldRefreshProxyStatus(resp.StatusCode) {
+		return newProxyStreamRefreshError(fmt.Errorf("upstream returned %s", resp.Status))
 	}
 
-	w.WriteHeader(resp.StatusCode)
 	if r.Method == http.MethodHead {
-		return
+		copyProxySingleStreamHeaders(w.Header(), resp.Header, result)
+		w.WriteHeader(resp.StatusCode)
+		return nil
 	}
 	// Stream with a large buffer and flush each chunk: bigger reads/writes keep
 	// the pipe full on high-latency links, and flushing avoids any server-side
 	// buffering stall. (io.CopyBuffer alone would defer to the response writer's
 	// 32 KiB ReadFrom path, so copy explicitly.)
 	rc := http.NewResponseController(w)
-	_ = rc.Flush()
 	buf := make([]byte, 1<<20) // 1 MiB
+	n, rerr := resp.Body.Read(buf)
+	if rerr != nil && n == 0 && !errors.Is(rerr, io.EOF) {
+		return newProxyStreamRefreshError(rerr)
+	}
+	copyProxySingleStreamHeaders(w.Header(), resp.Header, result)
+	w.WriteHeader(resp.StatusCode)
+	_ = rc.Flush()
 	written := int64(0)
+	if n > 0 {
+		wrote, werr := w.Write(buf[:n])
+		written += int64(wrote)
+		if werr != nil {
+			return nil
+		}
+		_ = rc.Flush()
+	}
+	if rerr != nil {
+		if !errors.Is(rerr, io.EOF) {
+			s.logJob(LogError, jobID, "proxy single stream interrupted", "bytes="+strconv.FormatInt(written, 10), rerr.Error())
+		}
+		return nil
+	}
 	for {
-		n, rerr := resp.Body.Read(buf)
+		n, rerr = resp.Body.Read(buf)
 		if n > 0 {
 			wrote, werr := w.Write(buf[:n])
 			written += int64(wrote)
 			if werr != nil {
-				return
+				return nil
 			}
 			_ = rc.Flush()
 		}
@@ -957,6 +1163,7 @@ func (s *Server) serveProxySingleStream(w http.ResponseWriter, r *http.Request, 
 			break
 		}
 	}
+	return nil
 }
 
 type proxyRangeProbe struct {
@@ -972,10 +1179,10 @@ type proxyRangeResult struct {
 	Err      error
 }
 
-func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sourceURL string, result *JobResult, jobID string, cfg proxyMultipartConfig) bool {
+func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sourceURL string, result *JobResult, jobID string, cfg proxyMultipartConfig) (bool, error) {
 	cfg = normalizeProxyMultipartConfig(cfg)
 	if cfg.Concurrency < 1 || cfg.ChunkSize <= 0 || cfg.MinSize <= 0 {
-		return false
+		return false, nil
 	}
 
 	ctx, cancel := context.WithCancel(r.Context())
@@ -983,15 +1190,15 @@ func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sou
 
 	probe, ok, err := probeProxyRangeSupport(ctx, sourceURL)
 	if err != nil {
-		return false
+		return false, err
 	}
 	if !ok || probe.Size < cfg.MinSize {
-		return false
+		return false, nil
 	}
 
 	ranges := proxyByteRanges(probe.Size, cfg.ChunkSize)
 	if len(ranges) <= 1 {
-		return false
+		return false, nil
 	}
 
 	workers := cfg.Concurrency
@@ -1002,7 +1209,7 @@ func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sou
 		workers = cfg.WindowChunks
 	}
 	if workers < 1 {
-		return false
+		return false, nil
 	}
 	results := make(chan proxyRangeResult, workers)
 	pending := make(map[int]proxyRangeResult)
@@ -1031,17 +1238,17 @@ func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sou
 	for completed := 0; completed < len(ranges); completed++ {
 		select {
 		case <-ctx.Done():
-			return true
+			return true, nil
 		case res := <-results:
 			inFlight--
 			if res.Err != nil {
 				cancel()
 				if !wroteHeader {
 					s.logJob(LogWarn, jobID, "proxy multipart range failed before fallback", proxyRangeFailureDetails(res)...)
-					return false
+					return false, res.Err
 				}
 				s.logJob(LogError, jobID, "proxy multipart download interrupted", proxyRangeFailureDetails(res)...)
-				return true
+				return true, nil
 			}
 			if res.Attempts > 1 && !loggedRetryRecovery {
 				s.logJob(LogWarn, jobID, "proxy multipart range recovered after retry", proxyRangeRecoveryDetails(res)...)
@@ -1068,7 +1275,7 @@ func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sou
 				}
 				if _, err := w.Write(ready.Data); err != nil {
 					cancel()
-					return true
+					return true, nil
 				}
 				_ = rc.Flush()
 				delete(pending, next)
@@ -1077,7 +1284,7 @@ func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sou
 			dispatch()
 		}
 	}
-	return wroteHeader
+	return wroteHeader, nil
 }
 
 func probeProxyRangeSupport(ctx context.Context, sourceURL string) (proxyRangeProbe, bool, error) {
@@ -1090,7 +1297,7 @@ func probeProxyRangeSupport(ctx context.Context, sourceURL string) (proxyRangePr
 
 	resp, err := proxyHTTPClient.Do(req)
 	if err != nil {
-		return proxyRangeProbe{}, false, err
+		return proxyRangeProbe{}, false, newProxyStreamRefreshError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusPartialContent {
@@ -1124,6 +1331,38 @@ func newProxyRangeError(err error, retryable bool) error {
 		return nil
 	}
 	return &proxyRangeError{err: err, retryable: retryable}
+}
+
+type proxyStreamRefreshError struct {
+	err error
+}
+
+func (e *proxyStreamRefreshError) Error() string {
+	return e.err.Error()
+}
+
+func (e *proxyStreamRefreshError) Unwrap() error {
+	return e.err
+}
+
+func newProxyStreamRefreshError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &proxyStreamRefreshError{err: err}
+}
+
+func isRefreshableProxyStreamError(err error) bool {
+	var refreshErr *proxyStreamRefreshError
+	return errors.As(err, &refreshErr)
+}
+
+func isRefreshableProxyError(err error) bool {
+	if isRefreshableProxyStreamError(err) {
+		return true
+	}
+	var rangeErr *proxyRangeError
+	return errors.As(err, &rangeErr)
 }
 
 func retryableProxyStatus(status int) bool {
@@ -1281,6 +1520,24 @@ func copyProxyDownloadHeaders(dst, src http.Header) {
 		"Last-Modified",
 	} {
 		copyHeaderIfPresent(dst, src, key)
+	}
+}
+
+func copyProxySingleStreamHeaders(dst, src http.Header, result *JobResult) {
+	for _, key := range []string{
+		"Accept-Ranges",
+		"Cache-Control",
+		"Content-Disposition",
+		"Content-Length",
+		"Content-Range",
+		"Content-Type",
+		"ETag",
+		"Last-Modified",
+	} {
+		copyHeaderIfPresent(dst, src, key)
+	}
+	if result != nil && dst.Get("Content-Disposition") == "" && result.File.Name != "" {
+		dst.Set("Content-Disposition", buildContentDisposition(result.File.Name))
 	}
 }
 
@@ -1821,13 +2078,11 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 		}
 	}
 
-	s.updateJobState(jobID, JobRunning, StageTransfer, "cleaning temporary PikPak files", "")
-	s.logJob(LogInfo, jobID, "开始清理 PikPak 临时文件 ...")
-	if err := s.cleanupJobTempResources(ctx, jobID, account, item.ID); err != nil {
-		s.logJob(LogWarn, jobID, "temporary PikPak cleanup failed", err.Error())
-		s.addJobWarning(jobID, "Temporary PikPak cleanup failed; generated links are still ready.")
+	cleanupAfter := proxyDeferredCleanupAfter([]JobResult{*result}, s.now())
+	if err := s.deferJobTempCleanup(jobID, account, cleanupAfter, item.ID); err != nil {
+		s.logJob(LogWarn, jobID, "deferred PikPak cleanup failed", err.Error())
+		s.addJobWarning(jobID, "Temporary PikPak cleanup could not be scheduled; generated links are still ready.")
 	}
-	s.logJob(LogSuccess, jobID, "PikPak 临时文件已清理")
 
 	_, err = s.jobs.update(jobID, func(job *Job) error {
 		job.Status = JobCompleted
@@ -1937,13 +2192,11 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 		}
 	}
 
-	s.updateJobState(jobID, JobRunning, StageTransfer, "cleaning temporary PikPak files", "")
-	s.logJob(LogInfo, jobID, "开始清理 PikPak 临时文件 ...")
-	if err := s.cleanupJobTempResources(ctx, jobID, account, fallbackIDs...); err != nil {
-		s.logJob(LogWarn, jobID, "temporary PikPak cleanup failed", err.Error())
-		s.addJobWarning(jobID, "Temporary PikPak cleanup failed; generated links are still ready.")
+	cleanupAfter := proxyDeferredCleanupAfter(results, s.now())
+	if err := s.deferJobTempCleanup(jobID, account, cleanupAfter, fallbackIDs...); err != nil {
+		s.logJob(LogWarn, jobID, "deferred PikPak cleanup failed", err.Error())
+		s.addJobWarning(jobID, "Temporary PikPak cleanup could not be scheduled; generated links are still ready.")
 	}
-	s.logJob(LogSuccess, jobID, "PikPak 临时文件已清理")
 
 	_, err := s.jobs.update(jobID, func(job *Job) error {
 		job.Status = JobCompleted

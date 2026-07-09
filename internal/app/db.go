@@ -72,7 +72,19 @@ CREATE TABLE IF NOT EXISTS cdk_resolve_history (
 CREATE INDEX IF NOT EXISTS idx_cdk_resolve_history_cdk_completed
 ON cdk_resolve_history(cdk_code, completed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cdk_resolve_history_expires
-ON cdk_resolve_history(expires_at);`
+ON cdk_resolve_history(expires_at);
+CREATE TABLE IF NOT EXISTS proxy_temp_cleanups (
+    id             TEXT PRIMARY KEY,
+    job_id         TEXT NOT NULL,
+    account_id     TEXT NOT NULL,
+    file_ids_json  TEXT NOT NULL,
+    cleanup_after  INTEGER NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_temp_cleanups_after
+ON proxy_temp_cleanups(cleanup_after);`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
