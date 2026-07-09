@@ -123,8 +123,6 @@ CREATE TABLE IF NOT EXISTS cdk_resolve_history (
 );
 CREATE INDEX IF NOT EXISTS idx_cdk_resolve_history_cdk_completed
 ON cdk_resolve_history(cdk_code, completed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_cdk_resolve_history_user_completed
-ON cdk_resolve_history(user_id, completed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cdk_resolve_history_expires
 ON cdk_resolve_history(expires_at);
 CREATE TABLE IF NOT EXISTS proxy_temp_cleanups (
