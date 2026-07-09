@@ -39,46 +39,72 @@ func (e errCDKOverdraw) Error() string {
 // CDK is the stored representation of a redemption code. Quota is metered in
 // bytes of downstream traffic (RemainingBytes left, UsedBytes consumed).
 type CDK struct {
-	Code           string
-	RemainingBytes int64
-	UsedBytes      int64
-	ExpiresAt      int64 // unix seconds
-	CreatedAt      int64 // unix seconds
-	AllowProxy     bool  // whether this CDK may use proxy (中转) download
+	Code             string
+	RemainingBytes   int64
+	UsedBytes        int64
+	ExpiresAt        int64 // unix seconds
+	CreatedAt        int64 // unix seconds
+	AllowProxy       bool  // whether this CDK may use proxy (中转) download
+	DurationDays     int
+	RedeemedByUserID string
+	RedeemedAt       int64
+	RevokedAt        int64
 }
 
 // cdkView is the JSON shape returned to clients, with derived fields. Traffic is
 // reported both as raw bytes (for the UI to do exact math) and as a human label.
 type cdkView struct {
-	Code           string `json:"code"`
-	RemainingBytes int64  `json:"remaining_bytes"`
-	UsedBytes      int64  `json:"used_bytes"`
-	RemainingLabel string `json:"remaining_label"`
-	UsedLabel      string `json:"used_label"`
-	ExpiresAt      string `json:"expires_at"`
-	CreatedAt      string `json:"created_at"`
-	DaysLeft       int    `json:"days_left"`
-	Expired        bool   `json:"expired"`
-	AllowProxy     bool   `json:"allow_proxy"`
+	Code             string `json:"code"`
+	RemainingBytes   int64  `json:"remaining_bytes"`
+	UsedBytes        int64  `json:"used_bytes"`
+	RemainingLabel   string `json:"remaining_label"`
+	UsedLabel        string `json:"used_label"`
+	ExpiresAt        string `json:"expires_at"`
+	CreatedAt        string `json:"created_at"`
+	DaysLeft         int    `json:"days_left"`
+	Expired          bool   `json:"expired"`
+	AllowProxy       bool   `json:"allow_proxy"`
+	DurationDays     int    `json:"duration_days"`
+	Redeemed         bool   `json:"redeemed"`
+	RedeemedByUserID string `json:"redeemed_by_user_id,omitempty"`
+	RedeemedAt       string `json:"redeemed_at,omitempty"`
+	Revoked          bool   `json:"revoked"`
+	RevokedAt        string `json:"revoked_at,omitempty"`
 }
 
 func toCDKView(c CDK, now time.Time) cdkView {
-	expired := c.ExpiresAt <= now.Unix()
+	expired := c.RedeemedAt > 0 && c.ExpiresAt > 0 && c.ExpiresAt <= now.Unix()
 	daysLeft := 0
-	if !expired {
+	if !expired && c.RedeemedAt > 0 && c.ExpiresAt > now.Unix() {
 		daysLeft = int((c.ExpiresAt - now.Unix() + 86399) / 86400) // ceil to whole days
+	} else if !expired && c.DurationDays > 0 {
+		daysLeft = c.DurationDays
+	}
+	redeemedAt := ""
+	if c.RedeemedAt > 0 {
+		redeemedAt = time.Unix(c.RedeemedAt, 0).Format(time.RFC3339)
+	}
+	revokedAt := ""
+	if c.RevokedAt > 0 {
+		revokedAt = time.Unix(c.RevokedAt, 0).Format(time.RFC3339)
 	}
 	return cdkView{
-		Code:           c.Code,
-		RemainingBytes: c.RemainingBytes,
-		UsedBytes:      c.UsedBytes,
-		RemainingLabel: formatTrafficLabel(c.RemainingBytes),
-		UsedLabel:      formatTrafficLabel(c.UsedBytes),
-		ExpiresAt:      time.Unix(c.ExpiresAt, 0).Format(time.RFC3339),
-		CreatedAt:      time.Unix(c.CreatedAt, 0).Format(time.RFC3339),
-		DaysLeft:       daysLeft,
-		Expired:        expired,
-		AllowProxy:     c.AllowProxy,
+		Code:             c.Code,
+		RemainingBytes:   c.RemainingBytes,
+		UsedBytes:        c.UsedBytes,
+		RemainingLabel:   formatTrafficLabel(c.RemainingBytes),
+		UsedLabel:        formatTrafficLabel(c.UsedBytes),
+		ExpiresAt:        time.Unix(c.ExpiresAt, 0).Format(time.RFC3339),
+		CreatedAt:        time.Unix(c.CreatedAt, 0).Format(time.RFC3339),
+		DaysLeft:         daysLeft,
+		Expired:          expired,
+		AllowProxy:       c.AllowProxy,
+		DurationDays:     c.DurationDays,
+		Redeemed:         c.RedeemedAt > 0,
+		RedeemedByUserID: c.RedeemedByUserID,
+		RedeemedAt:       redeemedAt,
+		Revoked:          c.RevokedAt > 0,
+		RevokedAt:        revokedAt,
 	}
 }
 
@@ -177,8 +203,8 @@ func (s *cdkStore) createBatch(count int, remainingBytes int64, days int, allowP
 				return nil, err
 			}
 			_, err = tx.Exec(
-				`INSERT INTO cdks(code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy) VALUES(?,?,?,?,?,?)`,
-				candidate, remainingBytes, 0, expiresAt, createdAt, b2i(allowProxy),
+				`INSERT INTO cdks(code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy, duration_days) VALUES(?,?,?,?,?,?,?)`,
+				candidate, remainingBytes, 0, expiresAt, createdAt, b2i(allowProxy), days,
 			)
 			if err == nil {
 				code = candidate
@@ -189,7 +215,7 @@ func (s *cdkStore) createBatch(count int, remainingBytes int64, days int, allowP
 		if code == "" {
 			return nil, errors.New("无法生成唯一的 CDK，请重试")
 		}
-		out = append(out, CDK{Code: code, RemainingBytes: remainingBytes, ExpiresAt: expiresAt, CreatedAt: createdAt, AllowProxy: allowProxy})
+		out = append(out, CDK{Code: code, RemainingBytes: remainingBytes, ExpiresAt: expiresAt, CreatedAt: createdAt, AllowProxy: allowProxy, DurationDays: days})
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -199,7 +225,7 @@ func (s *cdkStore) createBatch(count int, remainingBytes int64, days int, allowP
 }
 
 func (s *cdkStore) list() ([]CDK, error) {
-	rows, err := s.db.Query(`SELECT code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy FROM cdks ORDER BY created_at DESC, code`)
+	rows, err := s.db.Query(cdkSelectSQL + ` ORDER BY created_at DESC, code`)
 	if err != nil {
 		return nil, err
 	}
@@ -207,21 +233,17 @@ func (s *cdkStore) list() ([]CDK, error) {
 
 	var out []CDK
 	for rows.Next() {
-		var c CDK
-		var allow int64
-		if err := rows.Scan(&c.Code, &c.RemainingBytes, &c.UsedBytes, &c.ExpiresAt, &c.CreatedAt, &allow); err != nil {
+		c, err := scanCDK(rows)
+		if err != nil {
 			return nil, err
 		}
-		c.AllowProxy = allow != 0
 		out = append(out, c)
 	}
 	return out, rows.Err()
 }
 
 func (s *cdkStore) get(code string) (CDK, bool, error) {
-	c, err := scanCDK(s.db.QueryRow(
-		`SELECT code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy FROM cdks WHERE code=?`, code,
-	))
+	c, err := scanCDK(s.db.QueryRow(cdkSelectSQL+` WHERE code=?`, code))
 	if errors.Is(err, sql.ErrNoRows) {
 		return CDK{}, false, nil
 	}
@@ -235,13 +257,18 @@ type cdkScanner interface {
 	Scan(dest ...any) error
 }
 
+const cdkSelectSQL = `SELECT code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy, duration_days, COALESCE(redeemed_by_user_id, ''), COALESCE(redeemed_at, 0), COALESCE(revoked_at, 0) FROM cdks`
+
 func scanCDK(scanner cdkScanner) (CDK, error) {
 	var c CDK
 	var allow int64
-	if err := scanner.Scan(&c.Code, &c.RemainingBytes, &c.UsedBytes, &c.ExpiresAt, &c.CreatedAt, &allow); err != nil {
+	if err := scanner.Scan(&c.Code, &c.RemainingBytes, &c.UsedBytes, &c.ExpiresAt, &c.CreatedAt, &allow, &c.DurationDays, &c.RedeemedByUserID, &c.RedeemedAt, &c.RevokedAt); err != nil {
 		return CDK{}, err
 	}
 	c.AllowProxy = allow != 0
+	if c.DurationDays < 1 {
+		c.DurationDays = 1
+	}
 	return c, nil
 }
 
@@ -255,7 +282,7 @@ func (s *cdkStore) update(code string, remainingBytes int64, days int, allowProx
 		days = 1
 	}
 	expiresAt := now.Add(time.Duration(days) * 24 * time.Hour).Unix()
-	res, err := s.db.Exec(`UPDATE cdks SET remaining_bytes=?, expires_at=?, allow_proxy=? WHERE code=?`, remainingBytes, expiresAt, b2i(allowProxy), code)
+	res, err := s.db.Exec(`UPDATE cdks SET remaining_bytes=?, expires_at=?, allow_proxy=?, duration_days=? WHERE code=?`, remainingBytes, expiresAt, b2i(allowProxy), days, code)
 	if err != nil {
 		return CDK{}, false, err
 	}
@@ -265,13 +292,21 @@ func (s *cdkStore) update(code string, remainingBytes int64, days int, allowProx
 	return s.get(code)
 }
 
-func (s *cdkStore) delete(code string) (bool, error) {
-	res, err := s.db.Exec(`DELETE FROM cdks WHERE code=?`, code)
-	if err != nil {
-		return false, err
+func (s *cdkStore) revoke(code string, now time.Time) (CDK, bool, error) {
+	if _, ok, err := s.get(code); err != nil || !ok {
+		return CDK{}, ok, err
 	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
+	_, err := s.db.Exec(
+		`UPDATE cdks
+		 SET revoked_at=CASE WHEN revoked_at IS NULL OR revoked_at=0 THEN ? ELSE revoked_at END
+		 WHERE code=?`,
+		now.Unix(), code,
+	)
+	if err != nil {
+		return CDK{}, false, err
+	}
+	updated, ok, err := s.get(code)
+	return updated, ok, err
 }
 
 // merge moves the secondary CDK's remaining traffic into the primary CDK, keeps
@@ -300,7 +335,7 @@ func (s *cdkStore) merge(primaryCode, secondaryCode string, now time.Time) (CDK,
 
 	load := func(code string) (CDK, bool, error) {
 		c, err := scanCDK(tx.QueryRow(
-			`SELECT code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy FROM cdks WHERE code=?`,
+			cdkSelectSQL+` WHERE code=?`,
 			code,
 		))
 		if errors.Is(err, sql.ErrNoRows) {
@@ -365,10 +400,11 @@ func (s *cdkStore) merge(primaryCode, secondaryCode string, now time.Time) (CDK,
 	return merged, nil
 }
 
-// deleteExpired removes every CDK whose expiry is at or before now, returning
-// how many were deleted.
+// deleteExpired removes redeemed/revoked voucher records whose legacy display
+// expiry is at or before now. Unredeemed vouchers no longer expire at creation
+// time; their duration starts when a user redeems them.
 func (s *cdkStore) deleteExpired(now time.Time) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM cdks WHERE expires_at<=?`, now.Unix())
+	res, err := s.db.Exec(`DELETE FROM cdks WHERE expires_at<=? AND (redeemed_at IS NOT NULL OR revoked_at IS NOT NULL)`, now.Unix())
 	if err != nil {
 		return 0, err
 	}

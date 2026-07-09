@@ -83,3 +83,35 @@ func TestUpdateSettingsAcceptsDynamicMinimum(t *testing.T) {
 		t.Fatalf("min timeout payload = %d, want %d", payload.MinTaskTimeoutS, int(minTimeout.Seconds()))
 	}
 }
+
+func TestAuthSettingsSecretWriteOnly(t *testing.T) {
+	t.Parallel()
+
+	s := newTestSettingsServer(t, Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/settings/auth", nil)
+	s.handleGetAuthSettings(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"linuxdo_configured":false`) ||
+		!strings.Contains(rec.Body.String(), `"linuxdo_login_enabled":true`) {
+		t.Fatalf("unexpected initial auth settings: %s", rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = jsonRequest(http.MethodPut, "/api/settings/auth", `{"linuxdo_client_id":"cid","linuxdo_client_secret":"secret","email_registration_enabled":true}`)
+	s.handleUpdateAuthSettings(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `"linuxdo_client_secret":"`) || strings.Contains(body, `:"secret"`) {
+		t.Fatalf("secret must not be returned: %s", body)
+	}
+	if !strings.Contains(body, `"linuxdo_configured":true`) ||
+		!strings.Contains(body, `"linuxdo_client_secret_configured":true`) ||
+		!strings.Contains(body, `"email_registration_enabled":true`) {
+		t.Fatalf("unexpected updated auth settings: %s", body)
+	}
+}

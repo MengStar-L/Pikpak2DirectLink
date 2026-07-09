@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
-  Ticket, LogOut, Gauge, CalendarClock, Hourglass, Link2, Files, CheckCheck, Settings2, Send, Radar, Waypoints,
-  History, ArrowLeft, RefreshCw, Inbox, X, GitMerge,
+  ArrowLeft, CalendarClock, CheckCheck, Files, Gauge, History, Hourglass, Inbox, KeyRound, Link2,
+  LogOut, Mail, Radar, RefreshCw, Send, Settings2, Ticket, UserPlus, Waypoints, X,
 } from 'lucide-vue-next'
 import AuroraBg from './components/AuroraBg.vue'
 import GlassCard from './components/GlassCard.vue'
@@ -20,13 +20,23 @@ import { useJob } from './composables/useJob'
 import { aria2 } from './composables/useAria2'
 import { toast } from './composables/useToast'
 import { formatDateTime, formatRelative } from './lib/format'
-import type { JobResult, ResolveHistoryDetail, ResolveHistorySummary, UserStatusResponse } from './lib/types'
+import type { JobResult, ResolveHistoryDetail, ResolveHistorySummary, UserAuthConfig, UserStatusResponse } from './lib/types'
 
 const view = ref<'gate' | 'portal'>('gate')
 const status = ref<UserStatusResponse | null>(null)
-const cdkInput = ref('')
-const cdkError = ref('')
-const cdkLoading = ref(false)
+const authConfig = ref<UserAuthConfig | null>(null)
+
+const emailMode = ref<'login' | 'register'>('login')
+const email = ref('')
+const password = ref('')
+const loginError = ref('')
+const loginLoading = ref(false)
+
+const redeemOpen = ref(false)
+const redeemCode = ref('')
+const redeemError = ref('')
+const redeemLoading = ref(false)
+
 const pushChoiceOpen = ref(false)
 const pushChoiceResults = ref<JobResult[]>([])
 const historyOpen = ref(false)
@@ -34,11 +44,7 @@ const historyLoading = ref(false)
 const historyError = ref('')
 const historyItems = ref<ResolveHistorySummary[]>([])
 const historyDetail = ref<ResolveHistoryDetail | null>(null)
-const mergeOpen = ref(false)
-const mergePrimary = ref('')
-const mergeSecondary = ref('')
-const mergeError = ref('')
-const mergeLoading = ref(false)
+const selectedIds = ref<string[]>([])
 
 const { job, phase, error, submitting, submit, selectItems } = useJob({
   create: (b) => api.u.jobs.create(b),
@@ -46,7 +52,6 @@ const { job, phase, error, submitting, submit, selectItems } = useJob({
   select: (id, b) => api.u.jobs.select(id, b),
 })
 
-const selectedIds = ref<string[]>([])
 const needSelection = computed(() => phase.value === 'selection_required' && job.value?.items?.length)
 const results = computed(() => {
   const j = job.value
@@ -56,40 +61,62 @@ const results = computed(() => {
   return []
 })
 const queuePill = computed(() => status.value?.queue)
+const subscriptions = computed(() => status.value?.subscriptions ?? [])
+const activeSubscriptions = computed(() => subscriptions.value.filter((s) => !s.expired && s.remaining_bytes > 0))
 const historyResults = computed(() => historyDetail.value?.results ?? [])
+const displayName = computed(() => status.value?.user.display_name || status.value?.user.email || 'User')
+const canProxy = computed(() => Boolean(status.value?.quota.allow_proxy_available))
 
 setUnauthorizedHandler(() => {
   view.value = 'gate'
   status.value = null
-  closeMerge()
+  closeRedeem()
   closeHistory()
-  toast('会话已过期，请重新输入 CDK', 'info')
 })
+
+async function loadAuthConfig() {
+  try {
+    authConfig.value = await api.u.authConfig()
+  } catch {
+    authConfig.value = null
+  }
+}
 
 async function loadStatus() {
   try {
     status.value = await api.u.status()
+    authConfig.value = status.value.auth
     view.value = 'portal'
   } catch {
+    status.value = null
     view.value = 'gate'
+    await loadAuthConfig()
   }
 }
 
-async function cdkLogin() {
-  cdkError.value = ''
-  if (!cdkInput.value.trim()) {
-    cdkError.value = '请输入 CDK 兑换码'
+function linuxDoLogin() {
+  if (!authConfig.value?.linuxdo_available) return
+  window.location.href = authConfig.value.linuxdo_start_url || '/api/u/auth/linuxdo/start'
+}
+
+async function submitEmailAuth() {
+  loginError.value = ''
+  if (!email.value.trim() || password.value.length < 6) {
+    loginError.value = '请输入邮箱和至少 6 位密码'
     return
   }
-  cdkLoading.value = true
+  loginLoading.value = true
   try {
-    status.value = await api.u.login(cdkInput.value.trim().toUpperCase())
+    status.value = emailMode.value === 'register'
+      ? await api.u.emailRegister(email.value.trim(), password.value)
+      : await api.u.emailLogin(email.value.trim(), password.value)
+    authConfig.value = status.value.auth
     view.value = 'portal'
-    toast('已进入用户面板', 'success')
+    toast(emailMode.value === 'register' ? '账号已创建' : '已登录', 'success')
   } catch (e: any) {
-    cdkError.value = e?.message || 'CDK 无效或已过期'
+    loginError.value = e?.message || '登录失败'
   } finally {
-    cdkLoading.value = false
+    loginLoading.value = false
   }
 }
 
@@ -97,47 +124,36 @@ async function logout() {
   try {
     await api.u.logout()
   } catch { /* ignore */ }
-  view.value = 'gate'
   status.value = null
-  cdkInput.value = ''
-  closeMerge()
-  closeHistory()
+  view.value = 'gate'
+  await loadAuthConfig()
 }
 
-function openMerge() {
-  mergePrimary.value = status.value?.code || ''
-  mergeSecondary.value = ''
-  mergeError.value = ''
-  mergeOpen.value = true
+function openRedeem() {
+  redeemCode.value = ''
+  redeemError.value = ''
+  redeemOpen.value = true
 }
-function closeMerge() {
-  mergeOpen.value = false
-  mergeError.value = ''
-  mergeLoading.value = false
+function closeRedeem() {
+  redeemOpen.value = false
+  redeemError.value = ''
+  redeemLoading.value = false
 }
-async function submitMerge() {
-  const primary = mergePrimary.value.trim().toUpperCase()
-  const secondary = mergeSecondary.value.trim().toUpperCase()
-  mergeError.value = ''
-  if (!primary || !secondary) {
-    mergeError.value = '请输入主 CDK 和副 CDK'
+async function submitRedeem() {
+  redeemError.value = ''
+  if (!redeemCode.value.trim()) {
+    redeemError.value = '请输入 CDK'
     return
   }
-  if (primary === secondary) {
-    mergeError.value = '主 CDK 和副 CDK 不能相同'
-    return
-  }
-  mergeLoading.value = true
+  redeemLoading.value = true
   try {
-    status.value = await api.u.mergeCDK(primary, secondary)
-    closeMerge()
-    toast('CDK 已合并', 'success')
+    status.value = await api.u.redeemCDK(redeemCode.value.trim().toUpperCase())
+    closeRedeem()
+    toast('CDK 已兑换', 'success')
   } catch (e: any) {
-    const message = e?.message || 'CDK 合并失败'
-    mergeError.value = message
-    toast(message, 'error')
+    redeemError.value = e?.message || '兑换失败'
   } finally {
-    mergeLoading.value = false
+    redeemLoading.value = false
   }
 }
 
@@ -156,7 +172,7 @@ function onPush(p: { url: string; name: string }) {
   aria2.pushOne(p.url, p.name)
 }
 function canChoosePushKind(list: JobResult[]) {
-  return Boolean(status.value?.allow_proxy) && list.length > 0 && list.every((r) => r.direct_url && r.proxy_url)
+  return canProxy.value && list.length > 0 && list.every((r) => r.direct_url && r.proxy_url)
 }
 function pushManyAs(kind: 'direct' | 'proxy', list: JobResult[]) {
   aria2.pushMany(list.map((r) => ({ url: kind === 'proxy' ? r.proxy_url : r.direct_url, name: r.file.name })))
@@ -179,6 +195,7 @@ function choosePushKind(kind: 'direct' | 'proxy') {
   closePushChoice()
   pushManyAs(kind, list)
 }
+
 function closeHistory() {
   historyOpen.value = false
   historyLoading.value = false
@@ -202,7 +219,7 @@ async function loadHistory() {
     const payload = await api.u.history.list()
     historyItems.value = payload.history || []
   } catch (e: any) {
-    historyError.value = e?.message || '加载解析历史失败'
+    historyError.value = e?.message || '加载历史失败'
   } finally {
     historyLoading.value = false
   }
@@ -260,7 +277,15 @@ function historyDuration(item: ResolveHistorySummary | ResolveHistoryDetail) {
   return minRest ? `${hr} 小时 ${minRest} 分` : `${hr} 小时`
 }
 
-onMounted(loadStatus)
+onMounted(async () => {
+  const params = new URLSearchParams(window.location.search)
+  const authError = params.get('error')
+  if (authError) {
+    toast(`LinuxDo 登录失败：${authError}`, 'error')
+    window.history.replaceState({}, '', '/u')
+  }
+  await loadStatus()
+})
 </script>
 
 <template>
@@ -271,38 +296,28 @@ onMounted(loadStatus)
   <Aria2PushChoiceModal
     :open="pushChoiceOpen"
     :count="pushChoiceResults.length"
-    :show-proxy="Boolean(status?.allow_proxy)"
+    :show-proxy="canProxy"
     @select="choosePushKind"
     @close="closePushChoice"
   />
 
   <Teleport to="body">
     <Transition name="v-veil">
-      <div v-if="mergeOpen" class="overlay merge-overlay" @click.self="closeMerge">
+      <div v-if="redeemOpen" class="overlay redeem-overlay" @click.self="closeRedeem">
         <Transition name="v-pop" appear>
-          <form v-if="mergeOpen" class="dialog merge-dialog" role="dialog" aria-modal="true" aria-label="合并 CDK" @submit.prevent="submitMerge">
-            <div class="dialog-head merge-dialog-head">
-              <h2><GitMerge />合并 CDK</h2>
-              <button type="button" class="dialog-close" aria-label="关闭" @click="closeMerge"><X /></button>
+          <form v-if="redeemOpen" class="dialog redeem-dialog" role="dialog" aria-modal="true" aria-label="兑换 CDK" @submit.prevent="submitRedeem">
+            <div class="dialog-head redeem-dialog-head">
+              <h2><Ticket />兑换 CDK</h2>
+              <button type="button" class="dialog-close" aria-label="关闭" @click="closeRedeem"><X /></button>
             </div>
-            <div class="merge-form">
-              <label class="field">
-                <span class="field-label">主 CDK</span>
-                <input v-model="mergePrimary" class="input input-mono" type="text" autocomplete="off" placeholder="保留的 CDK" />
-              </label>
-              <label class="field">
-                <span class="field-label">副 CDK</span>
-                <input v-model="mergeSecondary" class="input input-mono" type="text" autocomplete="off" placeholder="合并后删除的 CDK" />
-              </label>
-            </div>
-            <Transition name="v-fade">
-              <p v-if="mergeError" class="error-block">{{ mergeError }}</p>
-            </Transition>
-            <div class="merge-actions">
-              <button class="btn btn-ghost btn-sm" type="button" @click="closeMerge">取消</button>
-              <PrimaryButton type="submit" size="sm" :loading="mergeLoading">
-                <template #icon><GitMerge /></template>合并
-              </PrimaryButton>
+            <label class="field">
+              <span class="field-label">CDK</span>
+              <input v-model="redeemCode" class="input input-mono redeem-input" type="text" autocomplete="off" placeholder="XXXX-XXXX-XXXX" />
+            </label>
+            <Transition name="v-fade"><p v-if="redeemError" class="error-block">{{ redeemError }}</p></Transition>
+            <div class="dialog-actions">
+              <button class="btn btn-ghost btn-sm" type="button" @click="closeRedeem">取消</button>
+              <PrimaryButton type="submit" size="sm" :loading="redeemLoading"><template #icon><Ticket /></template>兑换</PrimaryButton>
             </div>
           </form>
         </Transition>
@@ -318,16 +333,12 @@ onMounted(loadStatus)
             <div class="dialog-head history-dialog-head">
               <h2><History />解析历史</h2>
               <div class="history-dialog-actions">
-                <PrimaryButton v-if="historyDetail" variant="line" size="sm" @click="backToHistoryList"><template #icon><ArrowLeft /></template>返回列表</PrimaryButton>
+                <PrimaryButton v-if="historyDetail" variant="line" size="sm" @click="backToHistoryList"><template #icon><ArrowLeft /></template>返回</PrimaryButton>
                 <PrimaryButton variant="soft" size="sm" :loading="historyLoading" @click="loadHistory"><template #icon><RefreshCw /></template>刷新</PrimaryButton>
                 <button type="button" class="dialog-close" aria-label="关闭" @click="closeHistory"><X /></button>
               </div>
             </div>
-
-            <Transition name="v-fade">
-              <p v-if="historyError" class="error-block">{{ historyError }}</p>
-            </Transition>
-
+            <Transition name="v-fade"><p v-if="historyError" class="error-block">{{ historyError }}</p></Transition>
             <div class="history-dialog-body">
               <template v-if="historyDetail">
                 <div class="history-detail-head">
@@ -350,17 +361,10 @@ onMounted(loadStatus)
                 </div>
                 <ResultList :results="historyResults" show-push @push="onPush" />
               </template>
-
               <template v-else>
                 <div v-if="historyLoading" class="history-state mono">加载中...</div>
                 <div v-else-if="historyItems.length" class="history-list">
-                  <button
-                    v-for="item in historyItems"
-                    :key="item.id"
-                    class="history-item"
-                    type="button"
-                    @click="openHistoryDetail(item.id)"
-                  >
+                  <button v-for="item in historyItems" :key="item.id" class="history-item" type="button" @click="openHistoryDetail(item.id)">
                     <span class="history-main">
                       <span class="history-title">{{ historyInputPreview(item.input) }}</span>
                       <span class="history-sub mono">{{ formatDateTime(item.completed_at) }} · 用时 {{ historyDuration(item) }}</span>
@@ -382,53 +386,71 @@ onMounted(loadStatus)
   </Teleport>
 
   <Transition name="v-fade" mode="out-in">
-    <!-- CDK gate -->
     <main v-if="view === 'gate'" class="gate-wrap" key="gate">
       <section class="gate-card panel anim-rise">
         <div class="wire"><span class="wire-pulse" /></div>
-        <div class="mark"><Ticket /></div>
-        <h1>输入 CDK 进入</h1>
-        <p class="lede">使用拿到的兑换码即可使用解析功能</p>
-        <form class="cdk-form" @submit.prevent="cdkLogin">
-          <input
-            v-model="cdkInput"
-            class="input input-mono cdk-input"
-            type="text"
-            autocomplete="off"
-            placeholder="XXXX-XXXX-XXXX"
-            aria-label="CDK 兑换码"
-          />
-          <PrimaryButton type="submit" block size="lg" :loading="cdkLoading">
-            <template #icon><Ticket /></template>进入
+        <div class="mark"><Radar /></div>
+        <h1>用户登录</h1>
+        <p class="lede">LinuxDo 社区用户可直接登录，额度通过 CDK 兑换</p>
+        <PrimaryButton v-if="authConfig?.linuxdo_available" block size="lg" @click="linuxDoLogin">
+          <template #icon><Radar /></template>使用 LinuxDo 登录
+        </PrimaryButton>
+        <p v-else class="auth-note">LinuxDo 登录暂未开放</p>
+
+        <form v-if="authConfig?.email_login_enabled || authConfig?.email_registration_enabled" class="email-form" @submit.prevent="submitEmailAuth">
+          <div v-if="authConfig?.email_registration_enabled" class="seg email-tabs">
+            <label class="seg-item"><input v-model="emailMode" type="radio" value="login" /><span><Mail />登录</span></label>
+            <label class="seg-item"><input v-model="emailMode" type="radio" value="register" /><span><UserPlus />注册</span></label>
+          </div>
+          <input v-model="email" class="input" type="email" autocomplete="email" placeholder="email@example.com" />
+          <input v-model="password" class="input" type="password" autocomplete="current-password" placeholder="Password" />
+          <PrimaryButton type="submit" block :loading="loginLoading">
+            <template #icon><KeyRound /></template>{{ emailMode === 'register' ? '邮箱注册' : '邮箱登录' }}
           </PrimaryButton>
-          <Transition name="v-fade">
-            <p v-if="cdkError" class="error-block">{{ cdkError }}</p>
-          </Transition>
+          <Transition name="v-fade"><p v-if="loginError" class="error-block">{{ loginError }}</p></Transition>
         </form>
       </section>
     </main>
 
-    <!-- Portal -->
     <main v-else class="portal" key="portal">
       <header class="phead panel">
         <div class="brand">
           <span class="logo"><Radar /></span>
           <div>
             <div class="title">PikPak 直链工具</div>
-            <div class="sub mono">{{ status?.code || 'CDK 用户' }}</div>
+            <div class="sub mono">{{ displayName }}</div>
           </div>
         </div>
         <div class="pills">
           <span v-if="queuePill?.active" class="pill pill-live"><Hourglass />队列 {{ queuePill.waiting }}</span>
-          <span class="pill pill-ok"><Gauge />剩余 {{ status?.remaining_label || '-' }}</span>
-          <span class="pill pill-info"><CalendarClock />{{ status?.days_left ?? '-' }} 天</span>
-          <span class="pill" :class="status?.allow_proxy ? 'pill-brand' : ''" :title="status?.allow_proxy ? '此 CDK 支持中转下载' : '此 CDK 不支持中转下载'"><Waypoints />中转{{ status?.allow_proxy ? '可用' : '不可用' }}</span>
+          <span class="pill pill-ok"><Gauge />剩余 {{ status?.quota.total_remaining_label || '0 B' }}</span>
+          <span class="pill pill-info"><CalendarClock />{{ activeSubscriptions[0]?.days_left ?? '-' }} 天</span>
+          <span class="pill" :class="canProxy ? 'pill-brand' : ''"><Waypoints />中转{{ canProxy ? '可用' : '不可用' }}</span>
           <button class="btn btn-ghost btn-sm" type="button" @click="aria2.openConfig()"><Settings2 />aria2</button>
-          <button class="btn btn-ghost btn-sm" type="button" @click="openMerge"><GitMerge />合并 CDK</button>
-          <button class="btn btn-ghost btn-sm" type="button" @click="toggleHistory"><History />解析历史</button>
+          <button class="btn btn-ghost btn-sm" type="button" @click="openRedeem"><Ticket />兑换</button>
+          <button class="btn btn-ghost btn-sm" type="button" @click="toggleHistory"><History />历史</button>
           <button class="btn btn-ghost btn-sm" type="button" @click="logout"><LogOut />退出</button>
         </div>
       </header>
+
+      <GlassCard class="quota-card" seam>
+        <div class="sec-head mb">
+          <div class="sec-title">
+            <span class="sec-glyph ok"><Gauge /></span>
+            <div><span class="eyebrow">quota</span><h2>订阅空间</h2><p>解析会优先消耗最快到期的空间，不足时自动继续扣下一个订阅</p></div>
+          </div>
+          <PrimaryButton size="sm" variant="soft" @click="openRedeem"><template #icon><Ticket /></template>兑换 CDK</PrimaryButton>
+        </div>
+        <div v-if="subscriptions.length" class="subs">
+          <div v-for="sub in subscriptions" :key="sub.id" class="sub-row" :class="{ expired: sub.expired }">
+            <span class="mono code">{{ sub.source_cdk_code || sub.id }}</span>
+            <span class="pill pill-ok">{{ sub.remaining_label }}</span>
+            <span class="pill">{{ sub.days_left }} 天</span>
+            <span class="pill" :class="sub.allow_proxy ? 'pill-brand' : ''">{{ sub.allow_proxy ? '中转' : '直链' }}</span>
+          </div>
+        </div>
+        <div v-else class="empty quota-empty"><Ticket /><p>暂无可用空间，请兑换 CDK</p></div>
+      </GlassCard>
 
       <GlassCard class="workbench" seam>
         <div class="sec-head">
@@ -437,7 +459,7 @@ onMounted(loadStatus)
             <div><span class="eyebrow">resolve</span><h2>链接解析</h2><p>粘贴磁力或 PikPak 分享链接，勾选文件生成下载链接</p></div>
           </div>
         </div>
-        <ResolveForm :loading="submitting" @submit="onSubmit" />
+        <ResolveForm :loading="submitting" :allow-proxy="canProxy" @submit="onSubmit" />
         <div class="dock-wrap"><JobStatus :job="job" :phase="phase" :error="error" :submitting="submitting" /></div>
       </GlassCard>
 
@@ -476,19 +498,20 @@ onMounted(loadStatus)
 </template>
 
 <style scoped>
-/* gate */
 .gate-wrap { position: relative; z-index: 1; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
-.gate-card { position: relative; width: min(100%, 372px); padding: 30px 28px 24px; text-align: center; overflow: hidden; }
+.gate-card { position: relative; width: min(100%, 392px); padding: 30px 28px 24px; text-align: center; overflow: hidden; }
 .wire { position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--canvas-2); overflow: hidden; }
 .wire-pulse { position: absolute; top: 0; left: 0; width: 36%; height: 100%; background: linear-gradient(90deg, transparent, var(--brand), transparent); animation: wireRun 2.6s var(--ease) infinite; }
 .mark { width: 46px; height: 46px; margin: 4px auto 14px; display: grid; place-items: center; border-radius: var(--r-lg); background: var(--brand); color: var(--ink-on); box-shadow: var(--shadow-sm); }
 .mark svg { width: 22px; height: 22px; }
 .gate-card h1 { font-size: var(--fs-xl); font-weight: var(--fw-bold); }
 .lede { color: var(--ink-2); font-size: var(--fs-sm); margin-top: 5px; margin-bottom: 18px; }
-.cdk-form { display: grid; gap: 11px; text-align: left; }
-.cdk-input { height: 40px; text-align: center; text-transform: uppercase; letter-spacing: 0.14em; font-size: var(--fs-md); }
+.auth-note { margin: 0 0 13px; color: var(--ink-3); font-size: var(--fs-sm); }
+.email-form { display: grid; gap: 10px; margin-top: 14px; text-align: left; }
+.email-tabs { width: 100%; }
+.email-tabs .seg-item { flex: 1 1 0; }
+.email-tabs .seg-item span { width: 100%; justify-content: center; }
 
-/* portal */
 .portal { position: relative; z-index: 1; width: 100%; max-width: 1760px; margin: 0 auto; padding: 20px 28px 56px; display: flex; flex-direction: column; gap: 14px; }
 .phead { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; padding: 12px 16px; }
 .brand { display: flex; align-items: center; gap: 11px; }
@@ -497,7 +520,6 @@ onMounted(loadStatus)
 .title { font-size: var(--fs-md); font-weight: var(--fw-semi); }
 .sub { color: var(--ink-3); font-size: var(--fs-xs); margin-top: 1px; }
 .pills { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
-
 .workbench { display: flex; flex-direction: column; gap: 16px; }
 .eyebrow { display: block; margin-bottom: 2px; }
 .sec-glyph.ok { background: var(--ok-soft); color: var(--ok); }
@@ -506,43 +528,27 @@ onMounted(loadStatus)
 .sec-head.compact h2 { font-size: var(--fs-md); }
 .dock-wrap { padding-top: 13px; border-top: 1px solid var(--line); }
 .res-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.merge-overlay { z-index: 7950; }
-.merge-dialog { width: min(430px, calc(100vw - 32px)); }
-.merge-dialog-head { margin-bottom: 14px; }
-.merge-dialog-head h2 { display: flex; align-items: center; gap: 7px; font-size: var(--fs-lg); }
-.merge-dialog-head h2 svg { width: 17px; height: 17px; color: var(--brand); }
-.merge-form { display: grid; gap: 10px; }
-.merge-form .input { height: 36px; text-transform: uppercase; }
-.merge-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.subs { display: grid; gap: 8px; }
+.sub-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 9px 11px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-2); }
+.sub-row.expired { opacity: 0.55; }
+.sub-row .code { flex: 1 1 180px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-size: var(--fs-xs); }
+.quota-empty { min-height: 100px; }
+.redeem-overlay { z-index: 7950; }
+.redeem-dialog { width: min(430px, calc(100vw - 32px)); }
+.redeem-dialog-head { margin-bottom: 14px; }
+.redeem-dialog-head h2 { display: flex; align-items: center; gap: 7px; font-size: var(--fs-lg); }
+.redeem-dialog-head h2 svg { width: 17px; height: 17px; color: var(--brand); }
+.redeem-input { text-transform: uppercase; }
+.dialog-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .history-overlay { z-index: 7900; align-items: start; padding-top: 42px; }
-.history-dialog {
-  width: min(100%, 1180px);
-  max-height: calc(100vh - 84px);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
+.history-dialog { width: min(100%, 1180px); max-height: calc(100vh - 84px); display: flex; flex-direction: column; overflow: hidden; }
 .history-dialog-head { flex: none; margin-bottom: 12px; }
 .history-dialog-head h2 { display: flex; align-items: center; gap: 7px; font-size: var(--fs-lg); }
 .history-dialog-head h2 svg { width: 17px; height: 17px; color: var(--brand); }
 .history-dialog-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .history-dialog-body { min-height: 0; overflow-y: auto; padding-right: 2px; }
 .history-list { display: grid; gap: 9px; }
-.history-item {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 13px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--panel-2);
-  color: inherit;
-  text-align: left;
-  cursor: pointer;
-  transition: transform var(--t) var(--ease), box-shadow var(--t) var(--ease), border-color var(--t) var(--ease);
-}
+.history-item { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 13px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-2); color: inherit; text-align: left; cursor: pointer; transition: transform var(--t) var(--ease), box-shadow var(--t) var(--ease), border-color var(--t) var(--ease); }
 .history-item:hover { transform: translateY(-1px); box-shadow: var(--shadow-sm); border-color: var(--brand-soft); }
 .history-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .history-title { font-size: var(--fs-sm); font-weight: var(--fw-semi); line-height: 1.45; word-break: break-all; }
@@ -551,31 +557,16 @@ onMounted(loadStatus)
 .history-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
 .history-detail-head h3 { font-size: var(--fs-md); font-weight: var(--fw-semi); }
 .history-metrics { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.history-input {
-  margin: 0 0 14px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--panel-2);
-  color: var(--ink-2);
-  font-size: var(--fs-xs);
-  white-space: pre-wrap;
-  word-break: break-all;
-}
+.history-input { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-2); color: var(--ink-2); font-size: var(--fs-xs); white-space: pre-wrap; word-break: break-all; }
 .history-state { padding: 16px 0; color: var(--ink-3); font-size: var(--fs-xs); }
 .history-empty { min-height: 120px; }
-
-@keyframes wireRun {
-  0% { left: -36%; }
-  100% { left: 100%; }
-}
-
+@keyframes wireRun { 0% { left: -36%; } 100% { left: 100%; } }
 @media (max-width: 600px) {
   .portal { padding: 16px 14px 48px; }
-  .merge-overlay { padding: 12px; }
-  .merge-dialog { width: 100%; }
-  .merge-actions { justify-content: stretch; }
-  .merge-actions .btn { flex: 1 1 0; }
+  .redeem-overlay { padding: 12px; }
+  .redeem-dialog { width: 100%; }
+  .dialog-actions { justify-content: stretch; }
+  .dialog-actions .btn { flex: 1 1 0; }
   .history-overlay { align-items: stretch; padding: 12px; }
   .history-dialog { max-height: calc(100vh - 24px); }
   .history-dialog-head { align-items: flex-start; }

@@ -94,7 +94,7 @@ func TestCreateBatchJobRejectsTooManyLinks(t *testing.T) {
 		lines[i] = resourceLineSpec{raw: "magnet:?xt=urn:btih:test", clean: "magnet:?xt=urn:btih:test"}
 	}
 	s := &Server{}
-	if _, status, _ := s.createBatchJob(lines, "direct", "", "", priorityAdmin, "https://host"); status != 400 {
+	if _, status, _ := s.createBatchJob(lines, "direct", "", "", "", priorityAdmin, "https://host"); status != 400 {
 		t.Fatalf("status = %d, want 400", status)
 	}
 }

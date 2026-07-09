@@ -129,7 +129,7 @@ func TestMigrateCDKAddAllowProxyOnExistingDB(t *testing.T) {
 	)`); err != nil {
 		t.Fatalf("create legacy table: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO cdks(code, remaining_bytes, used_bytes, expires_at, created_at) VALUES('OLDCODE-AAAA-BBBB-CCCC', 100, 0, 9999999999, 1700000000)`); err != nil {
+	if _, err := db.Exec(`INSERT INTO cdks(code, remaining_bytes, used_bytes, expires_at, created_at) VALUES('OLDCODE-AAAA-BBBB-CCCC', 100, 0, 1701468800, 1700000000)`); err != nil {
 		t.Fatalf("insert legacy row: %v", err)
 	}
 
@@ -139,6 +139,9 @@ func TestMigrateCDKAddAllowProxyOnExistingDB(t *testing.T) {
 	if err := migrateCDKAddAllowProxy(db); err != nil { // idempotent
 		t.Fatalf("migrate (2nd run): %v", err)
 	}
+	if err := migrateCDKToVoucher(db); err != nil {
+		t.Fatalf("migrate voucher columns: %v", err)
+	}
 
 	c, ok, err := newCDKStore(db).get("OLDCODE-AAAA-BBBB-CCCC")
 	if err != nil || !ok {
@@ -146,6 +149,9 @@ func TestMigrateCDKAddAllowProxyOnExistingDB(t *testing.T) {
 	}
 	if !c.AllowProxy {
 		t.Fatal("existing CDK should default to AllowProxy=true after migration")
+	}
+	if c.DurationDays != 17 {
+		t.Fatalf("duration_days = %d, want 17 from legacy expires_at-created_at span", c.DurationDays)
 	}
 }
 
@@ -270,12 +276,16 @@ func TestCDKUpdateAndDelete(t *testing.T) {
 		t.Fatalf("expected expiry %d, got %d", wantExpiry, updated.ExpiresAt)
 	}
 
-	deleted, err := store.delete(code)
-	if err != nil || !deleted {
-		t.Fatalf("delete: deleted=%v err=%v", deleted, err)
+	revoked, ok, err := store.revoke(code, now)
+	if err != nil || !ok {
+		t.Fatalf("revoke: ok=%v err=%v", ok, err)
 	}
-	if _, ok, _ := store.get(code); ok {
-		t.Fatalf("expected code to be gone after delete")
+	if revoked.RevokedAt == 0 {
+		t.Fatalf("expected code to be marked revoked, got %+v", revoked)
+	}
+	stored, ok, err := store.get(code)
+	if err != nil || !ok || stored.RevokedAt == 0 {
+		t.Fatalf("expected revoked code to remain listed, got %+v ok=%v err=%v", stored, ok, err)
 	}
 }
 
@@ -393,13 +403,12 @@ func TestCDKDeleteExpired(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	store := newTestCDKStore(t)
 
-	// Two already-expired (created far in the past, short window) and one live.
+	// Unredeemed vouchers no longer expire from their creation timestamp.
 	past := now.Add(-40 * 24 * time.Hour)
 	if _, err := store.createBatch(2, 5*bytesPerGB, 10, true, past); err != nil {
-		t.Fatalf("create expired: %v", err)
+		t.Fatalf("create old vouchers: %v", err)
 	}
-	live, err := store.createBatch(1, 5*bytesPerGB, 30, true, now)
-	if err != nil {
+	if _, err := store.createBatch(1, 5*bytesPerGB, 30, true, now); err != nil {
 		t.Fatalf("create live: %v", err)
 	}
 
@@ -407,16 +416,36 @@ func TestCDKDeleteExpired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deleteExpired: %v", err)
 	}
-	if deleted != 2 {
-		t.Fatalf("expected 2 expired deleted, got %d", deleted)
+	if deleted != 0 {
+		t.Fatalf("expected no unredeemed vouchers deleted, got %d", deleted)
 	}
 
 	remaining, err := store.list()
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(remaining) != 1 || remaining[0].Code != live[0].Code {
-		t.Fatalf("expected only the live CDK to remain, got %+v", remaining)
+	if len(remaining) != 3 {
+		t.Fatalf("expected all unredeemed vouchers to remain, got %+v", remaining)
+	}
+
+	// Redeemed records with legacy display expiry in the past can be purged.
+	if _, err := store.db.Exec(`UPDATE cdks SET redeemed_by_user_id='usr_old', redeemed_at=? WHERE created_at=?`, past.Unix(), past.Unix()); err != nil {
+		t.Fatalf("mark old vouchers redeemed: %v", err)
+	}
+	deleted, err = store.deleteExpired(now)
+	if err != nil {
+		t.Fatalf("deleteExpired: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("expected 2 redeemed old vouchers deleted, got %d", deleted)
+	}
+
+	remaining, err = store.list()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("expected only the live voucher to remain, got %+v", remaining)
 	}
 
 	// A second purge with nothing expired removes nothing.
@@ -431,8 +460,9 @@ func TestHandleDeleteExpiredCDKs(t *testing.T) {
 	handler := srv.Handler()
 
 	past := time.Now().Add(-72 * time.Hour)
-	if _, err := srv.cdk.createBatch(2, 5*bytesPerGB, 1, true, past); err != nil {
-		t.Fatalf("create expired: %v", err)
+	old, err := srv.cdk.createBatch(2, 5*bytesPerGB, 1, true, past)
+	if err != nil {
+		t.Fatalf("create old vouchers: %v", err)
 	}
 	live, err := srv.cdk.createBatch(1, 5*bytesPerGB, 30, true, time.Now())
 	if err != nil {
@@ -459,128 +489,102 @@ func TestHandleDeleteExpiredCDKs(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if payload.Deleted != 2 {
-		t.Fatalf("expected 2 expired CDKs deleted, got %d", payload.Deleted)
+	if payload.Deleted != 0 {
+		t.Fatalf("unredeemed vouchers should not expire before redeem, deleted %d", payload.Deleted)
 	}
 
 	remaining, err := srv.cdk.list()
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(remaining) != 1 || remaining[0].Code != live[0].Code {
-		t.Fatalf("expected only the live CDK to remain, got %+v", remaining)
+	if len(remaining) != 3 {
+		t.Fatalf("expected old unredeemed vouchers and live voucher to remain, got %+v (live=%s old=%v)", remaining, live[0].Code, old)
 	}
 }
 
-func TestHandleUserMergeCDKWithCurrentPrimary(t *testing.T) {
+func TestHandleUserRedeemCDKCreatesSubscription(t *testing.T) {
 	srv := newTestServer(t)
 	handler := srv.Handler()
 	now := time.Now()
-	created, err := srv.cdk.createBatch(2, bytesPerGB, 30, true, now)
+	created, err := srv.cdk.createBatch(1, 3*bytesPerGB, 45, true, now)
 	if err != nil {
-		t.Fatalf("create cdks: %v", err)
+		t.Fatalf("create cdk: %v", err)
 	}
-	primary, secondary := created[0].Code, created[1].Code
+	user := createTestUserSession(t, srv)
 
-	req := jsonRequest(http.MethodPost, "/api/u/cdks/merge", `{"primary_code":"`+primary+`","secondary_code":"`+secondary+`"}`)
-	req.AddCookie(&http.Cookie{Name: "cdk", Value: primary})
+	req := jsonRequest(http.MethodPost, "/api/u/cdks/redeem", `{"code":"`+created[0].Code+`"}`)
+	req.AddCookie(user)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("merge status = %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("redeem status = %d body=%s", rec.Code, rec.Body.String())
 	}
 
 	var payload userStatusResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if payload.Code != primary || payload.RemainingBytes != 2*bytesPerGB {
-		t.Fatalf("payload code/remaining = %s/%d, want %s/%d", payload.Code, payload.RemainingBytes, primary, 2*bytesPerGB)
+	if payload.Quota.TotalRemainingBytes != 3*bytesPerGB || len(payload.Subscriptions) != 1 {
+		t.Fatalf("quota/subscriptions = %+v/%+v", payload.Quota, payload.Subscriptions)
 	}
-	if got := cdkCookieValue(rec.Result().Cookies()); got != primary {
-		t.Fatalf("set cdk cookie = %q, want primary %q", got, primary)
+	if payload.Subscriptions[0].DaysLeft != 45 || !payload.Subscriptions[0].AllowProxy {
+		t.Fatalf("subscription = %+v, want 45 proxy days", payload.Subscriptions[0])
 	}
-	if _, ok, err := srv.cdk.get(secondary); err != nil || ok {
-		t.Fatalf("secondary should be deleted, ok=%v err=%v", ok, err)
+	c, ok, err := srv.cdk.get(created[0].Code)
+	if err != nil || !ok || c.RedeemedAt == 0 || c.RedeemedByUserID == "" {
+		t.Fatalf("redeemed cdk = %+v ok=%v err=%v", c, ok, err)
+	}
+	if c.ExpiresAt < now.Add(45*24*time.Hour).Add(-2*time.Second).Unix() || c.ExpiresAt > now.Add(45*24*time.Hour).Add(2*time.Second).Unix() {
+		t.Fatalf("redeemed cdk expires_at = %d, want roughly redeem time + 45 days", c.ExpiresAt)
 	}
 }
 
-func TestHandleUserMergeCDKWithCurrentSecondarySwitchesSession(t *testing.T) {
+func TestHandleUserRedeemCDKRejectsRepeat(t *testing.T) {
 	srv := newTestServer(t)
 	handler := srv.Handler()
-	now := time.Now()
-	created, err := srv.cdk.createBatch(2, bytesPerGB, 30, true, now)
+	created, err := srv.cdk.createBatch(1, bytesPerGB, 30, true, time.Now())
 	if err != nil {
-		t.Fatalf("create cdks: %v", err)
+		t.Fatalf("create cdk: %v", err)
 	}
-	primary, secondary := created[0].Code, created[1].Code
+	user := createTestUserSession(t, srv)
 
-	req := jsonRequest(http.MethodPost, "/api/u/cdks/merge", `{"primary_code":"`+primary+`","secondary_code":"`+secondary+`"}`)
-	req.AddCookie(&http.Cookie{Name: "cdk", Value: secondary})
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("merge status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	if got := cdkCookieValue(rec.Result().Cookies()); got != primary {
-		t.Fatalf("set cdk cookie = %q, want primary %q", got, primary)
-	}
-}
-
-func TestHandleUserMergeCDKRejectsCurrentCDKOutsideMerge(t *testing.T) {
-	srv := newTestServer(t)
-	handler := srv.Handler()
-	now := time.Now()
-	created, err := srv.cdk.createBatch(3, bytesPerGB, 30, true, now)
-	if err != nil {
-		t.Fatalf("create cdks: %v", err)
-	}
-	current, primary, secondary := created[0].Code, created[1].Code, created[2].Code
-
-	req := jsonRequest(http.MethodPost, "/api/u/cdks/merge", `{"primary_code":"`+primary+`","secondary_code":"`+secondary+`"}`)
-	req.AddCookie(&http.Cookie{Name: "cdk", Value: current})
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("merge status = %d body=%s, want 403", rec.Code, rec.Body.String())
-	}
-	if _, ok, err := srv.cdk.get(secondary); err != nil || !ok {
-		t.Fatalf("secondary should remain, ok=%v err=%v", ok, err)
-	}
-}
-
-func TestHandleUserMergeCDKRejectsProxyMismatch(t *testing.T) {
-	srv := newTestServer(t)
-	handler := srv.Handler()
-	now := time.Now()
-	primary, err := srv.cdk.createBatch(1, bytesPerGB, 30, true, now)
-	if err != nil {
-		t.Fatalf("create primary: %v", err)
-	}
-	secondary, err := srv.cdk.createBatch(1, bytesPerGB, 30, false, now)
-	if err != nil {
-		t.Fatalf("create secondary: %v", err)
-	}
-
-	req := jsonRequest(http.MethodPost, "/api/u/cdks/merge", `{"primary_code":"`+primary[0].Code+`","secondary_code":"`+secondary[0].Code+`"}`)
-	req.AddCookie(&http.Cookie{Name: "cdk", Value: primary[0].Code})
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("merge status = %d body=%s, want 409", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "CDK 中转权限不同，不允许合并") {
-		t.Fatalf("expected proxy mismatch message, got %s", rec.Body.String())
-	}
-}
-
-func cdkCookieValue(cookies []*http.Cookie) string {
-	for _, c := range cookies {
-		if c.Name == "cdk" {
-			return c.Value
+	for i, want := range []int{http.StatusOK, http.StatusConflict} {
+		req := jsonRequest(http.MethodPost, "/api/u/cdks/redeem", `{"code":"`+created[0].Code+`"}`)
+		req.AddCookie(user)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Fatalf("redeem #%d status = %d body=%s, want %d", i+1, rec.Code, rec.Body.String(), want)
 		}
 	}
-	return ""
+}
+
+func TestHandleUserRedeemCDKRequiresUserSession(t *testing.T) {
+	srv := newTestServer(t)
+	handler := srv.Handler()
+	created, err := srv.cdk.createBatch(1, bytesPerGB, 30, true, time.Now())
+	if err != nil {
+		t.Fatalf("create cdk: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/u/cdks/redeem", `{"code":"`+created[0].Code+`"}`))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("redeem without session status = %d body=%s, want 401", rec.Code, rec.Body.String())
+	}
+}
+
+func createTestUserSession(t *testing.T, srv *Server) *http.Cookie {
+	t.Helper()
+	user, err := srv.users.createEmailUser("user@example.com", "secret-pass", time.Now())
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	token, err := srv.users.createSession(user.ID, time.Now())
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	return &http.Cookie{Name: userSessionCookieName, Value: token}
 }
 
 func TestCDKViewDaysLeft(t *testing.T) {
@@ -590,6 +594,7 @@ func TestCDKViewDaysLeft(t *testing.T) {
 		RemainingBytes: 5 * bytesPerGB,
 		ExpiresAt:      now.Add(72 * time.Hour).Unix(),
 		CreatedAt:      now.Unix(),
+		DurationDays:   3,
 	}
 	v := toCDKView(c, now)
 	if v.Expired {
@@ -602,7 +607,7 @@ func TestCDKViewDaysLeft(t *testing.T) {
 		t.Fatalf("unexpected remaining view: bytes=%d label=%q", v.RemainingBytes, v.RemainingLabel)
 	}
 
-	expiredView := toCDKView(CDK{ExpiresAt: now.Add(-time.Hour).Unix()}, now)
+	expiredView := toCDKView(CDK{ExpiresAt: now.Add(-time.Hour).Unix(), RedeemedAt: now.Add(-72 * time.Hour).Unix(), DurationDays: 3}, now)
 	if !expiredView.Expired || expiredView.DaysLeft != 0 {
 		t.Fatalf("expected expired view, got %+v", expiredView)
 	}

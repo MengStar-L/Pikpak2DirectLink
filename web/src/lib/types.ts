@@ -30,6 +30,27 @@ export type SettingsResponse = {
   max_task_timeout_seconds: number
 }
 
+export type AuthSettingsResponse = {
+  linuxdo_client_id: string
+  linuxdo_client_secret_configured: boolean
+  linuxdo_callback_url: string
+  linuxdo_configured: boolean
+  linuxdo_login_enabled: boolean
+  linuxdo_registration_enabled: boolean
+  email_login_enabled: boolean
+  email_registration_enabled: boolean
+}
+
+export type UpdateAuthSettingsRequest = {
+  linuxdo_client_id?: string
+  linuxdo_client_secret?: string
+  clear_linuxdo_client_secret?: boolean
+  linuxdo_login_enabled?: boolean
+  linuxdo_registration_enabled?: boolean
+  email_login_enabled?: boolean
+  email_registration_enabled?: boolean
+}
+
 export type UpdateSettingsRequest = {
   concurrency?: number
   task_timeout_seconds?: number
@@ -201,6 +222,12 @@ export type CDKView = {
   days_left: number
   expired: boolean
   allow_proxy: boolean
+  duration_days: number
+  redeemed: boolean
+  redeemed_by_user_id?: string
+  redeemed_at?: string
+  revoked: boolean
+  revoked_at?: string
 }
 
 export type CreateCDKRequest = {
@@ -216,13 +243,52 @@ export type UpdateCDKRequest = {
   allow_proxy: boolean
 }
 
-export type MergeCDKRequest = {
-  primary_code: string
-  secondary_code: string
+export type User = {
+  id: string
+  email?: string
+  display_name: string
+  avatar_url?: string
+  disabled: boolean
+  created_at: number
+  updated_at: number
 }
 
-// CDK user-portal projections.
-export type UserStatusResponse = CDKView & {
+export type UserSubscription = {
+  id: string
+  source_cdk_code?: string
+  remaining_bytes: number
+  used_bytes: number
+  remaining_label: string
+  used_label: string
+  expires_at: string
+  created_at: string
+  days_left: number
+  expired: boolean
+  allow_proxy: boolean
+}
+
+export type UserQuota = {
+  total_remaining_bytes: number
+  total_remaining_label: string
+  next_expires_at?: string
+  allow_proxy_available: boolean
+}
+
+export type UserAuthConfig = {
+  linuxdo_available: boolean
+  linuxdo_configured: boolean
+  linuxdo_login_enabled: boolean
+  linuxdo_registration_enabled: boolean
+  email_login_enabled: boolean
+  email_registration_enabled: boolean
+  linuxdo_start_url: string
+}
+
+export type UserStatusResponse = {
+  user: User
+  quota: UserQuota
+  subscriptions: UserSubscription[]
+  auth: UserAuthConfig
   queue: { waiting: number; active: boolean }
 }
 

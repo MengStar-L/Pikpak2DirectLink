@@ -126,6 +126,8 @@ type Job struct {
 	BaseURL         string           `json:"-"`
 	FolderID        string           `json:"-"`
 	CDKCode         string           `json:"-"`
+	UserID          string           `json:"-"`
+	ProxyAllowed    bool             `json:"-"`
 	AccountID       string           `json:"account_id,omitempty"`
 	Share           *ShareState      `json:"share,omitempty"`
 	Items           []DownloadItem   `json:"items,omitempty"`

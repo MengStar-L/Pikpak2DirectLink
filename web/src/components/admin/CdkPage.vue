@@ -72,7 +72,7 @@ async function action(code: string, kind: 'update' | 'delete', payload?: { traff
   try {
     if (kind === 'update' && payload) await api.cdks.update(code, payload)
     else if (kind === 'delete') await api.cdks.remove(code)
-    toast(kind === 'delete' ? '已删除 CDK' : '已重置额度', 'success')
+    toast(kind === 'delete' ? '已撤销 CDK' : '已重置额度', 'success')
     await load()
   } catch (e: any) {
     toast(e?.message || '操作失败', 'error')
@@ -91,7 +91,7 @@ defineExpose({ refresh: load })
       <div class="sec-head mb">
         <div class="sec-title">
           <span class="sec-glyph"><Ticket /></span>
-          <div><span class="eyebrow">cdk</span><h2>CDK 分发</h2><p>生成兑换码，用户凭码进入用户页面使用解析</p></div>
+          <div><span class="eyebrow">cdk</span><h2>CDK 分发</h2><p>生成兑换码，用户登录后兑换为空间订阅</p></div>
         </div>
         <div class="head-actions">
           <a class="link-btn" href="/u" target="_blank" rel="noreferrer noopener"><ExternalLink />用户入口</a>

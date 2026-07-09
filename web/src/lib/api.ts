@@ -3,6 +3,7 @@
 // (admin `session` / CDK `cdk`) flow automatically with same-origin requests.
 import type {
   AccountSummary,
+  AuthSettingsResponse,
   AuthResult,
   AuthStatus,
   BatchSummary,
@@ -12,14 +13,15 @@ import type {
   CreateJobRequest,
   Job,
   LogEntry,
-  MergeCDKRequest,
   ResolveHistoryDetail,
   ResolveHistorySummary,
   SelectItemsRequest,
   SettingsResponse,
   UpdateCDKRequest,
+  UpdateAuthSettingsRequest,
   UpdateSettingsRequest,
   UpdateStatus,
+  UserAuthConfig,
   UserJobView,
   UserStatusResponse,
 } from './types'
@@ -92,6 +94,10 @@ export const api = {
   settings: {
     get: () => request<SettingsResponse>('GET', '/api/settings'),
     update: (body: UpdateSettingsRequest) => request<SettingsResponse>('PUT', '/api/settings', body),
+    auth: {
+      get: () => request<AuthSettingsResponse>('GET', '/api/settings/auth'),
+      update: (body: UpdateAuthSettingsRequest) => request<AuthSettingsResponse>('PUT', '/api/settings/auth', body),
+    },
   },
 
   update: {
@@ -134,14 +140,14 @@ export const api = {
   },
 
   u: {
-    login: (code: string) => request<UserStatusResponse>('POST', '/api/u/login', { code }),
+    authConfig: () => request<UserAuthConfig>('GET', '/api/u/auth/config'),
+    emailLogin: (email: string, password: string) =>
+      request<UserStatusResponse>('POST', '/api/u/auth/email/login', { email, password }),
+    emailRegister: (email: string, password: string) =>
+      request<UserStatusResponse>('POST', '/api/u/auth/email/register', { email, password }),
     status: () => request<UserStatusResponse>('GET', '/api/u/status'),
     logout: () => request<AuthResult>('POST', '/api/u/logout'),
-    mergeCDK: (primaryCode: string, secondaryCode: string) =>
-      request<UserStatusResponse>('POST', '/api/u/cdks/merge', {
-        primary_code: primaryCode,
-        secondary_code: secondaryCode,
-      } satisfies MergeCDKRequest),
+    redeemCDK: (code: string) => request<UserStatusResponse>('POST', '/api/u/cdks/redeem', { code }),
     jobs: {
       create: (body: CreateJobRequest) => request<UserJobView>('POST', '/api/u/jobs', body),
       get: (id: string) => request<UserJobView>('GET', `/api/u/jobs/${id}`),

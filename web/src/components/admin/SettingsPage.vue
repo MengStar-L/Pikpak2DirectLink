@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { Gauge, Lock, Save, KeyRound } from 'lucide-vue-next'
+import { Copy, Gauge, KeyRound, Lock, Save, ShieldCheck } from 'lucide-vue-next'
 import GlassCard from '../GlassCard.vue'
 import PrimaryButton from '../PrimaryButton.vue'
 import { api } from '../../lib/api'
+import { copyText } from '../../lib/clipboard'
 import { toast } from '../../composables/useToast'
-import type { SettingsResponse } from '../../lib/types'
+import type { AuthSettingsResponse, SettingsResponse } from '../../lib/types'
 
 const props = defineProps<{ passwordFixed: boolean }>()
 
@@ -19,6 +20,19 @@ const pw = ref({ current: '', new: '', confirm: '' })
 const pwErr = ref('')
 const pwSaving = ref(false)
 
+const authSettings = ref<AuthSettingsResponse | null>(null)
+const authForm = ref({
+  linuxdo_client_id: '',
+  linuxdo_client_secret: '',
+  clear_linuxdo_client_secret: false,
+  linuxdo_login_enabled: true,
+  linuxdo_registration_enabled: true,
+  email_login_enabled: true,
+  email_registration_enabled: false,
+})
+const authErr = ref('')
+const authSaving = ref(false)
+
 async function loadSettings() {
   try {
     settings.value = await api.settings.get()
@@ -27,6 +41,52 @@ async function loadSettings() {
   } catch (e: any) {
     toast(e?.message || '加载设置失败', 'error')
   }
+}
+
+async function loadAuthSettings() {
+  try {
+    authSettings.value = await api.settings.auth.get()
+    authForm.value = {
+      linuxdo_client_id: authSettings.value.linuxdo_client_id,
+      linuxdo_client_secret: '',
+      clear_linuxdo_client_secret: false,
+      linuxdo_login_enabled: authSettings.value.linuxdo_login_enabled,
+      linuxdo_registration_enabled: authSettings.value.linuxdo_registration_enabled,
+      email_login_enabled: authSettings.value.email_login_enabled,
+      email_registration_enabled: authSettings.value.email_registration_enabled,
+    }
+  } catch (e: any) {
+    toast(e?.message || '加载用户登录设置失败', 'error')
+  }
+}
+
+async function saveAuthSettings() {
+  authErr.value = ''
+  authSaving.value = true
+  try {
+    authSettings.value = await api.settings.auth.update({
+      linuxdo_client_id: authForm.value.linuxdo_client_id,
+      linuxdo_client_secret: authForm.value.linuxdo_client_secret || undefined,
+      clear_linuxdo_client_secret: authForm.value.clear_linuxdo_client_secret,
+      linuxdo_login_enabled: authForm.value.linuxdo_login_enabled,
+      linuxdo_registration_enabled: authForm.value.linuxdo_registration_enabled,
+      email_login_enabled: authForm.value.email_login_enabled,
+      email_registration_enabled: authForm.value.email_registration_enabled,
+    })
+    authForm.value.linuxdo_client_secret = ''
+    authForm.value.clear_linuxdo_client_secret = false
+    toast('用户登录设置已保存', 'success')
+    await loadAuthSettings()
+  } catch (e: any) {
+    authErr.value = e?.message || '保存失败'
+  } finally {
+    authSaving.value = false
+  }
+}
+
+async function copyCallbackURL() {
+  if (!authSettings.value?.linuxdo_callback_url) return
+  toast(await copyText(authSettings.value.linuxdo_callback_url) ? '回调地址已复制' : '复制失败', 'info')
 }
 
 async function saveSettings() {
@@ -60,7 +120,9 @@ async function changePassword() {
   }
 }
 
-onMounted(loadSettings)
+onMounted(async () => {
+  await Promise.all([loadSettings(), loadAuthSettings()])
+})
 </script>
 
 <template>
@@ -83,6 +145,40 @@ onMounted(loadSettings)
         队列 <b class="mono">{{ settings?.waiting ?? 0 }} 等待 / {{ settings?.running ?? 0 }} 运行</b>
       </p>
       <Transition name="v-fade"><p v-if="concErr" class="error-block">{{ concErr }}</p></Transition>
+    </GlassCard>
+
+    <GlassCard seam>
+      <div class="sec-head mb">
+        <div class="sec-title">
+          <span class="sec-glyph ok"><ShieldCheck /></span>
+          <div><span class="eyebrow">user auth</span><h2>用户登录</h2><p>配置 LinuxDo 登录、社区用户注册和邮箱注册入口</p></div>
+        </div>
+      </div>
+      <form class="auth-form" @submit.prevent="saveAuthSettings">
+        <label class="field callback-field">
+          <span class="field-label">LinuxDo 回调地址</span>
+          <div class="copy-row">
+            <input class="input input-mono" :value="authSettings?.linuxdo_callback_url || '-'" readonly />
+            <button class="btn btn-line btn-sm" type="button" @click="copyCallbackURL"><Copy />复制</button>
+          </div>
+        </label>
+        <label class="field"><span class="field-label">Client ID</span><input v-model="authForm.linuxdo_client_id" class="input input-mono" type="text" autocomplete="off" /></label>
+        <label class="field"><span class="field-label">Client Secret</span><input v-model="authForm.linuxdo_client_secret" class="input input-mono" type="password" autocomplete="new-password" placeholder="留空则不修改" /></label>
+        <div class="check-grid">
+          <label class="check"><input v-model="authForm.linuxdo_login_enabled" type="checkbox" />LinuxDo 登录</label>
+          <label class="check"><input v-model="authForm.linuxdo_registration_enabled" type="checkbox" />LinuxDo 注册</label>
+          <label class="check"><input v-model="authForm.email_login_enabled" type="checkbox" />邮箱登录</label>
+          <label class="check"><input v-model="authForm.email_registration_enabled" type="checkbox" />邮箱注册</label>
+          <label class="check danger"><input v-model="authForm.clear_linuxdo_client_secret" type="checkbox" />清空 Secret</label>
+        </div>
+        <PrimaryButton type="submit" :loading="authSaving"><template #icon><Save /></template>保存登录设置</PrimaryButton>
+      </form>
+      <p class="state">
+        LinuxDo <b class="mono">{{ authSettings?.linuxdo_configured ? '已配置' : '未配置' }}</b> ·
+        Secret <b class="mono">{{ authSettings?.linuxdo_client_secret_configured ? '已保存' : '未保存' }}</b> ·
+        邮箱注册 <b class="mono">{{ authSettings?.email_registration_enabled ? '开启' : '关闭' }}</b>
+      </p>
+      <Transition name="v-fade"><p v-if="authErr" class="error-block">{{ authErr }}</p></Transition>
     </GlassCard>
 
     <GlassCard seam>
@@ -111,10 +207,16 @@ onMounted(loadSettings)
 .form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; align-items: end; }
 .form.pw { grid-template-columns: 1fr 1fr 1fr auto; }
 .form .btn { height: 34px; }
+.auth-form { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 10px; align-items: end; }
+.auth-form .btn { height: 34px; }
+.callback-field { grid-column: 1 / -1; }
+.copy-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.check-grid { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; padding: 3px 0; }
+.check.danger { color: var(--danger-ink); }
 .state { font-size: var(--fs-sm); color: var(--ink-2); margin-top: 12px; }
 .state b { color: var(--ink); font-weight: var(--fw-semi); }
 .fixed-note { display: flex; align-items: flex-start; gap: 8px; font-size: var(--fs-sm); color: var(--ink-2); padding: 11px 13px; border-radius: var(--r-md); background: var(--live-soft); border: 1px solid var(--live-line); line-height: 1.55; }
 .fixed-note svg { width: 15px; height: 15px; flex: none; margin-top: 2px; color: var(--live-ink); }
 .fixed-note code { font-size: var(--fs-xs); }
-@media (max-width: 820px) { .form, .form.pw { grid-template-columns: 1fr; } }
+@media (max-width: 820px) { .form, .form.pw, .auth-form { grid-template-columns: 1fr; } .callback-field, .check-grid { grid-column: auto; } }
 </style>

@@ -92,13 +92,14 @@ type resolveHistoryDetail struct {
 type storedResolveHistory struct {
 	resolveHistoryDetail
 	cdkCode string
+	userID  string
 }
 
 func (s *resolveHistoryStore) saveJob(job *Job) error {
 	if s == nil || s.db == nil || job == nil {
 		return nil
 	}
-	if strings.TrimSpace(job.CDKCode) == "" || strings.TrimSpace(job.ParentID) != "" || job.Status != JobCompleted {
+	if strings.TrimSpace(job.CDKCode) == "" && strings.TrimSpace(job.UserID) == "" || strings.TrimSpace(job.ParentID) != "" || job.Status != JobCompleted {
 		return nil
 	}
 
@@ -133,10 +134,11 @@ func (s *resolveHistoryStore) saveJob(job *Job) error {
 	input := strings.TrimSpace(firstNonEmpty(job.OriginalInput, job.Input))
 	_, err = s.db.Exec(
 		`INSERT OR REPLACE INTO cdk_resolve_history
-			(id, cdk_code, job_id, kind, mode, input, results_json, batch_json, created_at, completed_at, expires_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+			(id, cdk_code, user_id, job_id, kind, mode, input, results_json, batch_json, created_at, completed_at, expires_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		job.ID,
 		normalizeCode(job.CDKCode),
+		strings.TrimSpace(job.UserID),
 		job.ID,
 		string(job.Kind),
 		job.Mode,
@@ -155,11 +157,39 @@ func (s *resolveHistoryStore) list(cdkCode string, now time.Time) ([]resolveHist
 		return nil, nil
 	}
 	rows, err := s.db.Query(
-		`SELECT id, cdk_code, job_id, kind, mode, input, results_json, batch_json, created_at, completed_at, expires_at
+		`SELECT id, cdk_code, user_id, job_id, kind, mode, input, results_json, batch_json, created_at, completed_at, expires_at
 			FROM cdk_resolve_history
 			WHERE cdk_code=? AND expires_at>?
 			ORDER BY completed_at DESC`,
 		normalizeCode(cdkCode),
+		now.Unix(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []resolveHistorySummary
+	for rows.Next() {
+		record, err := scanResolveHistory(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, record.resolveHistorySummary)
+	}
+	return out, rows.Err()
+}
+
+func (s *resolveHistoryStore) listByUser(userID string, now time.Time) ([]resolveHistorySummary, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.Query(
+		`SELECT id, cdk_code, user_id, job_id, kind, mode, input, results_json, batch_json, created_at, completed_at, expires_at
+			FROM cdk_resolve_history
+			WHERE user_id=? AND expires_at>?
+			ORDER BY completed_at DESC`,
+		strings.TrimSpace(userID),
 		now.Unix(),
 	)
 	if err != nil {
@@ -183,11 +213,33 @@ func (s *resolveHistoryStore) get(cdkCode, id string, now time.Time) (resolveHis
 		return resolveHistoryDetail{}, false, nil
 	}
 	row := s.db.QueryRow(
-		`SELECT id, cdk_code, job_id, kind, mode, input, results_json, batch_json, created_at, completed_at, expires_at
+		`SELECT id, cdk_code, user_id, job_id, kind, mode, input, results_json, batch_json, created_at, completed_at, expires_at
 			FROM cdk_resolve_history
 			WHERE id=? AND cdk_code=? AND expires_at>?`,
 		strings.TrimSpace(id),
 		normalizeCode(cdkCode),
+		now.Unix(),
+	)
+	record, err := scanResolveHistory(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return resolveHistoryDetail{}, false, nil
+	}
+	if err != nil {
+		return resolveHistoryDetail{}, false, err
+	}
+	return record.resolveHistoryDetail, true, nil
+}
+
+func (s *resolveHistoryStore) getByUser(userID, id string, now time.Time) (resolveHistoryDetail, bool, error) {
+	if s == nil || s.db == nil {
+		return resolveHistoryDetail{}, false, nil
+	}
+	row := s.db.QueryRow(
+		`SELECT id, cdk_code, user_id, job_id, kind, mode, input, results_json, batch_json, created_at, completed_at, expires_at
+			FROM cdk_resolve_history
+			WHERE id=? AND user_id=? AND expires_at>?`,
+		strings.TrimSpace(id),
+		strings.TrimSpace(userID),
 		now.Unix(),
 	)
 	record, err := scanResolveHistory(row)
@@ -219,6 +271,7 @@ func scanResolveHistory(scanner resolveHistoryScanner) (storedResolveHistory, er
 	var (
 		id          string
 		cdkCode     string
+		userID      string
 		jobID       string
 		kind        string
 		mode        string
@@ -229,7 +282,7 @@ func scanResolveHistory(scanner resolveHistoryScanner) (storedResolveHistory, er
 		doneUnix    int64
 		expiresUnix int64
 	)
-	if err := scanner.Scan(&id, &cdkCode, &jobID, &kind, &mode, &input, &resultsRaw, &batchRaw, &createdUnix, &doneUnix, &expiresUnix); err != nil {
+	if err := scanner.Scan(&id, &cdkCode, &userID, &jobID, &kind, &mode, &input, &resultsRaw, &batchRaw, &createdUnix, &doneUnix, &expiresUnix); err != nil {
 		return storedResolveHistory{}, err
 	}
 
@@ -249,6 +302,7 @@ func scanResolveHistory(scanner resolveHistoryScanner) (storedResolveHistory, er
 
 	return storedResolveHistory{
 		cdkCode: cdkCode,
+		userID:  userID,
 		resolveHistoryDetail: resolveHistoryDetail{
 			resolveHistorySummary: resolveHistorySummary{
 				ID:          id,

@@ -353,11 +353,19 @@ func TestCDKAdminGatedUserPortalPublic(t *testing.T) {
 		t.Fatalf("expected the user portal page at /u, got %d", rec.Code)
 	}
 
-	// An unknown CDK is rejected at login.
+	// User auth config is public and reports LinuxDo unavailable until the admin
+	// configures the OAuth client.
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/u/login", `{"code":"DOES-NOTE-XIST-0000"}`))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/u/auth/config", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"linuxdo_available":false`) {
+		t.Fatalf("expected public auth config with LinuxDo unavailable, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// User business APIs require a user session, not an admin session or CDK.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/u/status", nil))
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for unknown CDK, got %d", rec.Code)
+		t.Fatalf("expected 401 for anonymous user status, got %d", rec.Code)
 	}
 }
 

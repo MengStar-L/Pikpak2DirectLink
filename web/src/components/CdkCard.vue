@@ -18,7 +18,7 @@ const draftAllowProxy = ref(true)
 
 function startEdit() {
   draftGb.value = Math.max(1, Math.round(props.cdk.remaining_bytes / (1 << 30)) || 5)
-  draftDays.value = Math.max(1, props.cdk.days_left || 30)
+  draftDays.value = Math.max(1, props.cdk.duration_days || props.cdk.days_left || 30)
   draftAllowProxy.value = props.cdk.allow_proxy
   editing.value = true
 }
@@ -29,19 +29,21 @@ function saveEdit() {
 </script>
 
 <template>
-  <article class="cdk panel anim-rise" :class="{ expired: cdk.expired }">
+  <article class="cdk panel anim-rise" :class="{ expired: cdk.revoked }">
     <header class="head">
       <span class="tk"><Ticket /></span>
       <code class="code mono">{{ cdk.code }}</code>
       <CopyButton :text="cdk.code" label="复制" size="sm" />
       <span class="pill" :class="cdk.allow_proxy ? 'pill-brand' : ''" :title="cdk.allow_proxy ? '此 CDK 可用中转下载' : '此 CDK 不支持中转下载'">{{ cdk.allow_proxy ? '中转可用' : '无中转' }}</span>
-      <span v-if="cdk.expired" class="pill pill-danger">已过期</span>
+      <span v-if="cdk.revoked" class="pill pill-danger">已撤销</span>
+      <span v-else-if="cdk.redeemed" class="pill pill-ok">已兑换</span>
+      <span v-else class="pill pill-live">未兑换</span>
     </header>
 
     <div class="stats">
       <div class="stat"><span class="k">剩余</span><span class="v mono">{{ cdk.remaining_label }}</span></div>
       <div class="stat"><span class="k">已用</span><span class="v mono">{{ cdk.used_label }}</span></div>
-      <div class="stat"><span class="k">到期</span><span class="v mono">{{ cdk.days_left }} 天</span></div>
+      <div class="stat"><span class="k">有效期</span><span class="v mono">{{ cdk.duration_days || cdk.days_left }} 天</span></div>
     </div>
 
     <footer class="actions">

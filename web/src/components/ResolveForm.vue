@@ -1,20 +1,22 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import { Play } from 'lucide-vue-next'
+import { Link2, Play, Waypoints } from 'lucide-vue-next'
 import PrimaryButton from './PrimaryButton.vue'
 
 const props = defineProps<{
   loading?: boolean
   disabled?: boolean
   compact?: boolean
+  allowProxy?: boolean
 }>()
 
 const emit = defineEmits<{
-  (e: 'submit', payload: { input: string; passCode: string; mode: 'direct' }): void
+  (e: 'submit', payload: { input: string; passCode: string; mode: 'direct' | 'proxy' }): void
 }>()
 
 const input = ref('')
 const passCode = ref('')
+const mode = ref<'direct' | 'proxy'>('direct')
 
 const lineCount = computed(() => input.value.split('\n').filter((l) => l.trim()).length)
 const isBatch = computed(() => lineCount.value > 1)
@@ -22,7 +24,7 @@ const isBatch = computed(() => lineCount.value > 1)
 function onSubmit() {
   if (props.loading || props.disabled) return
   if (!input.value.trim()) return
-  emit('submit', { input: input.value, passCode: passCode.value, mode: 'direct' })
+  emit('submit', { input: input.value, passCode: passCode.value, mode: props.allowProxy ? mode.value : 'direct' })
 }
 </script>
 
@@ -46,6 +48,17 @@ https://mypikpak.com/s/...
         <input v-model="passCode" class="input input-mono" type="text" autocomplete="off" placeholder="-" />
       </label>
 
+      <div class="seg mode-seg">
+        <label class="seg-item">
+          <input v-model="mode" type="radio" value="direct" />
+          <span><Link2 />Direct</span>
+        </label>
+        <label class="seg-item" :class="{ off: !allowProxy }" :title="allowProxy ? 'Proxy' : 'No proxy quota'">
+          <input v-model="mode" type="radio" value="proxy" :disabled="!allowProxy" />
+          <span><Waypoints />Proxy</span>
+        </label>
+      </div>
+
       <PrimaryButton class="submit-btn" type="submit" block size="lg" :loading="loading" :disabled="disabled || !input.trim()">
         <template #icon><Play /></template>
         {{ isBatch ? `批量解析 ${lineCount} 条` : '开始解析' }}
@@ -60,6 +73,10 @@ https://mypikpak.com/s/...
 .main .textarea { width: 100%; min-height: 132px; }
 .side { display: flex; flex-direction: column; gap: 12px; }
 .submit-btn { margin-top: auto; }
+.mode-seg { width: 100%; }
+.mode-seg .seg-item { flex: 1 1 0; }
+.mode-seg .seg-item span { width: 100%; justify-content: center; }
+.mode-seg .off { opacity: 0.55; cursor: not-allowed; }
 
 @media (max-width: 760px) {
   .rform { grid-template-columns: 1fr; }

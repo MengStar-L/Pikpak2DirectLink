@@ -35,9 +35,11 @@ type Server struct {
 	updater              *updater
 	db                   *sql.DB
 	cdk                  *cdkStore
+	users                *userStore
 	settings             *settingsStore
 	history              *resolveHistoryStore
 	tempCleanups         *proxyTempCleanupStore
+	oauthStates          *oauthStateStore
 	gateHTML             []byte
 	userHTML             []byte
 	mux                  *http.ServeMux
@@ -155,9 +157,11 @@ func NewServer(cfg Config) (*Server, error) {
 		creds:         creds,
 		db:            db,
 		cdk:           newCDKStore(db),
+		users:         newUserStore(db),
 		settings:      newSettingsStore(db),
 		history:       newResolveHistoryStore(db),
 		tempCleanups:  newProxyTempCleanupStore(db),
+		oauthStates:   newOAuthStateStore(),
 		gateHTML:      gateHTML,
 		userHTML:      userHTML,
 		mux:           http.NewServeMux(),
@@ -210,6 +214,8 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("GET /api/config", server.handleConfig)
 	server.mux.HandleFunc("GET /api/settings", server.handleGetSettings)
 	server.mux.HandleFunc("PUT /api/settings", server.handleUpdateSettings)
+	server.mux.HandleFunc("GET /api/settings/auth", server.handleGetAuthSettings)
+	server.mux.HandleFunc("PUT /api/settings/auth", server.handleUpdateAuthSettings)
 	server.mux.HandleFunc("GET /api/update", server.handleUpdateStatus)
 	server.mux.HandleFunc("POST /api/update/check", server.handleUpdateCheck)
 	server.mux.HandleFunc("POST /api/update/install", server.handleUpdateInstall)
@@ -233,12 +239,17 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("PATCH /api/cdks/{code}", server.handleUpdateCDK)
 	server.mux.HandleFunc("DELETE /api/cdks/{code}", server.handleDeleteCDK)
 
-	// Public CDK user portal. The handlers enforce CDK validity themselves.
+	// Public user portal. The handlers enforce user-session validity themselves.
 	server.mux.Handle("GET /u", http.HandlerFunc(server.handleUserPortal))
-	server.mux.HandleFunc("POST /api/u/login", server.handleUserLogin)
+	server.mux.HandleFunc("GET /api/u/auth/config", server.handleUserAuthConfig)
+	server.mux.HandleFunc("GET /api/u/auth/linuxdo/start", server.handleLinuxDoAuthStart)
+	server.mux.HandleFunc("GET /api/u/auth/linuxdo/callback", server.handleLinuxDoAuthCallback)
+	server.mux.HandleFunc("POST /api/u/auth/email/register", server.handleEmailRegister)
+	server.mux.HandleFunc("POST /api/u/auth/email/login", server.handleEmailLogin)
+	server.mux.HandleFunc("POST /api/u/login", server.handleEmailLogin)
 	server.mux.HandleFunc("GET /api/u/status", server.handleUserStatus)
 	server.mux.HandleFunc("POST /api/u/logout", server.handleUserLogout)
-	server.mux.HandleFunc("POST /api/u/cdks/merge", server.handleUserMergeCDK)
+	server.mux.HandleFunc("POST /api/u/cdks/redeem", server.handleUserRedeemCDK)
 	server.mux.HandleFunc("POST /api/u/jobs", server.handleUserCreateJob)
 	server.mux.HandleFunc("GET /api/u/jobs/{id}", server.handleUserGetJob)
 	server.mux.HandleFunc("POST /api/u/jobs/{id}/select", server.handleUserSelectItem)
@@ -649,7 +660,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	// (multi-file resolution still pauses for a manual selection).
 	lines := splitResourceLineSpecs(req.Input)
 	if len(lines) > 1 {
-		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, "", priorityAdmin, s.baseURL(r))
+		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, "", "", priorityAdmin, s.baseURL(r))
 		if status != 0 {
 			writeError(w, status, msg)
 			return
@@ -879,15 +890,20 @@ func (s *Server) clearProxyFailure(jobID, token string) {
 	}
 }
 
-// jobAllowsProxy reports whether a job may expose proxy (中转) links. Admin jobs
-// (no CDK) always may; a CDK job may only if its CDK has AllowProxy set. A
-// missing/deleted CDK is treated as allowed so the admin path and edge cases
-// don't break — a CDK job whose CDK is gone fails elsewhere anyway.
-func (s *Server) jobAllowsProxy(cdkCode string) bool {
-	if cdkCode == "" {
+// jobAllowsProxy reports whether a job may expose proxy links. Admin jobs always
+// may. User jobs only may when they were created in proxy mode; legacy CDK jobs
+// still follow the voucher's allow_proxy flag.
+func (s *Server) jobAllowsProxy(job *Job) bool {
+	if job == nil {
 		return true
 	}
-	c, ok, err := s.cdk.get(cdkCode)
+	if job.UserID != "" {
+		return job.ProxyAllowed
+	}
+	if job.CDKCode == "" {
+		return true
+	}
+	c, ok, err := s.cdk.get(job.CDKCode)
 	if err != nil || !ok {
 		return true
 	}
@@ -994,7 +1010,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	// Defense in depth: a CDK that may not use 中转 cannot pull files through the
 	// proxy even with a valid token (its results normally carry no proxy URL).
-	if !s.jobAllowsProxy(job.CDKCode) {
+	if !s.jobAllowsProxy(job) {
 		writeError(w, http.StatusForbidden, proxyInvalidLinkError)
 		return
 	}
@@ -1592,11 +1608,12 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 		// retrying on other accounts would just repeat the expensive transfer and
 		// hit the same refusal. Fail the job terminally instead.
 		var overdraw errCDKOverdraw
-		if errors.As(err, &overdraw) {
+		var userOverdraw errUserQuotaOverdraw
+		if errors.As(err, &overdraw) || errors.As(err, &userOverdraw) {
 			s.accounts.MarkAvailable(account.ID)
-			s.finishAccountAttempt(jobID, account.ID, "failed", overdraw.Error())
-			s.logJob(LogWarn, jobID, "文件大小超过 CDK 剩余流量，已拒绝", overdraw.Error())
-			s.failJob(jobID, overdraw)
+			s.finishAccountAttempt(jobID, account.ID, "failed", err.Error())
+			s.logJob(LogWarn, jobID, "resolved file exceeds remaining user quota", err.Error())
+			s.failJob(jobID, err)
 			return
 		}
 		if isCDKRefusalError(err) {
@@ -1978,20 +1995,20 @@ func (s *Server) finishWithItems(ctx context.Context, jobID string, account Acco
 	return s.completeJob(ctx, jobID, account, items[0])
 }
 
-// cdkOverdrawError returns a typed error when a CDK job's resolved file is
-// larger than the CDK's remaining traffic. Non-CDK jobs and lookups that fail
-// never block (the charge step still clamps at zero as a backstop).
+// cdkOverdrawError returns a typed quota error when a user/legacy CDK job's
+// resolved file is larger than the remaining quota. Admin jobs and lookups that
+// fail never block (the charge step still validates as a backstop).
 func (s *Server) cdkOverdrawError(jobID string, item DownloadItem) error {
-	cdkCode := mustJob(s.jobs.get(jobID)).CDKCode
-	if cdkCode == "" {
+	job := mustJob(s.jobs.get(jobID))
+	if job.UserID == "" && job.CDKCode == "" {
 		return nil
 	}
 	size := parseBytes(item.Size)
-	c, ok, err := s.cdk.get(cdkCode)
-	if err != nil || !ok {
-		return nil
+	if job.UserID != "" && s.users != nil {
+		return s.users.hasQuota(job.UserID, size, job.Mode == "proxy", s.now())
 	}
-	if size > c.RemainingBytes {
+	c, ok, err := s.cdk.get(job.CDKCode)
+	if err == nil && ok && size > c.RemainingBytes {
 		return errCDKOverdraw{size: size, remaining: c.RemainingBytes}
 	}
 	return nil
@@ -2005,9 +2022,14 @@ func isCDKRefusalError(err error) bool {
 	if errors.As(err, &overdraw) {
 		return true
 	}
+	var userOverdraw errUserQuotaOverdraw
+	if errors.As(err, &userOverdraw) {
+		return true
+	}
 	return errors.Is(err, errCDKNotFound) ||
 		errors.Is(err, errCDKExpired) ||
-		errors.Is(err, errCDKExhausted)
+		errors.Is(err, errCDKExhausted) ||
+		errors.Is(err, errUserQuotaExhausted)
 }
 
 func (s *Server) requestSelection(jobID string, stage JobStage, message string, items []DownloadItem, accountID string) error {
@@ -2071,7 +2093,13 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 	}
 
 	size := parseBytes(result.File.Size)
-	if cdkCode := mustJob(s.jobs.get(jobID)).CDKCode; cdkCode != "" {
+	job := mustJob(s.jobs.get(jobID))
+	if job.UserID != "" && s.users != nil {
+		if err := s.users.chargeIfEnough(job.UserID, size, job.Mode == "proxy", time.Now()); err != nil {
+			s.cleanupTempResourcesBestEffort(jobID, account, "user quota charge failed", false, item.ID)
+			return err
+		}
+	} else if cdkCode := job.CDKCode; cdkCode != "" {
 		if err := s.cdk.chargeIfEnough(cdkCode, size, time.Now()); err != nil {
 			s.cleanupTempResourcesBestEffort(jobID, account, "CDK charge failed", false, item.ID)
 			return err
@@ -2142,7 +2170,7 @@ func (s *Server) resolveFileLink(ctx context.Context, jobID string, account Acco
 	// Only mint a proxy (中转) link when the job is permitted to use it: admin
 	// jobs always, CDK jobs only if their CDK allows it. No-proxy CDK results
 	// then carry only a direct link, and the frontend hides the proxy row.
-	if s.jobAllowsProxy(job.CDKCode) {
+	if s.jobAllowsProxy(job) {
 		proxyToken := newJobID()
 		result.ProxyURL = strings.TrimRight(job.BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken
 		result.ProxyToken = proxyToken
@@ -2163,7 +2191,16 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 	// expensive link resolution. The user-select path is already pre-gated in
 	// applyItemsSelection; this also covers the batch-child path, which resolves
 	// every file unattended and would otherwise overdraw.
-	if cdkCode := mustJob(s.jobs.get(jobID)).CDKCode; cdkCode != "" {
+	job := mustJob(s.jobs.get(jobID))
+	if job.UserID != "" && s.users != nil {
+		var sum int64
+		for _, item := range items {
+			sum += parseBytes(item.Size)
+		}
+		if err := s.users.hasQuota(job.UserID, sum, job.Mode == "proxy", s.now()); err != nil {
+			return err
+		}
+	} else if cdkCode := job.CDKCode; cdkCode != "" {
 		var sum int64
 		for _, item := range items {
 			sum += parseBytes(item.Size)
@@ -2185,7 +2222,13 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 	}
 
 	fallbackIDs := downloadItemIDs(items)
-	if cdkCode := mustJob(s.jobs.get(jobID)).CDKCode; cdkCode != "" {
+	job = mustJob(s.jobs.get(jobID))
+	if job.UserID != "" && s.users != nil {
+		if err := s.users.chargeIfEnough(job.UserID, totalSize, job.Mode == "proxy", time.Now()); err != nil {
+			s.cleanupTempResourcesBestEffort(jobID, account, "user quota charge failed", false, fallbackIDs...)
+			return err
+		}
+	} else if cdkCode := job.CDKCode; cdkCode != "" {
 		if err := s.cdk.chargeIfEnough(cdkCode, totalSize, time.Now()); err != nil {
 			s.cleanupTempResourcesBestEffort(jobID, account, "CDK charge failed", false, fallbackIDs...)
 			return err

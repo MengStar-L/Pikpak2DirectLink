@@ -33,6 +33,37 @@ func selectionErrorResponse(err error) (int, string) {
 	return http.StatusConflict, err.Error()
 }
 
+func (s *Server) jobQuotaSelectionError(job *Job, size int64) error {
+	if job == nil || size <= 0 {
+		return nil
+	}
+	if job.UserID != "" && s.users != nil {
+		return s.users.hasQuota(job.UserID, size, job.Mode == "proxy", s.now())
+	}
+	if job.CDKCode != "" && s.cdk != nil {
+		c, ok, err := s.cdk.get(job.CDKCode)
+		if err == nil && ok && size > c.RemainingBytes {
+			return errCDKOverdraw{size: size, remaining: c.RemainingBytes}
+		}
+	}
+	return nil
+}
+
+func quotaSelectionMessage(err error) string {
+	var userOverdraw errUserQuotaOverdraw
+	if errors.As(err, &userOverdraw) {
+		return "Selected files exceed remaining quota."
+	}
+	var cdkOverdraw errCDKOverdraw
+	if errors.As(err, &cdkOverdraw) {
+		return "Selected files exceed remaining CDK traffic."
+	}
+	if errors.Is(err, errUserQuotaExhausted) {
+		return "User quota has been used up."
+	}
+	return err.Error()
+}
+
 // applyItemSelection resolves a pending selection on a job and kicks the next
 // stage. It returns the updated job, or an HTTP status code + message on error
 // (status 0 means success).
@@ -62,14 +93,8 @@ func (s *Server) applyItemSelection(jobID, itemID string) (*Job, int, string) {
 		if selectedItem == nil {
 			return nil, http.StatusBadRequest, "selected file was not found in the current result set"
 		}
-		// For CDK users the file size is known at this point, so refuse a pick
-		// that would exceed the CDK's remaining traffic instead of silently
-		// absorbing the overage at charge time (charge only clamps at zero).
-		if job.CDKCode != "" {
-			size := parseBytes(selectedItem.Size)
-			if c, ok, err := s.cdk.get(job.CDKCode); err == nil && ok && size > c.RemainingBytes {
-				return nil, http.StatusForbidden, "所选文件大小 " + formatTrafficLabel(size) + " 超过 CDK 剩余流量（剩余 " + formatTrafficLabel(c.RemainingBytes) + "），请选择更小的文件"
-			}
+		if err := s.jobQuotaSelectionError(job, parseBytes(selectedItem.Size)); err != nil {
+			return nil, http.StatusForbidden, quotaSelectionMessage(err)
 		}
 	}
 
@@ -175,10 +200,8 @@ func (s *Server) applyItemsSelection(jobID string, itemIDs []string) (*Job, int,
 			}
 			totalSize += parseBytes(item.Size)
 		}
-		if job.CDKCode != "" {
-			if c, ok, err := s.cdk.get(job.CDKCode); err == nil && ok && totalSize > c.RemainingBytes {
-				return nil, http.StatusForbidden, "所选文件合计 " + formatTrafficLabel(totalSize) + " 超过 CDK 剩余流量（剩余 " + formatTrafficLabel(c.RemainingBytes) + "），请减少选择"
-			}
+		if err := s.jobQuotaSelectionError(job, totalSize); err != nil {
+			return nil, http.StatusForbidden, quotaSelectionMessage(err)
 		}
 
 		_, err := s.jobs.update(jobID, func(current *Job) error {
@@ -245,12 +268,8 @@ func (s *Server) applyItemsSelection(jobID string, itemIDs []string) (*Job, int,
 		totalSize += parseBytes(item.Size)
 	}
 
-	// Charge is summed at completion, so gate on the summed size here to refuse a
-	// batch that would overdraw the CDK instead of silently clamping at zero.
-	if job.CDKCode != "" {
-		if c, ok, err := s.cdk.get(job.CDKCode); err == nil && ok && totalSize > c.RemainingBytes {
-			return nil, http.StatusForbidden, "所选文件合计 " + formatTrafficLabel(totalSize) + " 超过 CDK 剩余流量（剩余 " + formatTrafficLabel(c.RemainingBytes) + "），请减少选择"
-		}
+	if err := s.jobQuotaSelectionError(job, totalSize); err != nil {
+		return nil, http.StatusForbidden, quotaSelectionMessage(err)
 	}
 
 	_, err := s.jobs.update(jobID, func(current *Job) error {
@@ -389,7 +408,7 @@ func (s *Server) handleUpdateCDK(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteCDK(w http.ResponseWriter, r *http.Request) {
 	code := normalizeCode(r.PathValue("code"))
-	ok, err := s.cdk.delete(code)
+	_, ok, err := s.cdk.revoke(code, time.Now())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -398,7 +417,7 @@ func (s *Server) handleDeleteCDK(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "CDK 不存在")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }
 
 // handleDeleteExpiredCDKs removes every CDK that has already expired and reports
@@ -415,377 +434,7 @@ func (s *Server) handleDeleteExpiredCDKs(w http.ResponseWriter, _ *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
 }
 
-// --- CDK user portal ---
-
-func (s *Server) handleUserPortal(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(s.userHTML)
-}
-
-// currentCDK returns the CDK bound to the request's cookie when it exists and is
-// still valid (not expired).
-func (s *Server) currentCDK(r *http.Request) (CDK, bool) {
-	cookie, err := r.Cookie("cdk")
-	if err != nil {
-		return CDK{}, false
-	}
-	c, ok, err := s.cdk.get(normalizeCode(cookie.Value))
-	if err != nil || !ok {
-		return CDK{}, false
-	}
-	if c.ExpiresAt <= time.Now().Unix() {
-		return CDK{}, false
-	}
-	return c, true
-}
-
-type userLoginRequest struct {
-	Code string `json:"code"`
-}
-
-type userMergeCDKRequest struct {
-	PrimaryCode   string `json:"primary_code"`
-	SecondaryCode string `json:"secondary_code"`
-}
-
-func setUserCDKCookie(w http.ResponseWriter, c CDK, now time.Time) {
-	maxAge := int(c.ExpiresAt - now.Unix())
-	if maxAge < 0 {
-		maxAge = 0
-	}
-	if maxAge > 86400*30 {
-		maxAge = 86400 * 30
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     "cdk",
-		Value:    c.Code,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   maxAge,
-	})
-}
-
-func (s *Server) handleUserLogin(w http.ResponseWriter, r *http.Request) {
-	var req userLoginRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	code := normalizeCode(req.Code)
-	if code == "" {
-		writeError(w, http.StatusBadRequest, "请输入 CDK")
-		return
-	}
-
-	now := time.Now()
-	c, ok, err := s.cdk.get(code)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "CDK 不存在")
-		return
-	}
-	if c.ExpiresAt <= now.Unix() {
-		writeError(w, http.StatusForbidden, "CDK 已过期")
-		return
-	}
-
-	setUserCDKCookie(w, c, now)
-	writeJSON(w, http.StatusOK, s.userStatusPayload(c, now))
-}
-
-// userStatusResponse is the CDK status payload plus a live view of the global
-// resolution queue, so the user portal can show how busy the system is.
-type userStatusResponse struct {
-	cdkView
-	Queue struct {
-		Waiting int  `json:"waiting"`
-		Active  bool `json:"active"`
-	} `json:"queue"`
-}
-
-func (s *Server) userStatusPayload(c CDK, now time.Time) userStatusResponse {
-	resp := userStatusResponse{cdkView: toCDKView(c, now)}
-	resp.Queue.Waiting = s.resolver.waiting()
-	resp.Queue.Active = s.resolver.active()
-	return resp
-}
-
-func (s *Server) handleUserStatus(w http.ResponseWriter, r *http.Request) {
-	c, ok := s.currentCDK(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "CDK 无效或已过期")
-		return
-	}
-	writeJSON(w, http.StatusOK, s.userStatusPayload(c, time.Now()))
-}
-
-func (s *Server) handleUserLogout(w http.ResponseWriter, _ *http.Request) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     "cdk",
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		MaxAge:   -1,
-	})
-	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
-}
-
-func (s *Server) handleUserMergeCDK(w http.ResponseWriter, r *http.Request) {
-	current, ok := s.currentCDK(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "CDK 无效或已过期")
-		return
-	}
-
-	var req userMergeCDKRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	primaryCode := normalizeCode(req.PrimaryCode)
-	secondaryCode := normalizeCode(req.SecondaryCode)
-	if primaryCode == "" || secondaryCode == "" {
-		writeError(w, http.StatusBadRequest, "请输入主 CDK 和副 CDK")
-		return
-	}
-	if primaryCode == secondaryCode {
-		writeError(w, http.StatusBadRequest, "主 CDK 和副 CDK 不能相同")
-		return
-	}
-	if current.Code != primaryCode && current.Code != secondaryCode {
-		writeError(w, http.StatusForbidden, "当前登录 CDK 必须参与合并")
-		return
-	}
-
-	now := time.Now()
-	merged, err := s.cdk.merge(primaryCode, secondaryCode, now)
-	if err != nil {
-		switch {
-		case errors.Is(err, errCDKSameMergeCode):
-			writeError(w, http.StatusBadRequest, "主 CDK 和副 CDK 不能相同")
-		case errors.Is(err, errCDKNotFound):
-			writeError(w, http.StatusNotFound, "CDK 不存在")
-		case errors.Is(err, errCDKExpired):
-			writeError(w, http.StatusForbidden, "CDK 已过期")
-		case errors.Is(err, errCDKExhausted):
-			writeError(w, http.StatusForbidden, "副 CDK 剩余流量为 0，无法合并")
-		case errors.Is(err, errCDKProxyMismatch):
-			writeError(w, http.StatusConflict, "CDK 中转权限不同，不允许合并")
-		default:
-			writeError(w, http.StatusInternalServerError, err.Error())
-		}
-		return
-	}
-
-	setUserCDKCookie(w, merged, now)
-	s.logJob(LogSuccess, "", "CDK 合并完成", "主 CDK："+maskCDK(primaryCode), "副 CDK："+maskCDK(secondaryCode), "当前剩余："+formatTrafficLabel(merged.RemainingBytes))
-	writeJSON(w, http.StatusOK, s.userStatusPayload(merged, now))
-}
-
-func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
-	c, ok := s.currentCDK(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "CDK 无效或已过期")
-		return
-	}
-	if !s.accounts.HasAccounts() {
-		writeError(w, http.StatusServiceUnavailable, "服务暂未就绪，请稍后再试")
-		return
-	}
-
-	var req createJobRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	req.Input = strings.TrimSpace(req.Input)
-	req.PassCode = strings.TrimSpace(req.PassCode)
-	req.Mode = strings.ToLower(strings.TrimSpace(req.Mode))
-	if req.Mode == "" {
-		req.Mode = "direct"
-	}
-	if req.Mode != "direct" && req.Mode != "proxy" {
-		writeError(w, http.StatusBadRequest, "mode must be direct or proxy")
-		return
-	}
-	// Proxy (中转) download is a per-CDK privilege; reject it server-side even if
-	// the UI is bypassed.
-	if req.Mode == "proxy" && !c.AllowProxy {
-		writeError(w, http.StatusForbidden, "此 CDK 不支持中转下载")
-		return
-	}
-
-	// Traffic is charged at resolve success (once the resource size is known), so
-	// here we only gate on the CDK still having traffic left and not being
-	// expired. A small overage is possible if parallel jobs race, which is fine.
-	if _, err := s.cdk.hasTraffic(c.Code, time.Now()); err != nil {
-		writeError(w, http.StatusForbidden, err.Error())
-		return
-	}
-
-	// A multi-line submission fans out into one child job per link, parallelized
-	// through the resolve queue under the same concurrency limit.
-	lines := splitResourceLineSpecs(req.Input)
-	if len(lines) > 1 {
-		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, c.Code, priorityUser, s.baseURL(r))
-		if status != 0 {
-			writeError(w, status, msg)
-			return
-		}
-		s.logJob(LogInfo, parent.ID, "CDK 用户批量解析任务已创建", "CDK："+maskCDK(c.Code), "链接数："+itoa(len(lines)))
-		view := toUserJobView(parent)
-		view.QueueAhead = s.resolver.position(parent.ID)
-		writeJSON(w, http.StatusAccepted, view)
-		return
-	}
-	rawInput := req.Input
-	if len(lines) == 1 {
-		rawInput = lines[0].raw
-		req.Input = lines[0].clean
-	}
-
-	kind, err := detectResourceKind(req.Input)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	var share *ShareState
-	if kind == ResourceShare {
-		var passCode string
-		share, passCode, err = shareStateAndPassCode(rawInput, req.PassCode)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		req.PassCode = passCode
-	}
-
-	job := &Job{
-		ID:            newJobID(),
-		Kind:          kind,
-		Mode:          req.Mode,
-		Input:         req.Input,
-		OriginalInput: rawInput,
-		PassCode:      req.PassCode,
-		Status:        JobQueued,
-		Stage:         StageTransfer,
-		Message:       "queued",
-		BaseURL:       s.baseURL(r),
-		CDKCode:       c.Code,
-		Share:         share,
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
-	}
-
-	s.jobs.create(job)
-	s.logJob(LogInfo, job.ID, "CDK 用户解析任务已创建", "CDK："+maskCDK(c.Code), "来源："+string(kind))
-	s.resolver.enqueue(job.ID, priorityUser, func(ctx context.Context) {
-		s.processJob(ctx, job.ID)
-	})
-
-	view := toUserJobView(job)
-	view.QueueAhead = s.resolver.position(job.ID)
-	writeJSON(w, http.StatusAccepted, view)
-}
-
-func (s *Server) handleUserGetJob(w http.ResponseWriter, r *http.Request) {
-	c, ok := s.currentCDK(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "CDK 无效或已过期")
-		return
-	}
-	job, ok := s.jobs.get(r.PathValue("id"))
-	if !ok || job.CDKCode != c.Code {
-		writeError(w, http.StatusNotFound, "job not found")
-		return
-	}
-	view := toUserJobView(job)
-	view.QueueAhead = s.resolver.position(job.ID)
-	writeJSON(w, http.StatusOK, view)
-}
-
-func (s *Server) handleUserHistoryList(w http.ResponseWriter, r *http.Request) {
-	c, ok := s.currentCDK(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "CDK 无效或已过期")
-		return
-	}
-	now := s.now()
-	s.cleanupResolveHistory(now)
-	history, err := s.history.list(c.Code, now)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"history": history})
-}
-
-func (s *Server) handleUserHistoryGet(w http.ResponseWriter, r *http.Request) {
-	c, ok := s.currentCDK(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "CDK 无效或已过期")
-		return
-	}
-	now := s.now()
-	s.cleanupResolveHistory(now)
-	detail, ok, err := s.history.get(c.Code, r.PathValue("id"), now)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if !ok {
-		writeError(w, http.StatusNotFound, "history not found")
-		return
-	}
-	writeJSON(w, http.StatusOK, detail)
-}
-
-// selectItemsRequest carries the CDK-user multi-select payload. item_ids is the
-// canonical field; item_id is accepted as a single-value fallback so older
-// callers still work.
-type selectItemsRequest struct {
-	ItemIDs []string `json:"item_ids"`
-	ItemID  string   `json:"item_id"`
-}
-
-func (s *Server) handleUserSelectItem(w http.ResponseWriter, r *http.Request) {
-	c, ok := s.currentCDK(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "CDK 无效或已过期")
-		return
-	}
-	job, ok := s.jobs.get(r.PathValue("id"))
-	if !ok || job.CDKCode != c.Code {
-		writeError(w, http.StatusNotFound, "job not found")
-		return
-	}
-
-	var req selectItemsRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	ids := req.ItemIDs
-	if len(ids) == 0 && req.ItemID != "" {
-		ids = []string{req.ItemID}
-	}
-
-	updated, status, msg := s.applyItemsSelection(job.ID, ids)
-	if status != 0 {
-		writeError(w, status, msg)
-		return
-	}
-	view := toUserJobView(updated)
-	view.QueueAhead = s.resolver.position(updated.ID)
-	writeJSON(w, http.StatusAccepted, view)
-}
+// --- user portal handlers live in user_handlers.go ---
 
 // userJobView is the CDK-user-facing projection of a Job. It deliberately omits
 // admin-only details such as which PikPak account was used.
@@ -858,7 +507,13 @@ func safeUserError(message string) string {
 	if message == errCDKExhausted.Error() {
 		return "CDK traffic has been used up."
 	}
+	if message == errUserQuotaExhausted.Error() {
+		return "User quota has been used up."
+	}
 	lower := strings.ToLower(message)
+	if strings.Contains(lower, "user quota") || strings.Contains(lower, "remaining quota") {
+		return "Selected files exceed remaining quota."
+	}
 	if strings.Contains(lower, "cdk") && strings.Contains(lower, "traffic") {
 		return "Selected files exceed remaining CDK traffic."
 	}

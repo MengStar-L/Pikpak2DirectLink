@@ -149,23 +149,12 @@ func (c *credentialStore) setLocked(password string) error {
 	if strings.TrimSpace(password) == "" {
 		return errors.New("password is required")
 	}
-
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		return err
-	}
-	hash, err := pbkdf2.Key(sha256.New, password, salt, pbkdf2Iterations, 32)
+	rec, err := hashPasswordRecord(password)
 	if err != nil {
 		return err
 	}
 
-	c.rec = credentialRecord{
-		Algo:       "pbkdf2-sha256",
-		Iterations: pbkdf2Iterations,
-		Salt:       hex.EncodeToString(salt),
-		Hash:       hex.EncodeToString(hash),
-		UpdatedAt:  time.Now(),
-	}
+	c.rec = rec
 	return c.saveLocked()
 }
 
@@ -175,6 +164,31 @@ func (c *credentialStore) Verify(password string) bool {
 	rec := c.rec
 	c.mu.RUnlock()
 
+	return verifyPasswordRecord(rec, password)
+}
+
+func hashPasswordRecord(password string) (credentialRecord, error) {
+	if strings.TrimSpace(password) == "" {
+		return credentialRecord{}, errors.New("password is required")
+	}
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return credentialRecord{}, err
+	}
+	hash, err := pbkdf2.Key(sha256.New, password, salt, pbkdf2Iterations, 32)
+	if err != nil {
+		return credentialRecord{}, err
+	}
+	return credentialRecord{
+		Algo:       "pbkdf2-sha256",
+		Iterations: pbkdf2Iterations,
+		Salt:       hex.EncodeToString(salt),
+		Hash:       hex.EncodeToString(hash),
+		UpdatedAt:  time.Now(),
+	}, nil
+}
+
+func verifyPasswordRecord(rec credentialRecord, password string) bool {
 	if rec.Hash == "" {
 		return false
 	}

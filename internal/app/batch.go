@@ -59,7 +59,7 @@ type childSpec struct {
 // and are enqueued at the given priority so they fan out across the resolve queue
 // under the admin's concurrency limit. It returns the parent job, or an HTTP
 // status + message when a line cannot be recognized (status 0 means success).
-func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode, cdkCode string, priority int, baseURL string) (*Job, int, string) {
+func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode, cdkCode, userID string, priority int, baseURL string) (*Job, int, string) {
 	if len(lines) > maxBatchLinks {
 		return nil, 400, fmt.Sprintf("too many links: maximum is %d per batch", maxBatchLinks)
 	}
@@ -100,6 +100,8 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 		Message:       fmt.Sprintf("解析中：0/%d 条完成", len(specs)),
 		BaseURL:       baseURL,
 		CDKCode:       cdkCode,
+		UserID:        userID,
+		ProxyAllowed:  userID != "" && mode == "proxy",
 		Batch:         &BatchProgress{Total: len(specs)},
 		CreatedAt:     now,
 		UpdatedAt:     now,
@@ -119,21 +121,23 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 	for _, spec := range specs {
 		childID := newJobID()
 		child := &Job{
-			ID:         childID,
-			Kind:       spec.kind,
-			Mode:       mode,
-			Input:      spec.input,
-			PassCode:   spec.passCode,
-			Status:     JobQueued,
-			Stage:      StageTransfer,
-			Message:    "queued",
-			BaseURL:    baseURL,
-			CDKCode:    cdkCode,
-			ParentID:   parentID,
-			ResolveAll: true,
-			Share:      spec.share,
-			CreatedAt:  now,
-			UpdatedAt:  now,
+			ID:           childID,
+			Kind:         spec.kind,
+			Mode:         mode,
+			Input:        spec.input,
+			PassCode:     spec.passCode,
+			Status:       JobQueued,
+			Stage:        StageTransfer,
+			Message:      "queued",
+			BaseURL:      baseURL,
+			CDKCode:      cdkCode,
+			UserID:       userID,
+			ProxyAllowed: userID != "" && mode == "proxy",
+			ParentID:     parentID,
+			ResolveAll:   true,
+			Share:        spec.share,
+			CreatedAt:    now,
+			UpdatedAt:    now,
 		}
 		s.jobs.create(child)
 		runs = append(runs, childRun{id: childID, label: spec.label})

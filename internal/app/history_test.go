@@ -163,18 +163,25 @@ func TestResolveHistoryExpiryCleanup(t *testing.T) {
 	}
 }
 
-func TestUserHistoryHandlersScopeToCurrentCDK(t *testing.T) {
+func TestUserHistoryHandlersScopeToCurrentUser(t *testing.T) {
 	db := newHistoryTestDB(t)
-	cdk := newCDKStore(db)
+	users := newUserStore(db)
 	history := newResolveHistoryStore(db)
 	now := time.Now().Truncate(time.Second)
-	created, err := cdk.createBatch(2, bytesPerGB, 30, true, now)
+	firstUser, err := users.createEmailUser("first@example.com", "secret-pass", now)
 	if err != nil {
-		t.Fatalf("create cdks: %v", err)
+		t.Fatalf("create first user: %v", err)
 	}
-	first, second := created[0].Code, created[1].Code
-	firstJob := historyTestJob("job-first", first, now)
-	secondJob := historyTestJob("job-second", second, now)
+	secondUser, err := users.createEmailUser("second@example.com", "secret-pass", now)
+	if err != nil {
+		t.Fatalf("create second user: %v", err)
+	}
+	token, err := users.createSession(firstUser.ID, now)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	firstJob := historyTestUserJob("job-first", firstUser.ID, now)
+	secondJob := historyTestUserJob("job-second", secondUser.ID, now)
 	if err := history.saveJob(firstJob); err != nil {
 		t.Fatalf("save first: %v", err)
 	}
@@ -182,10 +189,10 @@ func TestUserHistoryHandlersScopeToCurrentCDK(t *testing.T) {
 		t.Fatalf("save second: %v", err)
 	}
 
-	s := &Server{cdk: cdk, history: history, nowFunc: func() time.Time { return now }}
+	s := &Server{users: users, history: history, nowFunc: func() time.Time { return now }}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/u/history", nil)
-	req.AddCookie(&http.Cookie{Name: "cdk", Value: first})
+	req.AddCookie(&http.Cookie{Name: userSessionCookieName, Value: token})
 	s.handleUserHistoryList(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list status = %d body=%s", rec.Code, rec.Body.String())
@@ -203,7 +210,7 @@ func TestUserHistoryHandlersScopeToCurrentCDK(t *testing.T) {
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/u/history/job-second", nil)
 	req.SetPathValue("id", "job-second")
-	req.AddCookie(&http.Cookie{Name: "cdk", Value: first})
+	req.AddCookie(&http.Cookie{Name: userSessionCookieName, Value: token})
 	s.handleUserHistoryGet(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("cross-CDK detail status = %d, want 404", rec.Code)
@@ -212,7 +219,7 @@ func TestUserHistoryHandlersScopeToCurrentCDK(t *testing.T) {
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/u/history/job-first", nil)
 	req.SetPathValue("id", "job-first")
-	req.AddCookie(&http.Cookie{Name: "cdk", Value: first})
+	req.AddCookie(&http.Cookie{Name: userSessionCookieName, Value: token})
 	s.handleUserHistoryGet(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("own detail status = %d body=%s", rec.Code, rec.Body.String())
@@ -224,6 +231,12 @@ func TestUserHistoryHandlersScopeToCurrentCDK(t *testing.T) {
 	if detail.ID != "job-first" || len(detail.Results) != 1 {
 		t.Fatalf("detail = %+v, want first job with result", detail)
 	}
+}
+
+func historyTestUserJob(id, userID string, completedAt time.Time) *Job {
+	job := historyTestJob(id, "", completedAt)
+	job.UserID = userID
+	return job
 }
 
 func newHistoryTestDB(t *testing.T) *sql.DB {

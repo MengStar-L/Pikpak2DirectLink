@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -123,6 +124,44 @@ func (s *settingsStore) setInt64(key string, value int64) error {
 	return err
 }
 
+func (s *settingsStore) getString(key, fallback string) string {
+	var raw string
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key=?`, key).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) || err != nil {
+		return fallback
+	}
+	return raw
+}
+
+func (s *settingsStore) setString(key, value string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO settings(key, value) VALUES(?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		key, value,
+	)
+	return err
+}
+
+func (s *settingsStore) delete(key string) error {
+	_, err := s.db.Exec(`DELETE FROM settings WHERE key=?`, key)
+	return err
+}
+
+func (s *settingsStore) getBool(key string, fallback bool) bool {
+	raw := strings.ToLower(strings.TrimSpace(s.getString(key, "")))
+	if raw == "" {
+		return fallback
+	}
+	return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+}
+
+func (s *settingsStore) setBool(key string, value bool) error {
+	if value {
+		return s.setString(key, "true")
+	}
+	return s.setString(key, "false")
+}
+
 // --- HTTP (admin, behind the access gate) ---
 
 // settingsResponse is the admin-facing view of the resolution settings. It
@@ -139,6 +178,63 @@ type settingsResponse struct {
 	TaskTimeoutS     int  `json:"task_timeout_seconds"`
 	MinTaskTimeoutS  int  `json:"min_task_timeout_seconds"`
 	MaxTaskTimeoutS  int  `json:"max_task_timeout_seconds"`
+}
+
+const (
+	settingKeyLinuxDoClientID            = "linuxdo_client_id"
+	settingKeyLinuxDoClientSecret        = "linuxdo_client_secret"
+	settingKeyLinuxDoLoginEnabled        = "linuxdo_login_enabled"
+	settingKeyLinuxDoRegistrationEnabled = "linuxdo_registration_enabled"
+	settingKeyEmailLoginEnabled          = "email_login_enabled"
+	settingKeyEmailRegistrationEnabled   = "email_registration_enabled"
+)
+
+type authSettingsResponse struct {
+	LinuxDoClientID               string `json:"linuxdo_client_id"`
+	LinuxDoClientSecretConfigured bool   `json:"linuxdo_client_secret_configured"`
+	LinuxDoCallbackURL            string `json:"linuxdo_callback_url"`
+	LinuxDoConfigured             bool   `json:"linuxdo_configured"`
+	LinuxDoLoginEnabled           bool   `json:"linuxdo_login_enabled"`
+	LinuxDoRegistrationEnabled    bool   `json:"linuxdo_registration_enabled"`
+	EmailLoginEnabled             bool   `json:"email_login_enabled"`
+	EmailRegistrationEnabled      bool   `json:"email_registration_enabled"`
+}
+
+type updateAuthSettingsRequest struct {
+	LinuxDoClientID            *string `json:"linuxdo_client_id"`
+	LinuxDoClientSecret        *string `json:"linuxdo_client_secret"`
+	ClearLinuxDoClientSecret   bool    `json:"clear_linuxdo_client_secret"`
+	LinuxDoLoginEnabled        *bool   `json:"linuxdo_login_enabled"`
+	LinuxDoRegistrationEnabled *bool   `json:"linuxdo_registration_enabled"`
+	EmailLoginEnabled          *bool   `json:"email_login_enabled"`
+	EmailRegistrationEnabled   *bool   `json:"email_registration_enabled"`
+}
+
+func (s *Server) linuxDoClientID() string {
+	return strings.TrimSpace(s.settings.getString(settingKeyLinuxDoClientID, ""))
+}
+
+func (s *Server) linuxDoClientSecret() string {
+	return strings.TrimSpace(s.settings.getString(settingKeyLinuxDoClientSecret, ""))
+}
+
+func (s *Server) linuxDoOAuthConfigured() bool {
+	return s.linuxDoClientID() != "" && s.linuxDoClientSecret() != ""
+}
+
+func (s *Server) authSettingsPayload(r *http.Request) authSettingsResponse {
+	clientID := s.linuxDoClientID()
+	secretConfigured := s.linuxDoClientSecret() != ""
+	return authSettingsResponse{
+		LinuxDoClientID:               clientID,
+		LinuxDoClientSecretConfigured: secretConfigured,
+		LinuxDoCallbackURL:            strings.TrimRight(s.baseURL(r), "/") + "/api/u/auth/linuxdo/callback",
+		LinuxDoConfigured:             clientID != "" && secretConfigured,
+		LinuxDoLoginEnabled:           s.settings.getBool(settingKeyLinuxDoLoginEnabled, true),
+		LinuxDoRegistrationEnabled:    s.settings.getBool(settingKeyLinuxDoRegistrationEnabled, true),
+		EmailLoginEnabled:             s.settings.getBool(settingKeyEmailLoginEnabled, true),
+		EmailRegistrationEnabled:      s.settings.getBool(settingKeyEmailRegistrationEnabled, false),
+	}
 }
 
 func (s *Server) settingsPayload() settingsResponse {
@@ -162,6 +258,64 @@ func (s *Server) settingsPayload() settingsResponse {
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.settingsPayload())
+}
+
+func (s *Server) handleGetAuthSettings(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.authSettingsPayload(r))
+}
+
+func (s *Server) handleUpdateAuthSettings(w http.ResponseWriter, r *http.Request) {
+	var req updateAuthSettingsRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.LinuxDoClientID != nil {
+		if err := s.settings.setString(settingKeyLinuxDoClientID, strings.TrimSpace(*req.LinuxDoClientID)); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if req.ClearLinuxDoClientSecret {
+		if err := s.settings.delete(settingKeyLinuxDoClientSecret); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	} else if req.LinuxDoClientSecret != nil {
+		secret := strings.TrimSpace(*req.LinuxDoClientSecret)
+		if secret != "" {
+			if err := s.settings.setString(settingKeyLinuxDoClientSecret, secret); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+	}
+	if req.LinuxDoLoginEnabled != nil {
+		if err := s.settings.setBool(settingKeyLinuxDoLoginEnabled, *req.LinuxDoLoginEnabled); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if req.LinuxDoRegistrationEnabled != nil {
+		if err := s.settings.setBool(settingKeyLinuxDoRegistrationEnabled, *req.LinuxDoRegistrationEnabled); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if req.EmailLoginEnabled != nil {
+		if err := s.settings.setBool(settingKeyEmailLoginEnabled, *req.EmailLoginEnabled); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if req.EmailRegistrationEnabled != nil {
+		if err := s.settings.setBool(settingKeyEmailRegistrationEnabled, *req.EmailRegistrationEnabled); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	s.logJob(LogSuccess, "", "user authentication settings updated")
+	writeJSON(w, http.StatusOK, s.authSettingsPayload(r))
 }
 
 type updateSettingsRequest struct {
