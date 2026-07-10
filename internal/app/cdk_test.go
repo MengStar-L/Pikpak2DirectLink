@@ -1,7 +1,6 @@
 package app
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -23,798 +22,91 @@ func newTestCDKStore(t *testing.T) *cdkStore {
 	return newCDKStore(db)
 }
 
-func TestCDKCreateAndList(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-
-	created, err := store.createBatch(3, 5*bytesPerGB, 30, true, now)
-	if err != nil {
-		t.Fatalf("createBatch: %v", err)
-	}
-	if len(created) != 3 {
-		t.Fatalf("expected 3 CDKs, got %d", len(created))
-	}
-	seen := map[string]bool{}
-	for _, c := range created {
-		if seen[c.Code] {
-			t.Fatalf("duplicate code generated: %s", c.Code)
-		}
-		seen[c.Code] = true
-		if c.RemainingBytes != 5*bytesPerGB {
-			t.Fatalf("expected remaining 5G, got %d", c.RemainingBytes)
-		}
-	}
-
-	list, err := store.list()
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(list) != 3 {
-		t.Fatalf("expected list of 3, got %d", len(list))
-	}
-}
-
-func TestCDKAllowProxyPersistsAndToggles(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-
-	off, err := store.createBatch(1, 5*bytesPerGB, 30, false, now)
-	if err != nil {
-		t.Fatalf("createBatch(false): %v", err)
-	}
-	on, err := store.createBatch(1, 5*bytesPerGB, 30, true, now)
-	if err != nil {
-		t.Fatalf("createBatch(true): %v", err)
-	}
-	if off[0].AllowProxy {
-		t.Fatal("created CDK should have AllowProxy=false")
-	}
-	if !on[0].AllowProxy {
-		t.Fatal("created CDK should have AllowProxy=true")
-	}
-
-	// Round-trips through get + view.
-	gotOff, ok, _ := store.get(off[0].Code)
-	if !ok || gotOff.AllowProxy {
-		t.Fatalf("get(off): ok=%v allow=%v, want ok=true allow=false", ok, gotOff.AllowProxy)
-	}
-	if v := toCDKView(gotOff, now); v.AllowProxy {
-		t.Fatal("cdkView should expose AllowProxy=false")
-	}
-
-	// And shows up in list.
-	for _, c := range mustList(t, store) {
-		if c.Code == on[0].Code && !c.AllowProxy {
-			t.Fatal("list should report AllowProxy=true for the enabled CDK")
-		}
-	}
-
-	// update flips the flag.
-	updated, ok, err := store.update(off[0].Code, 5*bytesPerGB, 30, true, now)
-	if err != nil || !ok {
-		t.Fatalf("update: ok=%v err=%v", ok, err)
-	}
-	if !updated.AllowProxy {
-		t.Fatal("update should have set AllowProxy=true")
-	}
-}
-
-func mustList(t *testing.T, store *cdkStore) []CDK {
-	t.Helper()
-	list, err := store.list()
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	return list
-}
-
-// TestMigrateCDKAddAllowProxyOnExistingDB guards the startup migration that runs
-// against real user databases: adding the column must succeed, be idempotent,
-// and default existing CDKs to proxy-allowed so prior behavior is preserved.
-func TestMigrateCDKAddAllowProxyOnExistingDB(t *testing.T) {
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	db.SetMaxOpenConns(1)
-
-	// Simulate a pre-feature cdks table without the allow_proxy column.
-	if _, err := db.Exec(`CREATE TABLE cdks (
-		code TEXT PRIMARY KEY,
-		remaining_bytes INTEGER NOT NULL,
-		used_bytes INTEGER NOT NULL DEFAULT 0,
-		expires_at INTEGER NOT NULL,
-		created_at INTEGER NOT NULL
-	)`); err != nil {
-		t.Fatalf("create legacy table: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO cdks(code, remaining_bytes, used_bytes, expires_at, created_at) VALUES('OLDCODE-AAAA-BBBB-CCCC', 100, 0, 1701468800, 1700000000)`); err != nil {
-		t.Fatalf("insert legacy row: %v", err)
-	}
-
-	if err := migrateCDKAddAllowProxy(db); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	if err := migrateCDKAddAllowProxy(db); err != nil { // idempotent
-		t.Fatalf("migrate (2nd run): %v", err)
-	}
-	if err := migrateCDKToVoucher(db); err != nil {
-		t.Fatalf("migrate voucher columns: %v", err)
-	}
-
-	var allowProxy, durationDays int
-	if err := db.QueryRow(
-		`SELECT allow_proxy, duration_days FROM cdks WHERE code='OLDCODE-AAAA-BBBB-CCCC'`,
-	).Scan(&allowProxy, &durationDays); err != nil {
-		t.Fatalf("get migrated row: %v", err)
-	}
-	if allowProxy == 0 {
-		t.Fatal("existing CDK should default to AllowProxy=true after migration")
-	}
-	if durationDays != 17 {
-		t.Fatalf("duration_days = %d, want 17 from legacy expires_at-created_at span", durationDays)
-	}
-}
-
-func TestCDKHasTrafficGuards(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-
-	created, _ := store.createBatch(1, 2*bytesPerGB, 30, true, now)
-	code := created[0].Code
-
-	if _, err := store.hasTraffic(code, now); err != nil {
-		t.Fatalf("hasTraffic on fresh CDK: %v", err)
-	}
-
-	// Drain it, then it must report exhausted.
-	if err := store.charge(code, 2*bytesPerGB); err != nil {
-		t.Fatalf("charge: %v", err)
-	}
-	if _, err := store.hasTraffic(code, now); err != errCDKExhausted {
-		t.Fatalf("expected errCDKExhausted, got %v", err)
-	}
-
-	// Unknown code.
-	if _, err := store.hasTraffic("NOPE-NOPE-NOPE-NOPE", now); err != errCDKNotFound {
-		t.Fatalf("expected errCDKNotFound, got %v", err)
-	}
-
-	// Expired code.
-	exp, _ := store.createBatch(1, 5*bytesPerGB, 1, true, now)
-	later := now.Add(48 * time.Hour)
-	if _, err := store.hasTraffic(exp[0].Code, later); err != errCDKExpired {
-		t.Fatalf("expected errCDKExpired, got %v", err)
-	}
-}
-
-func TestCDKCharge(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-
-	created, _ := store.createBatch(1, 5*bytesPerGB, 30, true, now)
-	code := created[0].Code
-
-	if err := store.charge(code, 2*bytesPerGB); err != nil {
-		t.Fatalf("charge: %v", err)
-	}
-	c, _, _ := store.get(code)
-	if c.RemainingBytes != 3*bytesPerGB || c.UsedBytes != 2*bytesPerGB {
-		t.Fatalf("after charge 2G: remaining=%d used=%d", c.RemainingBytes, c.UsedBytes)
-	}
-
-	// Overdraw clamps remaining at zero but still accumulates used.
-	if err := store.charge(code, 10*bytesPerGB); err != nil {
-		t.Fatalf("overdraw charge: %v", err)
-	}
-	c, _, _ = store.get(code)
-	if c.RemainingBytes != 0 {
-		t.Fatalf("remaining should clamp at 0, got %d", c.RemainingBytes)
-	}
-	if c.UsedBytes != 12*bytesPerGB {
-		t.Fatalf("used should accumulate to 12G, got %d", c.UsedBytes)
-	}
-}
-
-func TestCDKChargeIfEnoughDoesNotOverdrawConcurrently(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-	created, _ := store.createBatch(1, 1*bytesPerGB, 30, true, now)
-	code := created[0].Code
-	chargeSize := int64(700 * 1024 * 1024)
-
-	var wg sync.WaitGroup
-	errs := make(chan error, 2)
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			errs <- store.chargeIfEnough(code, chargeSize, now)
-		}()
-	}
-	wg.Wait()
-	close(errs)
-
-	successes := 0
-	overdraws := 0
-	for err := range errs {
-		if err == nil {
-			successes++
-			continue
-		}
-		if _, ok := errAsOverdraw(err); ok {
-			overdraws++
-			continue
-		}
-		t.Fatalf("unexpected charge error: %v", err)
-	}
-	if successes != 1 || overdraws != 1 {
-		t.Fatalf("successes=%d overdraws=%d, want 1 each", successes, overdraws)
-	}
-
-	c, _, _ := store.get(code)
-	if c.RemainingBytes != bytesPerGB-chargeSize || c.UsedBytes != chargeSize {
-		t.Fatalf("remaining=%d used=%d, want remaining=%d used=%d", c.RemainingBytes, c.UsedBytes, bytesPerGB-chargeSize, chargeSize)
-	}
-}
-
-func TestCDKUpdateAndDelete(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-
-	created, _ := store.createBatch(1, 5*bytesPerGB, 10, true, now)
-	code := created[0].Code
-
-	updated, ok, err := store.update(code, 20*bytesPerGB, 60, true, now)
-	if err != nil || !ok {
-		t.Fatalf("update: ok=%v err=%v", ok, err)
-	}
-	if updated.RemainingBytes != 20*bytesPerGB {
-		t.Fatalf("expected remaining 20G, got %d", updated.RemainingBytes)
-	}
-	wantExpiry := now.Add(60 * 24 * time.Hour).Unix()
-	if updated.ExpiresAt != wantExpiry {
-		t.Fatalf("expected expiry %d, got %d", wantExpiry, updated.ExpiresAt)
-	}
-
-	revoked, ok, err := store.revoke(code, now)
-	if err != nil || !ok {
-		t.Fatalf("revoke: ok=%v err=%v", ok, err)
-	}
-	if revoked.RevokedAt == 0 {
-		t.Fatalf("expected code to be marked revoked, got %+v", revoked)
-	}
-	stored, ok, err := store.get(code)
-	if err != nil || !ok || stored.RevokedAt == 0 {
-		t.Fatalf("expected revoked code to remain listed, got %+v ok=%v err=%v", stored, ok, err)
-	}
-}
-
-func TestRedeemedCDKUpdateSynchronizesSubscriptionAndProjection(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-	users := newUserStore(store.db)
-	if _, err := store.db.Exec(
-		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_update', 'cdk-update@example.com', ?, ?)`,
-		now.Unix(), now.Unix(),
-	); err != nil {
-		t.Fatalf("insert user: %v", err)
-	}
-	created, err := store.createBatch(1, 1_000, 10, true, now)
-	if err != nil {
-		t.Fatalf("createBatch: %v", err)
-	}
-	subscription, err := users.redeemCDK("usr_cdk_update", created[0].Code, now)
-	if err != nil {
-		t.Fatalf("redeemCDK: %v", err)
-	}
-	if err := users.chargeIfEnough("usr_cdk_update", 200, false, now); err != nil {
-		t.Fatalf("chargeIfEnough: %v", err)
-	}
-
-	updatedAt := now.Add(time.Hour)
-	updated, ok, err := store.update(created[0].Code, 750, 20, false, updatedAt)
-	if err != nil || !ok {
-		t.Fatalf("update: ok=%v err=%v", ok, err)
-	}
-	wantExpiry := updatedAt.Add(20 * 24 * time.Hour).Unix()
-	if updated.RemainingBytes != 750 || updated.UsedBytes != 200 || updated.ExpiresAt != wantExpiry || updated.AllowProxy {
-		t.Fatalf("projected CDK = %+v, want subscription state 750/200 expiry=%d proxy=false", updated, wantExpiry)
-	}
-
-	var remaining, used, expiresAt int64
-	var allowProxy int
-	if err := store.db.QueryRow(
-		`SELECT remaining_bytes, used_bytes, expires_at, allow_proxy FROM user_subscriptions WHERE id=?`,
-		subscription.ID,
-	).Scan(&remaining, &used, &expiresAt, &allowProxy); err != nil {
-		t.Fatalf("read subscription: %v", err)
-	}
-	if remaining != 750 || used != 200 || expiresAt != wantExpiry || allowProxy != 0 {
-		t.Fatalf("subscription = remaining:%d used:%d expiry:%d proxy:%d", remaining, used, expiresAt, allowProxy)
-	}
-	listed := mustList(t, store)
-	if len(listed) != 1 || listed[0].RemainingBytes != 750 || listed[0].UsedBytes != 200 || listed[0].AllowProxy {
-		t.Fatalf("list projection = %+v", listed)
-	}
-}
-
-func TestRedeemedCDKUpdateRebasesExistingQuotaReservationAccounting(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-	users := newUserStore(store.db)
-	if _, err := store.db.Exec(
-		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_generation', 'cdk-generation@example.com', ?, ?)`,
-		now.Unix(), now.Unix(),
-	); err != nil {
-		t.Fatalf("insert user: %v", err)
-	}
-	created, err := store.createBatch(1, 1_000, 10, true, now)
-	if err != nil {
-		t.Fatalf("createBatch: %v", err)
-	}
-	subscription, err := users.redeemCDK("usr_cdk_generation", created[0].Code, now)
-	if err != nil {
-		t.Fatalf("redeemCDK: %v", err)
-	}
-	if err := users.chargeIfEnough("usr_cdk_generation", 100, false, now); err != nil {
-		t.Fatalf("chargeIfEnough: %v", err)
-	}
-
-	if err := users.reserveQuota("job_stale_release", "usr_cdk_generation", 200, false, now); err != nil {
-		t.Fatalf("reserve release job: %v", err)
-	}
-	if _, ok, err := store.update(created[0].Code, 750, 20, true, now.Add(time.Hour)); err != nil || !ok {
-		t.Fatalf("update before release: ok=%v err=%v", ok, err)
-	}
-	released, err := users.releaseQuotaReservation("job_stale_release")
-	if err != nil || released != 0 {
-		t.Fatalf("release stale reservation = %d, %v; want 0, nil", released, err)
-	}
-	assertSubscriptionQuotaState(t, store.db, subscription.ID, 750, 100)
-
-	if err := users.reserveQuota("job_stale_settle", "usr_cdk_generation", 200, false, now.Add(2*time.Hour)); err != nil {
-		t.Fatalf("reserve settle job: %v", err)
-	}
-	if _, ok, err := store.update(created[0].Code, 700, 30, true, now.Add(3*time.Hour)); err != nil || !ok {
-		t.Fatalf("update before settle: ok=%v err=%v", ok, err)
-	}
-	settled, err := users.settleQuotaReservation("job_stale_settle")
-	if err != nil || settled != 200 {
-		t.Fatalf("settle stale reservation = %d, %v; want 200, nil", settled, err)
-	}
-	assertSubscriptionQuotaState(t, store.db, subscription.ID, 700, 300)
-
-	if err := users.reserveQuota("job_disabled_proxy", "usr_cdk_generation", 100, true, now.Add(4*time.Hour)); err != nil {
-		t.Fatalf("reserve proxy job: %v", err)
-	}
-	if _, ok, err := store.update(created[0].Code, 650, 30, false, now.Add(5*time.Hour)); err != nil || !ok {
-		t.Fatalf("disable proxy before settle: ok=%v err=%v", ok, err)
-	}
-	if err := users.reserveQuota("job_disabled_proxy", "usr_cdk_generation", 100, true, now.Add(5*time.Hour)); !errors.Is(err, errQuotaReservationInvalidated) {
-		t.Fatalf("repeat invalidated proxy reservation = %v, want invalidated error", err)
-	}
-	settled, err = users.settleQuotaReservation("job_disabled_proxy")
-	if settled != 0 || !errors.Is(err, errQuotaReservationInvalidated) {
-		t.Fatalf("settle disabled proxy reservation = %d, %v; want invalidated error", settled, err)
-	}
-	assertSubscriptionQuotaState(t, store.db, subscription.ID, 650, 300)
-
-	var reservations int
-	if err := store.db.QueryRow(
-		`SELECT COUNT(*) FROM user_quota_reservations WHERE job_id IN ('job_stale_release', 'job_stale_settle', 'job_disabled_proxy')`,
-	).Scan(&reservations); err != nil {
-		t.Fatalf("count stale reservations: %v", err)
-	}
-	if reservations != 0 {
-		t.Fatalf("stale reservations remaining = %d, want 0", reservations)
-	}
-}
-
-func TestRedeemedCDKRevokePreventsExistingQuotaReservationSettlement(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-	users := newUserStore(store.db)
-	if _, err := store.db.Exec(
-		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_revoke_reservation', 'cdk-revoke-reservation@example.com', ?, ?)`,
-		now.Unix(), now.Unix(),
-	); err != nil {
-		t.Fatalf("insert user: %v", err)
-	}
-	created, err := store.createBatch(1, 1_000, 10, true, now)
-	if err != nil {
-		t.Fatalf("createBatch: %v", err)
-	}
-	subscription, err := users.redeemCDK("usr_cdk_revoke_reservation", created[0].Code, now)
-	if err != nil {
-		t.Fatalf("redeemCDK: %v", err)
-	}
-	if err := users.reserveQuota("job_revoked_reservation", "usr_cdk_revoke_reservation", 200, false, now); err != nil {
-		t.Fatalf("reserveQuota: %v", err)
-	}
-	if _, ok, err := store.revoke(created[0].Code, now.Add(time.Hour)); err != nil || !ok {
-		t.Fatalf("revoke: ok=%v err=%v", ok, err)
-	}
-
-	settled, err := users.settleQuotaReservation("job_revoked_reservation")
-	if settled != 0 || !errors.Is(err, errQuotaReservationInvalidated) || !errors.Is(err, errUserQuotaExhausted) {
-		t.Fatalf("settle revoked reservation = %d, %v; want invalidated quota error", settled, err)
-	}
-	assertSubscriptionQuotaState(t, store.db, subscription.ID, 800, 0)
-	var reservations int
-	if err := store.db.QueryRow(
-		`SELECT COUNT(*) FROM user_quota_reservations WHERE job_id='job_revoked_reservation'`,
-	).Scan(&reservations); err != nil {
-		t.Fatalf("count revoked reservation: %v", err)
-	}
-	if reservations != 0 {
-		t.Fatalf("revoked reservation remaining = %d, want 0", reservations)
-	}
-}
-
-func TestCDKGenerationChangesKeepMultiSubscriptionReservationAtomic(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-	users := newUserStore(store.db)
-	if _, err := store.db.Exec(
-		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_multi_generation', 'cdk-multi-generation@example.com', ?, ?)`,
-		now.Unix(), now.Unix(),
-	); err != nil {
-		t.Fatalf("insert user: %v", err)
-	}
-	earlyCDKs, err := store.createBatch(1, 100, 1, true, now)
-	if err != nil {
-		t.Fatalf("create early CDK: %v", err)
-	}
-	lateCDKs, err := store.createBatch(1, 100, 2, true, now)
-	if err != nil {
-		t.Fatalf("create late CDK: %v", err)
-	}
-	early, err := users.redeemCDK("usr_cdk_multi_generation", earlyCDKs[0].Code, now)
-	if err != nil {
-		t.Fatalf("redeem early CDK: %v", err)
-	}
-	late, err := users.redeemCDK("usr_cdk_multi_generation", lateCDKs[0].Code, now)
-	if err != nil {
-		t.Fatalf("redeem late CDK: %v", err)
-	}
-
-	if err := users.reserveQuota("job_multi_patch", "usr_cdk_multi_generation", 150, false, now); err != nil {
-		t.Fatalf("reserve across subscriptions before PATCH: %v", err)
-	}
-	if _, ok, err := store.update(earlyCDKs[0].Code, 80, 1, true, now.Add(time.Hour)); err != nil || !ok {
-		t.Fatalf("update early CDK: ok=%v err=%v", ok, err)
-	}
-	settled, err := users.settleQuotaReservation("job_multi_patch")
-	if err != nil || settled != 150 {
-		t.Fatalf("settle multi-subscription PATCH reservation = %d, %v; want 150, nil", settled, err)
-	}
-	assertSubscriptionQuotaState(t, store.db, early.ID, 80, 100)
-	assertSubscriptionQuotaState(t, store.db, late.ID, 50, 50)
-
-	if err := users.reserveQuota("job_multi_revoke", "usr_cdk_multi_generation", 120, false, now.Add(2*time.Hour)); err != nil {
-		t.Fatalf("reserve across subscriptions before revoke: %v", err)
-	}
-	if _, ok, err := store.revoke(earlyCDKs[0].Code, now.Add(3*time.Hour)); err != nil || !ok {
-		t.Fatalf("revoke early CDK: ok=%v err=%v", ok, err)
-	}
-	settled, err = users.settleQuotaReservation("job_multi_revoke")
-	if settled != 0 || !errors.Is(err, errQuotaReservationInvalidated) {
-		t.Fatalf("settle multi-subscription revoked reservation = %d, %v; want invalidated error", settled, err)
-	}
-	assertSubscriptionQuotaState(t, store.db, early.ID, 0, 100)
-	assertSubscriptionQuotaState(t, store.db, late.ID, 50, 50)
-	var reservations int
-	if err := store.db.QueryRow(
-		`SELECT COUNT(*) FROM user_quota_reservations WHERE job_id IN ('job_multi_patch', 'job_multi_revoke')`,
-	).Scan(&reservations); err != nil {
-		t.Fatalf("count multi-subscription reservations: %v", err)
-	}
-	if reservations != 0 {
-		t.Fatalf("multi-subscription reservations remaining = %d, want 0", reservations)
-	}
-}
-
-func assertSubscriptionQuotaState(t *testing.T, db *sql.DB, subscriptionID string, wantRemaining, wantUsed int64) {
-	t.Helper()
-	var remaining, used int64
-	if err := db.QueryRow(
-		`SELECT remaining_bytes, used_bytes FROM user_subscriptions WHERE id=?`,
-		subscriptionID,
-	).Scan(&remaining, &used); err != nil {
-		t.Fatalf("read subscription quota state: %v", err)
-	}
-	if remaining != wantRemaining || used != wantUsed {
-		t.Fatalf("subscription quota state = remaining:%d used:%d, want remaining:%d used:%d", remaining, used, wantRemaining, wantUsed)
-	}
-}
-
-func TestRedeemedCDKRevokeImmediatelyExpiresSubscription(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-	users := newUserStore(store.db)
-	if _, err := store.db.Exec(
-		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_revoke', 'cdk-revoke@example.com', ?, ?)`,
-		now.Unix(), now.Unix(),
-	); err != nil {
-		t.Fatalf("insert user: %v", err)
-	}
-	created, err := store.createBatch(1, 1_000, 10, true, now)
-	if err != nil {
-		t.Fatalf("createBatch: %v", err)
-	}
-	if _, err := users.redeemCDK("usr_cdk_revoke", created[0].Code, now); err != nil {
-		t.Fatalf("redeemCDK: %v", err)
-	}
-
-	revokedAt := now.Add(time.Hour)
-	revoked, ok, err := store.revoke(created[0].Code, revokedAt)
-	if err != nil || !ok {
-		t.Fatalf("revoke: ok=%v err=%v", ok, err)
-	}
-	if revoked.RevokedAt != revokedAt.Unix() || revoked.ExpiresAt != revokedAt.Unix() {
-		t.Fatalf("revoked projection = %+v, want revoked and expired at %d", revoked, revokedAt.Unix())
-	}
-	if err := users.hasQuota("usr_cdk_revoke", 1, false, revokedAt); !errors.Is(err, errUserQuotaExhausted) {
-		t.Fatalf("quota after revoke = %v, want errUserQuotaExhausted", err)
-	}
-	if _, ok, err := store.update(created[0].Code, 2_000, 30, true, revokedAt.Add(time.Hour)); !ok || !errors.Is(err, errVoucherRevoked) {
-		t.Fatalf("update revoked CDK = ok:%v err:%v, want existing revoked error", ok, err)
-	}
-	if err := users.hasQuota("usr_cdk_revoke", 1, false, revokedAt.Add(2*time.Hour)); !errors.Is(err, errUserQuotaExhausted) {
-		t.Fatalf("quota after rejected revoked update = %v, want errUserQuotaExhausted", err)
-	}
-}
-
-func TestRedeemedCDKUpdateRollsBackWhenSubscriptionUpdateFails(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-	users := newUserStore(store.db)
-	if _, err := store.db.Exec(
-		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_rollback', 'cdk-rollback@example.com', ?, ?)`,
-		now.Unix(), now.Unix(),
-	); err != nil {
-		t.Fatalf("insert user: %v", err)
-	}
-	created, err := store.createBatch(1, 1_000, 10, true, now)
-	if err != nil {
-		t.Fatalf("createBatch: %v", err)
-	}
-	if _, err := users.redeemCDK("usr_cdk_rollback", created[0].Code, now); err != nil {
-		t.Fatalf("redeemCDK: %v", err)
-	}
-	if _, err := store.db.Exec(`CREATE TRIGGER reject_subscription_update BEFORE UPDATE ON user_subscriptions BEGIN SELECT RAISE(FAIL, 'reject update'); END`); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	if _, _, err := store.update(created[0].Code, 500, 20, false, now.Add(time.Hour)); err == nil {
-		t.Fatal("update unexpectedly succeeded")
-	}
-	var remaining int64
-	var durationDays int
-	if err := store.db.QueryRow(`SELECT remaining_bytes, duration_days FROM cdks WHERE code=?`, created[0].Code).Scan(&remaining, &durationDays); err != nil {
-		t.Fatalf("read CDK after rollback: %v", err)
-	}
-	if remaining != 1_000 || durationDays != 10 {
-		t.Fatalf("CDK changed despite rollback: remaining=%d duration=%d", remaining, durationDays)
-	}
-}
-
-func TestCDKMergeAddsTrafficKeepsPrimaryFieldsAndDeletesSecondary(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-
-	primary, err := store.createBatch(1, 5*bytesPerGB, 10, true, now)
-	if err != nil {
-		t.Fatalf("create primary: %v", err)
-	}
-	secondary, err := store.createBatch(1, 4*bytesPerGB, 30, true, now)
-	if err != nil {
-		t.Fatalf("create secondary: %v", err)
-	}
-	if err := store.charge(primary[0].Code, 2*bytesPerGB); err != nil {
-		t.Fatalf("charge primary: %v", err)
-	}
-	if err := store.charge(secondary[0].Code, bytesPerGB); err != nil {
-		t.Fatalf("charge secondary: %v", err)
-	}
-
-	merged, err := store.merge(primary[0].Code, secondary[0].Code, now)
-	if err != nil {
-		t.Fatalf("merge: %v", err)
-	}
-	if merged.Code != primary[0].Code {
-		t.Fatalf("merged code = %q, want primary %q", merged.Code, primary[0].Code)
-	}
-	if merged.RemainingBytes != 6*bytesPerGB {
-		t.Fatalf("remaining = %d, want 6 GiB", merged.RemainingBytes)
-	}
-	if merged.UsedBytes != 2*bytesPerGB {
-		t.Fatalf("used = %d, want primary used unchanged at 2 GiB", merged.UsedBytes)
-	}
-	if merged.ExpiresAt != secondary[0].ExpiresAt {
-		t.Fatalf("expires_at = %d, want later secondary expiry %d", merged.ExpiresAt, secondary[0].ExpiresAt)
-	}
-	if !merged.AllowProxy || merged.CreatedAt != primary[0].CreatedAt {
-		t.Fatalf("primary fields changed unexpectedly: %+v", merged)
-	}
-	if _, ok, err := store.get(secondary[0].Code); err != nil || ok {
-		t.Fatalf("secondary should be deleted, ok=%v err=%v", ok, err)
-	}
-}
-
-func TestCDKMergeRejectsInvalidInputs(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-
-	t.Run("same code", func(t *testing.T) {
-		store := newTestCDKStore(t)
-		created, _ := store.createBatch(1, bytesPerGB, 30, true, now)
-		if _, err := store.merge(created[0].Code, created[0].Code, now); !errors.Is(err, errCDKSameMergeCode) {
-			t.Fatalf("err = %v, want errCDKSameMergeCode", err)
-		}
-	})
-
-	t.Run("missing primary", func(t *testing.T) {
-		store := newTestCDKStore(t)
-		secondary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
-		if _, err := store.merge("NOPE-NOPE-NOPE-NOPE", secondary[0].Code, now); !errors.Is(err, errCDKNotFound) {
-			t.Fatalf("err = %v, want errCDKNotFound", err)
-		}
-	})
-
-	t.Run("missing secondary", func(t *testing.T) {
-		store := newTestCDKStore(t)
-		primary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
-		if _, err := store.merge(primary[0].Code, "NOPE-NOPE-NOPE-NOPE", now); !errors.Is(err, errCDKNotFound) {
-			t.Fatalf("err = %v, want errCDKNotFound", err)
-		}
-	})
-
-	t.Run("expired primary", func(t *testing.T) {
-		store := newTestCDKStore(t)
-		expired, _ := store.createBatch(1, bytesPerGB, 1, true, now.Add(-48*time.Hour))
-		secondary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
-		if _, err := store.merge(expired[0].Code, secondary[0].Code, now); !errors.Is(err, errCDKExpired) {
-			t.Fatalf("err = %v, want errCDKExpired", err)
-		}
-	})
-
-	t.Run("expired secondary", func(t *testing.T) {
-		store := newTestCDKStore(t)
-		primary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
-		expired, _ := store.createBatch(1, bytesPerGB, 1, true, now.Add(-48*time.Hour))
-		if _, err := store.merge(primary[0].Code, expired[0].Code, now); !errors.Is(err, errCDKExpired) {
-			t.Fatalf("err = %v, want errCDKExpired", err)
-		}
-	})
-
-	t.Run("secondary exhausted", func(t *testing.T) {
-		store := newTestCDKStore(t)
-		primary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
-		secondary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
-		if err := store.charge(secondary[0].Code, bytesPerGB); err != nil {
-			t.Fatalf("charge secondary: %v", err)
-		}
-		if _, err := store.merge(primary[0].Code, secondary[0].Code, now); !errors.Is(err, errCDKExhausted) {
-			t.Fatalf("err = %v, want errCDKExhausted", err)
-		}
-	})
-
-	t.Run("proxy mismatch", func(t *testing.T) {
-		store := newTestCDKStore(t)
-		primary, _ := store.createBatch(1, bytesPerGB, 30, true, now)
-		secondary, _ := store.createBatch(1, bytesPerGB, 30, false, now)
-		if _, err := store.merge(primary[0].Code, secondary[0].Code, now); !errors.Is(err, errCDKProxyMismatch) {
-			t.Fatalf("err = %v, want errCDKProxyMismatch", err)
-		}
-	})
-}
-
-func TestCDKDeleteExpired(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	store := newTestCDKStore(t)
-
-	// Unredeemed vouchers no longer expire from their creation timestamp.
-	past := now.Add(-40 * 24 * time.Hour)
-	if _, err := store.createBatch(2, 5*bytesPerGB, 10, true, past); err != nil {
-		t.Fatalf("create old vouchers: %v", err)
-	}
-	if _, err := store.createBatch(1, 5*bytesPerGB, 30, true, now); err != nil {
-		t.Fatalf("create live: %v", err)
-	}
-
-	deleted, err := store.deleteExpired(now)
-	if err != nil {
-		t.Fatalf("deleteExpired: %v", err)
-	}
-	if deleted != 0 {
-		t.Fatalf("expected no unredeemed vouchers deleted, got %d", deleted)
-	}
-
-	remaining, err := store.list()
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(remaining) != 3 {
-		t.Fatalf("expected all unredeemed vouchers to remain, got %+v", remaining)
-	}
-
-	// Redeemed records with legacy display expiry in the past can be purged.
-	if _, err := store.db.Exec(`UPDATE cdks SET redeemed_by_user_id='usr_old', redeemed_at=? WHERE created_at=?`, past.Unix(), past.Unix()); err != nil {
-		t.Fatalf("mark old vouchers redeemed: %v", err)
-	}
-	deleted, err = store.deleteExpired(now)
-	if err != nil {
-		t.Fatalf("deleteExpired: %v", err)
-	}
-	if deleted != 2 {
-		t.Fatalf("expected 2 redeemed old vouchers deleted, got %d", deleted)
-	}
-
-	remaining, err = store.list()
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(remaining) != 1 {
-		t.Fatalf("expected only the live voucher to remain, got %+v", remaining)
-	}
-
-	// A second purge with nothing expired removes nothing.
-	again, err := store.deleteExpired(now)
-	if err != nil || again != 0 {
-		t.Fatalf("second purge: deleted=%d err=%v", again, err)
-	}
-}
-
-func TestHandleDeleteExpiredCDKs(t *testing.T) {
+func TestCDKAdminHandlersExposeCredentialSnapshot(t *testing.T) {
 	srv := newTestServer(t)
 	handler := srv.Handler()
-
-	past := time.Now().Add(-72 * time.Hour)
-	old, err := srv.cdk.createBatch(2, 5*bytesPerGB, 1, true, past)
+	now := time.Now()
+	created, err := srv.cdk.createBatch(2, 3*bytesPerGB, 45, true, now)
 	if err != nil {
-		t.Fatalf("create old vouchers: %v", err)
+		t.Fatalf("create CDKs: %v", err)
 	}
-	live, err := srv.cdk.createBatch(1, 5*bytesPerGB, 30, true, time.Now())
-	if err != nil {
-		t.Fatalf("create live: %v", err)
-	}
-
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/cdks/expired", nil))
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated purge: expected 401, got %d", rec.Code)
-	}
-
-	req := httptest.NewRequest(http.MethodDelete, "/api/cdks/expired", nil)
-	token, err := srv.authSessions.create()
+	adminToken, err := srv.authSessions.create()
 	if err != nil {
 		t.Fatalf("create admin session: %v", err)
 	}
-	req.AddCookie(&http.Cookie{Name: "session", Value: token})
-	rec = httptest.NewRecorder()
+	adminCookie := &http.Cookie{Name: "session", Value: adminToken}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/cdks", nil)
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("purge: expected 200, got %d (%s)", rec.Code, rec.Body.String())
+		t.Fatalf("list status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var listPayload struct {
+		CDKs []cdkView `json:"cdks"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listPayload); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(listPayload.CDKs) != 2 || listPayload.CDKs[0].GrantBytes != 3*bytesPerGB || listPayload.CDKs[0].Status != "unredeemed" {
+		t.Fatalf("credential list = %+v", listPayload.CDKs)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw list: %v", err)
+	}
+	first := raw["cdks"].([]any)[0].(map[string]any)
+	for _, legacyField := range []string{"remaining_bytes", "used_bytes", "expires_at", "days_left", "expired"} {
+		if _, exists := first[legacyField]; exists {
+			t.Fatalf("legacy field %q leaked in CDK response: %v", legacyField, first)
+		}
 	}
 
-	var payload struct {
-		Deleted int64 `json:"deleted"`
+	patchReq := jsonRequest(http.MethodPatch, "/api/cdks/"+created[0].Code, `{"traffic_gb":4,"days":60,"allow_proxy":false}`)
+	patchReq.AddCookie(adminCookie)
+	patchRec := httptest.NewRecorder()
+	handler.ServeHTTP(patchRec, patchReq)
+	if patchRec.Code != http.StatusOK {
+		t.Fatalf("patch status=%d body=%s", patchRec.Code, patchRec.Body.String())
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode response: %v", err)
+	var patched cdkView
+	if err := json.Unmarshal(patchRec.Body.Bytes(), &patched); err != nil {
+		t.Fatalf("decode patch: %v", err)
 	}
-	if payload.Deleted != 0 {
-		t.Fatalf("unredeemed vouchers should not expire before redeem, deleted %d", payload.Deleted)
+	if patched.GrantBytes != 4*bytesPerGB || patched.DurationDays != 60 || patched.AllowProxy {
+		t.Fatalf("patched credential = %+v", patched)
 	}
 
-	remaining, err := srv.cdk.list()
-	if err != nil {
-		t.Fatalf("list: %v", err)
+	if _, err := srv.db.Exec(
+		`UPDATE cdks SET redeemed_by_user_id='usr_redeemed', redeemed_at=? WHERE code=?`,
+		now.Unix(), created[0].Code,
+	); err != nil {
+		t.Fatalf("mark redeemed: %v", err)
 	}
-	if len(remaining) != 3 {
-		t.Fatalf("expected old unredeemed vouchers and live voucher to remain, got %+v (live=%s old=%v)", remaining, live[0].Code, old)
+	patchReq = jsonRequest(http.MethodPatch, "/api/cdks/"+created[0].Code, `{"traffic_gb":1,"days":10,"allow_proxy":true}`)
+	patchReq.AddCookie(adminCookie)
+	patchRec = httptest.NewRecorder()
+	handler.ServeHTTP(patchRec, patchReq)
+	if patchRec.Code != http.StatusConflict {
+		t.Fatalf("patch redeemed status=%d body=%s", patchRec.Code, patchRec.Body.String())
+	}
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/cdks/"+created[0].Code, nil)
+	deleteReq.AddCookie(adminCookie)
+	deleteRec := httptest.NewRecorder()
+	handler.ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusConflict {
+		t.Fatalf("delete redeemed status=%d body=%s", deleteRec.Code, deleteRec.Body.String())
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		deleteReq = httptest.NewRequest(http.MethodDelete, "/api/cdks/"+created[1].Code, nil)
+		deleteReq.AddCookie(adminCookie)
+		deleteRec = httptest.NewRecorder()
+		handler.ServeHTTP(deleteRec, deleteReq)
+		if deleteRec.Code != http.StatusOK {
+			t.Fatalf("revoke attempt %d status=%d body=%s", attempt+1, deleteRec.Code, deleteRec.Body.String())
+		}
 	}
 }
 
@@ -846,12 +138,12 @@ func TestHandleUserRedeemCDKCreatesSubscription(t *testing.T) {
 	if payload.Subscriptions[0].DaysLeft != 45 || !payload.Subscriptions[0].AllowProxy {
 		t.Fatalf("subscription = %+v, want 45 proxy days", payload.Subscriptions[0])
 	}
-	c, ok, err := srv.cdk.get(created[0].Code)
-	if err != nil || !ok || c.RedeemedAt == 0 || c.RedeemedByUserID == "" {
-		t.Fatalf("redeemed cdk = %+v ok=%v err=%v", c, ok, err)
+	credential, ok, err := srv.cdk.get(created[0].Code)
+	if err != nil || !ok || credential.RedeemedAt == 0 || credential.RedeemedByUserID == "" {
+		t.Fatalf("redeemed cdk = %+v ok=%v err=%v", credential, ok, err)
 	}
-	if c.ExpiresAt < now.Add(45*24*time.Hour).Add(-2*time.Second).Unix() || c.ExpiresAt > now.Add(45*24*time.Hour).Add(2*time.Second).Unix() {
-		t.Fatalf("redeemed cdk expires_at = %d, want roughly redeem time + 45 days", c.ExpiresAt)
+	if credential.GrantBytes != 3*bytesPerGB || credential.DurationDays != 45 {
+		t.Fatalf("credential snapshot changed during redemption: %+v", credential)
 	}
 }
 
@@ -872,6 +164,142 @@ func TestHandleUserRedeemCDKRejectsRepeat(t *testing.T) {
 		if rec.Code != want {
 			t.Fatalf("redeem #%d status = %d body=%s, want %d", i+1, rec.Code, rec.Body.String(), want)
 		}
+	}
+}
+
+func TestConcurrentUserRedeemCDKSucceedsExactlyOnce(t *testing.T) {
+	srv := newTestServer(t)
+	now := time.Now()
+	created, err := srv.cdk.createBatch(1, bytesPerGB, 30, true, now)
+	if err != nil {
+		t.Fatalf("create cdk: %v", err)
+	}
+	const userID = "usr_concurrent_redeem"
+	if _, err := srv.db.Exec(
+		`INSERT INTO users(id, email, display_name, created_at, updated_at) VALUES(?,?,?,?,?)`,
+		userID, "concurrent@example.com", "Concurrent", now.Unix(), now.Unix(),
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	const attempts = 12
+	start := make(chan struct{})
+	errs := make(chan error, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := srv.users.redeemCDK(userID, created[0].Code, now)
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	succeeded := 0
+	conflicted := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, errVoucherRedeemed):
+			conflicted++
+		default:
+			t.Fatalf("unexpected redeem error: %v", err)
+		}
+	}
+	if succeeded != 1 || conflicted != attempts-1 {
+		t.Fatalf("redeem results = success:%d conflict:%d", succeeded, conflicted)
+	}
+	var subscriptions int
+	if err := srv.db.QueryRow(
+		`SELECT COUNT(*) FROM user_subscriptions WHERE user_id=? AND source_cdk_code=?`,
+		userID, created[0].Code,
+	).Scan(&subscriptions); err != nil {
+		t.Fatalf("count subscriptions: %v", err)
+	}
+	if subscriptions != 1 {
+		t.Fatalf("subscriptions = %d, want 1", subscriptions)
+	}
+}
+
+func TestUserRedeemCDKRejectsUnsafeStoredDurationAtomically(t *testing.T) {
+	srv := newTestServer(t)
+	now := time.Now()
+	created, err := srv.cdk.createBatch(1, bytesPerGB, 30, true, now)
+	if err != nil {
+		t.Fatalf("create cdk: %v", err)
+	}
+	if _, err := srv.db.Exec(`UPDATE cdks SET duration_days=? WHERE code=?`, maxCDKDurationDays+1, created[0].Code); err != nil {
+		t.Fatalf("set unsafe duration: %v", err)
+	}
+	const userID = "usr_unsafe_duration"
+	if _, err := srv.db.Exec(
+		`INSERT INTO users(id, email, display_name, created_at, updated_at) VALUES(?,?,?,?,?)`,
+		userID, "unsafe-duration@example.com", "Unsafe Duration", now.Unix(), now.Unix(),
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	if _, err := srv.users.redeemCDK(userID, created[0].Code, now); !errors.Is(err, errVoucherDuration) {
+		t.Fatalf("redeem error = %v, want errVoucherDuration", err)
+	}
+	var subscriptions, redeemed int
+	if err := srv.db.QueryRow(
+		`SELECT COUNT(*) FROM user_subscriptions WHERE source_cdk_code=?`,
+		created[0].Code,
+	).Scan(&subscriptions); err != nil {
+		t.Fatalf("count subscriptions: %v", err)
+	}
+	if err := srv.db.QueryRow(
+		`SELECT COUNT(*) FROM cdks WHERE code=? AND redeemed_at IS NOT NULL`,
+		created[0].Code,
+	).Scan(&redeemed); err != nil {
+		t.Fatalf("read redemption audit: %v", err)
+	}
+	if subscriptions != 0 || redeemed != 0 {
+		t.Fatalf("unsafe redemption changed state: subscriptions=%d redeemed=%d", subscriptions, redeemed)
+	}
+}
+
+func TestCDKHandlersRejectOverflowingGrantAndDuration(t *testing.T) {
+	srv := newTestServer(t)
+	created, err := srv.cdk.createBatch(1, bytesPerGB, 30, true, time.Now())
+	if err != nil {
+		t.Fatalf("create cdk: %v", err)
+	}
+	tests := []struct {
+		name   string
+		method string
+		body   string
+		update bool
+	}{
+		{name: "create grant overflow", method: http.MethodPost, body: `{"count":1,"traffic_gb":8589934592,"days":30,"allow_proxy":true}`},
+		{name: "create duration overflow", method: http.MethodPost, body: `{"count":1,"traffic_gb":1,"days":106752,"allow_proxy":true}`},
+		{name: "update grant overflow", method: http.MethodPatch, body: `{"traffic_gb":8589934592,"days":30,"allow_proxy":true}`, update: true},
+		{name: "update duration overflow", method: http.MethodPatch, body: `{"traffic_gb":1,"days":106752,"allow_proxy":true}`, update: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := "/api/cdks"
+			if tt.update {
+				target += "/" + created[0].Code
+			}
+			req := jsonRequest(tt.method, target, tt.body)
+			rec := httptest.NewRecorder()
+			if tt.update {
+				req.SetPathValue("code", created[0].Code)
+				srv.handleUpdateCDK(rec, req)
+			} else {
+				srv.handleCreateCDKs(rec, req)
+			}
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s, want 400", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }
 
@@ -903,35 +331,27 @@ func createTestUserSession(t *testing.T, srv *Server) *http.Cookie {
 	return &http.Cookie{Name: userSessionCookieName, Value: token}
 }
 
-func TestCDKViewDaysLeft(t *testing.T) {
+func TestCDKViewUsesAuditStatus(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	c := CDK{
-		Code:           "AAAA-BBBB-CCCC-DDDD",
-		RemainingBytes: 5 * bytesPerGB,
-		ExpiresAt:      now.Add(72 * time.Hour).Unix(),
-		CreatedAt:      now.Unix(),
-		DurationDays:   3,
+	credential := CDK{
+		Code:             "AAAA-BBBB-CCCC-DDDD",
+		GrantBytes:       5 * bytesPerGB,
+		DurationDays:     30,
+		AllowProxy:       true,
+		CreatedAt:        now.Unix(),
+		RedeemedByUserID: "usr_1",
+		RedeemedAt:       now.Add(time.Hour).Unix(),
+		RevokedAt:        now.Add(2 * time.Hour).Unix(),
 	}
-	v := toCDKView(c, now)
-	if v.Expired {
-		t.Fatal("should not be expired")
+	view := toCDKView(credential)
+	if view.Status != "redeemed" {
+		t.Fatalf("status=%q, want redeemed to take precedence", view.Status)
 	}
-	if v.DaysLeft != 3 {
-		t.Fatalf("expected 3 days left, got %d", v.DaysLeft)
-	}
-	if v.RemainingBytes != 5*bytesPerGB || v.RemainingLabel != "5 GB" {
-		t.Fatalf("unexpected remaining view: bytes=%d label=%q", v.RemainingBytes, v.RemainingLabel)
-	}
-
-	expiredView := toCDKView(CDK{ExpiresAt: now.Add(-time.Hour).Unix(), RedeemedAt: now.Add(-72 * time.Hour).Unix(), DurationDays: 3}, now)
-	if !expiredView.Expired || expiredView.DaysLeft != 0 {
-		t.Fatalf("expected expired view, got %+v", expiredView)
+	if view.GrantBytes != 5*bytesPerGB || view.GrantLabel != "5 GB" || view.RedeemedAt == "" || view.RevokedAt == "" {
+		t.Fatalf("credential view = %+v", view)
 	}
 }
 
-// TestUserJobViewHidesAccountInfo locks in the security boundary: a CDK user
-// must never receive the raw error/message, which embed PikPak account
-// usernames (the "all accounts failed: <email>: ..." leak).
 func TestUserJobViewHidesAccountInfo(t *testing.T) {
 	leak := "all PikPak accounts failed: alice@passinbox.com: record not found; bob@passinbox.com: record not found"
 
@@ -942,101 +362,35 @@ func TestUserJobViewHidesAccountInfo(t *testing.T) {
 		Message: "starting with alice@passinbox.com",
 		Error:   leak,
 	})
-	if failed.Error != genericUserJobError {
-		t.Fatalf("failed job error should be generic, got %q", failed.Error)
-	}
-	if failed.Message != "" {
-		t.Fatalf("failed job should expose no message, got %q", failed.Message)
+	if failed.Error != genericUserJobError || failed.Message != "" {
+		t.Fatalf("failed job leaked details: error=%q message=%q", failed.Error, failed.Message)
 	}
 	if contains(failed.Error, "@") || contains(failed.Message, "@") {
 		t.Fatalf("account email leaked: error=%q message=%q", failed.Error, failed.Message)
 	}
 
-	// A running job's internal "starting with <username>" message must not pass
-	// through either.
 	running := toUserJobView(&Job{
 		ID:      "job2",
 		Status:  JobRunning,
 		Stage:   StageTransfer,
 		Message: "starting with bob@passinbox.com",
 	})
-	if contains(running.Message, "@") || contains(running.Message, "bob") {
-		t.Fatalf("running message leaked account info: %q", running.Message)
-	}
-	if running.Error != "" {
-		t.Fatalf("running job should have no error, got %q", running.Error)
+	if contains(running.Message, "@") || contains(running.Message, "bob") || running.Error != "" {
+		t.Fatalf("running job leaked details: error=%q message=%q", running.Error, running.Message)
 	}
 
-	// Defense in depth: an error set without a failed status is still scrubbed.
 	weird := toUserJobView(&Job{ID: "job3", Status: JobRunning, Error: leak})
 	if weird.Error != genericUserJobError {
 		t.Fatalf("stray error not scrubbed, got %q", weird.Error)
 	}
-
 	badResource := toUserJobView(&Job{ID: "job4", Status: JobFailed, Error: badResourceParseUserError})
-	if badResource.Error != badResourceParseUserError {
-		t.Fatalf("bad resource error should be user-visible, got %q", badResource.Error)
-	}
-	if contains(badResource.Error, "@") {
-		t.Fatalf("bad resource error leaked account info: %q", badResource.Error)
-	}
-
-	overdraw := toUserJobView(&Job{ID: "job5", Status: JobFailed, Error: (errCDKOverdraw{size: 2 * bytesPerGB, remaining: bytesPerGB}).Error()})
-	if overdraw.Error == genericUserJobError {
-		t.Fatalf("CDK overdraw should be a safe user-visible error, got generic")
-	}
-	if contains(overdraw.Error, "@") {
-		t.Fatalf("CDK overdraw leaked account info: %q", overdraw.Error)
+	if badResource.Error != badResourceParseUserError || contains(badResource.Error, "@") {
+		t.Fatalf("bad resource error = %q", badResource.Error)
 	}
 }
 
 func contains(haystack, needle string) bool {
 	return strings.Contains(haystack, needle)
-}
-
-// TestApplyItemsSelectionRejectsOverdraw locks in the traffic gate: a CDK user
-// picking result files whose SUMMED size exceeds the CDK's remaining traffic
-// must be refused at selection time with a 403, not silently absorbed at charge
-// time. A selection that fits is accepted.
-func TestApplyItemsSelectionRejectsOverdraw(t *testing.T) {
-	now := time.Now()
-	store := newTestCDKStore(t)
-	created, _ := store.createBatch(1, 1*bytesPerGB, 30, true, now)
-	code := created[0].Code
-
-	noopResolver := newResolveQueue(time.Second, time.Second, 1, func(string, error) {})
-	s := &Server{cdk: store, jobs: newJobStore(10), resolver: noopResolver}
-
-	items := []DownloadItem{
-		{ID: "a", Name: "a.bin", Size: itoa64(512 * 1024 * 1024)}, // 0.5G
-		{ID: "b", Name: "b.bin", Size: itoa64(512 * 1024 * 1024)}, // 0.5G
-		{ID: "c", Name: "c.bin", Size: itoa64(512 * 1024 * 1024)}, // 0.5G
-	}
-	mkJob := func(id string) string {
-		job := &Job{ID: id, Status: JobSelectionRequired, Stage: StageResultSelection, CDKCode: code, Items: items}
-		s.jobs.create(job)
-		return id
-	}
-
-	// 1.5G summed > 1G remaining → refused.
-	if _, status, msg := s.applyItemsSelection(mkJob("job-over"), []string{"a", "b", "c"}); status != 403 {
-		t.Fatalf("expected 403 for oversized batch, got status=%d msg=%q", status, msg)
-	}
-
-	// 1.0G summed == 1G remaining → allowed (not strictly greater).
-	if _, status, msg := s.applyItemsSelection(mkJob("job-fit"), []string{"a", "b"}); status != 0 {
-		t.Fatalf("expected fitting batch to succeed, got status=%d msg=%q", status, msg)
-	}
-
-	// Empty selection is a bad request.
-	if _, status, _ := s.applyItemsSelection(mkJob("job-empty"), []string{"  "}); status != 400 {
-		t.Fatalf("expected 400 for empty selection, got status=%d", status)
-	}
-
-	// Unknown item id is rejected.
-	if _, status, _ := s.applyItemsSelection(mkJob("job-unknown"), []string{"a", "zzz"}); status != 400 {
-		t.Fatalf("expected 400 for unknown item, got status=%d", status)
-	}
 }
 
 func TestApplyItemSelectionRejectsUnknownSourceItem(t *testing.T) {
@@ -1050,7 +404,7 @@ func TestApplyItemSelectionRejectsUnknownSourceItem(t *testing.T) {
 		Items:  []DownloadItem{{ID: "known", Name: "known"}},
 	})
 
-	if _, status, msg := s.applyItemSelection("source-job", "unknown"); status != 400 {
+	if _, status, msg := s.applyItemSelection("source-job", "unknown"); status != http.StatusBadRequest {
 		t.Fatalf("status=%d msg=%q, want 400", status, msg)
 	}
 }
@@ -1073,7 +427,7 @@ func TestApplyItemSelectionDuplicateSubmitOnlyQueuesOnce(t *testing.T) {
 	if updated.Share == nil || len(updated.Share.SelectedItems) != 1 || updated.Share.SelectedItems[0].Path != "folder/known" {
 		t.Fatalf("selected source item = %+v, want path folder/known", updated.Share)
 	}
-	if _, status, msg := s.applyItemSelection("source-job", "known"); status != 409 {
+	if _, status, msg := s.applyItemSelection("source-job", "known"); status != http.StatusConflict {
 		t.Fatalf("second selection status=%d msg=%q, want 409", status, msg)
 	}
 	if queued := noopResolver.queuedIDs(); len(queued) != 1 || queued[0] != "source-job" {
@@ -1103,17 +457,14 @@ func TestApplyItemsSelectionAcceptsMultipleSourceItems(t *testing.T) {
 	if updated.Status != JobQueued || updated.Stage != StageTransfer {
 		t.Fatalf("updated job status/stage = %s/%s, want queued/transfer", updated.Status, updated.Stage)
 	}
-	if updated.Share == nil || updated.Share.SelectedID != "b" || len(updated.Share.SelectedIDs) != 2 || updated.Share.SelectedIDs[0] != "b" || updated.Share.SelectedIDs[1] != "a" {
+	if updated.Share == nil || len(updated.Share.SelectedIDs) != 2 || updated.Share.SelectedIDs[0] != "b" || updated.Share.SelectedIDs[1] != "a" {
 		t.Fatalf("selected share ids = %+v, want [b a]", updated.Share)
 	}
 	if len(updated.Share.SelectedItems) != 2 || updated.Share.SelectedItems[0].Path != "root/b.bin" || updated.Share.SelectedItems[1].Path != "root/a.bin" {
-		t.Fatalf("selected source items = %+v, want paths [root/b.bin root/a.bin]", updated.Share.SelectedItems)
+		t.Fatalf("selected source items = %+v", updated.Share.SelectedItems)
 	}
-	if !updated.ResolveSelected {
-		t.Fatal("source multi selection should mark the job to resolve selected files directly")
-	}
-	if len(updated.Items) != 0 {
-		t.Fatalf("selection items should be cleared, got %+v", updated.Items)
+	if !updated.ResolveSelected || len(updated.Items) != 0 {
+		t.Fatalf("selection state = resolve:%v items:%+v", updated.ResolveSelected, updated.Items)
 	}
 	if queued := noopResolver.queuedIDs(); len(queued) != 1 || queued[0] != "source-job" {
 		t.Fatalf("queued IDs = %v, want [source-job]", queued)
@@ -1125,42 +476,12 @@ func TestApplyItemsSelectionRejectsTooManyItems(t *testing.T) {
 	for i := range ids {
 		ids[i] = "file-" + strconv.Itoa(i)
 	}
-
 	s := &Server{jobs: newJobStore(10)}
 	if _, status, msg := s.applyItemsSelection("job-any", ids); status != http.StatusBadRequest {
 		t.Fatalf("status=%d msg=%q, want 400", status, msg)
 	}
 }
 
-func TestApplyItemsSelectionRejectsSourceOverdraw(t *testing.T) {
-	now := time.Now()
-	store := newTestCDKStore(t)
-	created, _ := store.createBatch(1, 1*bytesPerGB, 30, true, now)
-	code := created[0].Code
-
-	noopResolver := newResolveQueue(time.Second, time.Second, 1, func(string, error) {})
-	s := &Server{cdk: store, jobs: newJobStore(10), resolver: noopResolver}
-	s.jobs.create(&Job{
-		ID:      "source-job",
-		Status:  JobSelectionRequired,
-		Stage:   StageSourceSelection,
-		Share:   &ShareState{ShareID: "share"},
-		CDKCode: code,
-		Items: []DownloadItem{
-			{ID: "a", Name: "a.bin", Size: itoa64(512 * 1024 * 1024)},
-			{ID: "b", Name: "b.bin", Size: itoa64(512 * 1024 * 1024)},
-			{ID: "c", Name: "c.bin", Size: itoa64(512 * 1024 * 1024)},
-		},
-	})
-
-	if _, status, msg := s.applyItemsSelection("source-job", []string{"a", "b", "c"}); status != http.StatusForbidden {
-		t.Fatalf("expected 403 for oversized source selection, got status=%d msg=%q", status, msg)
-	}
-}
-
-// TestResultForToken locks in proxy-link routing for batch jobs: each resolved
-// file's token must select its own result, across both the single Result and
-// the multi-file Results slice.
 func TestResultForToken(t *testing.T) {
 	job := &Job{
 		Result:  &JobResult{ProxyToken: "single-tok", File: DownloadItem{ID: "s"}},
@@ -1180,42 +501,6 @@ func TestResultForToken(t *testing.T) {
 	}
 }
 
-// TestCDKOverdrawError covers the single-file backstop used by finishWithItems:
-// it returns a typed errCDKOverdraw only when a CDK job's file exceeds remaining
-// traffic, and never blocks non-CDK jobs.
-func TestCDKOverdrawError(t *testing.T) {
-	now := time.Now()
-	store := newTestCDKStore(t)
-	created, _ := store.createBatch(1, 1*bytesPerGB, 30, true, now)
-	code := created[0].Code
-
-	s := &Server{cdk: store, jobs: newJobStore(10)}
-
-	cdkJob := &Job{ID: "cdk-job", CDKCode: code}
-	s.jobs.create(cdkJob)
-	if err := s.cdkOverdrawError(cdkJob.ID, DownloadItem{Size: itoa64(2 * bytesPerGB)}); err == nil {
-		t.Fatal("expected overdraw error for 2G file against 1G CDK")
-	} else if _, ok := errAsOverdraw(err); !ok {
-		t.Fatalf("expected errCDKOverdraw, got %T", err)
-	}
-	if err := s.cdkOverdrawError(cdkJob.ID, DownloadItem{Size: itoa64(512 * 1024 * 1024)}); err != nil {
-		t.Fatalf("0.5G file should fit 1G CDK, got %v", err)
-	}
-
-	// A job with no CDK is never gated.
-	plainJob := &Job{ID: "plain-job"}
-	s.jobs.create(plainJob)
-	if err := s.cdkOverdrawError(plainJob.ID, DownloadItem{Size: itoa64(99 * bytesPerGB)}); err != nil {
-		t.Fatalf("non-CDK job must never be gated, got %v", err)
-	}
-}
-
 func itoa64(n int64) string {
 	return strconv.FormatInt(n, 10)
-}
-
-func errAsOverdraw(err error) (errCDKOverdraw, bool) {
-	var o errCDKOverdraw
-	ok := errors.As(err, &o)
-	return o, ok
 }

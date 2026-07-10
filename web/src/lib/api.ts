@@ -3,12 +3,17 @@
 // (admin `session` / CDK `cdk`) flow automatically with same-origin requests.
 import type {
   AccountSummary,
+  AdminSubscription,
+  AdminSubscriptionRevisionRequest,
+  AdminUserDetail,
+  AdminUsersResponse,
   AuthSettingsResponse,
   AuthResult,
   AuthStatus,
   BatchSummary,
   CDKView,
   ConfigResponse,
+  CreateAdminSubscriptionRequest,
   CreateCDKRequest,
   CreateJobRequest,
   Job,
@@ -20,6 +25,7 @@ import type {
   StorageStatusResponse,
   BackupRun,
   UpdateCDKRequest,
+  UpdateAdminSubscriptionRequest,
   UpdateAuthSettingsRequest,
   UpdateSettingsRequest,
   UpdateStatus,
@@ -32,7 +38,7 @@ import type { ApiError } from './types'
 let unauthorizedHandler: (() => void) | null = null
 
 /** Install a callback fired once when any request returns 401. Each app wires
- * its own redirect (admin → "/", CDK user → "/u"). */
+ * its own redirect (admin → "/", registered user → "/u"). */
 export function setUnauthorizedHandler(fn: (() => void) | null) {
   unauthorizedHandler = fn
 }
@@ -133,6 +139,29 @@ export const api = {
       request<AuthResult>('DELETE', `/api/accounts/${id}/parse-errors/${index}`),
   },
 
+  users: {
+    list: (q = '', limit = 50, offset = 0) => {
+      const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+      if (q) params.set('q', q)
+      return request<AdminUsersResponse>('GET', `/api/users?${params.toString()}`)
+    },
+    get: (userID: string) => request<AdminUserDetail>('GET', `/api/users/${encodeURIComponent(userID)}`),
+    createSubscription: (userID: string, body: CreateAdminSubscriptionRequest) =>
+      request<AdminSubscription>('POST', `/api/users/${encodeURIComponent(userID)}/subscriptions`, body),
+    updateSubscription: (userID: string, subscriptionID: string, body: UpdateAdminSubscriptionRequest) =>
+      request<AdminSubscription>(
+        'PATCH',
+        `/api/users/${encodeURIComponent(userID)}/subscriptions/${encodeURIComponent(subscriptionID)}`,
+        body,
+      ),
+    terminateSubscription: (userID: string, subscriptionID: string, body: AdminSubscriptionRevisionRequest) =>
+      request<AdminSubscription>(
+        'POST',
+        `/api/users/${encodeURIComponent(userID)}/subscriptions/${encodeURIComponent(subscriptionID)}/terminate`,
+        body,
+      ),
+  },
+
   jobs: {
     create: (body: CreateJobRequest) => request<Job>('POST', '/api/jobs', body),
     get: (id: string) => request<Job>('GET', `/api/jobs/${id}`),
@@ -142,7 +171,6 @@ export const api = {
   cdks: {
     list: () => request<{ cdks: CDKView[] }>('GET', '/api/cdks'),
     create: (body: CreateCDKRequest) => request<{ cdks: CDKView[] }>('POST', '/api/cdks', body),
-    deleteExpired: () => request<{ deleted: number }>('DELETE', '/api/cdks/expired'),
     update: (code: string, body: UpdateCDKRequest) =>
       request<CDKView>('PATCH', `/api/cdks/${encodeURIComponent(code)}`, body),
     remove: (code: string) => request<AuthResult>('DELETE', `/api/cdks/${encodeURIComponent(code)}`),

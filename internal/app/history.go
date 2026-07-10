@@ -110,7 +110,7 @@ func (s *Server) expireSelectionJob(jobID string, cutoff time.Time) {
 	}
 }
 
-func (s *Server) saveCDKHistory(jobID string) {
+func (s *Server) saveResolveHistory(jobID string) {
 	if s.history == nil {
 		return
 	}

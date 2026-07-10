@@ -160,7 +160,7 @@ type Job struct {
 }
 
 // resultForToken returns the resolved file whose proxy token matches, searching
-// both the single-file Result (admin path) and the multi-file Results (CDK-user
+// both the single-file Result (admin path) and the multi-file Results (registered-user
 // batch path). Returns nil when no token matches.
 func (j *Job) resultForToken(token string) *JobResult {
 	if token == "" {

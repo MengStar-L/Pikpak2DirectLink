@@ -9,6 +9,7 @@ import Sidebar from './components/admin/Sidebar.vue'
 import MetricGrid from './components/admin/MetricGrid.vue'
 import ResolvePage from './components/admin/ResolvePage.vue'
 import AccountsPage from './components/admin/AccountsPage.vue'
+import UsersPage from './components/admin/UsersPage.vue'
 import LogsPage from './components/admin/LogsPage.vue'
 import CdkPage from './components/admin/CdkPage.vue'
 import UpdatePage from './components/admin/UpdatePage.vue'
@@ -20,6 +21,7 @@ const booted = ref(false)
 const active = ref('resolve')
 const updateAvailable = ref(false)
 const passwordFixed = ref(false)
+const focusedUserID = ref('')
 
 const config = ref<ConfigResponse | null>(null)
 const settings = ref<SettingsResponse | null>(null)
@@ -27,12 +29,21 @@ const settings = ref<SettingsResponse | null>(null)
 const pageMap = {
   resolve: ResolvePage,
   accounts: AccountsPage,
+  users: UsersPage,
   logs: LogsPage,
   cdk: CdkPage,
   update: UpdatePage,
   settings: SettingsPage,
 } as const
 const current = computed(() => pageMap[active.value as keyof typeof pageMap])
+const currentProps = computed(() => active.value === 'users' && focusedUserID.value
+  ? { focusUserId: focusedUserID.value }
+  : {})
+
+function openUser(userID: string) {
+  focusedUserID.value = userID
+  active.value = 'users'
+}
 
 setUnauthorizedHandler(() => {
   window.location.replace('/')
@@ -98,8 +109,11 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
           <component
             :is="current"
             :key="active"
+            v-bind="currentProps"
             @changed="loadConfig"
             @available="(v: boolean) => (updateAvailable = v)"
+            @open-user="openUser"
+            @focus-consumed="focusedUserID = ''"
             :password-fixed="passwordFixed"
           />
         </Transition>

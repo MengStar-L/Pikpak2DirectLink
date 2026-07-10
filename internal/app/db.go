@@ -2,6 +2,7 @@ package app
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -125,13 +126,11 @@ func sqliteDatabaseDSN(path string) (string, error) {
 func migrate(db *sql.DB) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS cdks (
-    code            TEXT PRIMARY KEY,
-    remaining_bytes INTEGER NOT NULL,
-    used_bytes      INTEGER NOT NULL DEFAULT 0,
-    expires_at      INTEGER NOT NULL,
-    created_at      INTEGER NOT NULL,
+    code            TEXT PRIMARY KEY NOT NULL,
+    grant_bytes     INTEGER NOT NULL,
+    duration_days   INTEGER NOT NULL,
     allow_proxy     INTEGER NOT NULL DEFAULT 1,
-    duration_days   INTEGER NOT NULL DEFAULT 30,
+    created_at      INTEGER NOT NULL,
     redeemed_by_user_id TEXT,
     redeemed_at     INTEGER,
     revoked_at      INTEGER
@@ -149,6 +148,8 @@ CREATE TABLE IF NOT EXISTS users (
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_users_created_id
+ON users(created_at DESC, id);
 CREATE TABLE IF NOT EXISTS user_identities (
     provider         TEXT NOT NULL,
     provider_user_id TEXT NOT NULL,
@@ -184,12 +185,16 @@ CREATE TABLE IF NOT EXISTS user_subscriptions (
     created_at      INTEGER NOT NULL,
     allow_proxy     INTEGER NOT NULL DEFAULT 1,
     quota_generation INTEGER NOT NULL DEFAULT 0,
+    revision        INTEGER NOT NULL DEFAULT 1,
+    terminated_at   INTEGER,
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user_expiry
 ON user_subscriptions(user_id, expires_at);
 CREATE INDEX IF NOT EXISTS idx_user_subscriptions_source_cdk
 ON user_subscriptions(source_cdk_code, user_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user_timeline
+ON user_subscriptions(user_id, expires_at, created_at, id);
 CREATE TABLE IF NOT EXISTS user_quota_reservations (
     job_id          TEXT NOT NULL,
     subscription_id TEXT NOT NULL,
@@ -242,14 +247,11 @@ ON proxy_temp_cleanups(cleanup_after);`
 	if err := migrateQuotaReservationGenerations(db); err != nil {
 		return fmt.Errorf("migrate quota reservation generations: %w", err)
 	}
-	if err := migrateCDKToTraffic(db); err != nil {
-		return fmt.Errorf("migrate cdks to traffic: %w", err)
+	if err := migrateUserSubscriptionAdminFields(db); err != nil {
+		return fmt.Errorf("migrate user subscription admin fields: %w", err)
 	}
-	if err := migrateCDKAddAllowProxy(db); err != nil {
-		return fmt.Errorf("migrate cdks add allow_proxy: %w", err)
-	}
-	if err := migrateCDKToVoucher(db); err != nil {
-		return fmt.Errorf("migrate cdks to voucher: %w", err)
+	if err := migrateCDKsToCredentials(db); err != nil {
+		return fmt.Errorf("migrate cdks to credentials: %w", err)
 	}
 	if err := migrateHistoryAddUserID(db); err != nil {
 		return fmt.Errorf("migrate history add user id: %w", err)
@@ -278,6 +280,30 @@ func migrateQuotaReservationGenerations(db *sql.DB) error {
 		"quota_generation",
 		`ALTER TABLE user_quota_reservations ADD COLUMN quota_generation INTEGER NOT NULL DEFAULT 0`,
 	)
+}
+
+func migrateUserSubscriptionAdminFields(db *sql.DB) error {
+	if err := addColumnIfMissing(
+		db,
+		"user_subscriptions",
+		"revision",
+		`ALTER TABLE user_subscriptions ADD COLUMN revision INTEGER NOT NULL DEFAULT 1`,
+	); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(
+		db,
+		"user_subscriptions",
+		"terminated_at",
+		`ALTER TABLE user_subscriptions ADD COLUMN terminated_at INTEGER`,
+	); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_users_created_id ON users(created_at DESC, id)`); err != nil {
+		return err
+	}
+	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user_timeline ON user_subscriptions(user_id, expires_at, created_at, id)`)
+	return err
 }
 
 func migrateUserSessionsToDigests(db *sql.DB) error {
@@ -343,34 +369,6 @@ func migrateUserSessionsToDigests(db *sql.DB) error {
 	return tx.Commit()
 }
 
-func migrateCDKToVoucher(db *sql.DB) error {
-	hadDurationDays, err := columnExists(db, "cdks", "duration_days")
-	if err != nil {
-		return err
-	}
-	if err := addColumnIfMissing(db, "cdks", "duration_days", `ALTER TABLE cdks ADD COLUMN duration_days INTEGER NOT NULL DEFAULT 30`); err != nil {
-		return err
-	}
-	if err := addColumnIfMissing(db, "cdks", "redeemed_by_user_id", `ALTER TABLE cdks ADD COLUMN redeemed_by_user_id TEXT`); err != nil {
-		return err
-	}
-	if err := addColumnIfMissing(db, "cdks", "redeemed_at", `ALTER TABLE cdks ADD COLUMN redeemed_at INTEGER`); err != nil {
-		return err
-	}
-	if err := addColumnIfMissing(db, "cdks", "revoked_at", `ALTER TABLE cdks ADD COLUMN revoked_at INTEGER`); err != nil {
-		return err
-	}
-	whereClause := `WHERE duration_days IS NULL OR duration_days <= 0`
-	if !hadDurationDays {
-		whereClause = ``
-	}
-	_, err = db.Exec(`
-		UPDATE cdks
-		SET duration_days = max(1, CAST(((expires_at - created_at) + 86399) / 86400 AS INTEGER))
-		` + whereClause)
-	return err
-}
-
 func migrateHistoryAddUserID(db *sql.DB) error {
 	if err := addColumnIfMissing(db, "cdk_resolve_history", "user_id", `ALTER TABLE cdk_resolve_history ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
@@ -391,43 +389,70 @@ func addColumnIfMissing(db *sql.DB, table, column, stmt string) error {
 	return err
 }
 
-// migrateCDKAddAllowProxy adds the allow_proxy column to a pre-existing cdks
-// table. Existing CDKs default to 1 (proxy allowed) so prior behavior is
-// preserved. Fresh databases already have the column from the schema above, so
-// this is a no-op for them and idempotent thereafter.
-func migrateCDKAddAllowProxy(db *sql.DB) error {
-	has, err := columnExists(db, "cdks", "allow_proxy")
-	if err != nil {
-		return err
-	}
-	if has {
-		return nil
-	}
-	_, err = db.Exec(`ALTER TABLE cdks ADD COLUMN allow_proxy INTEGER NOT NULL DEFAULT 1`)
-	return err
-}
-
 // legacyCDKBytesPerCredit converts an existing count-based CDK credit into a
 // downstream-traffic allowance: one parse credit becomes 2 GiB.
 const legacyCDKBytesPerCredit = int64(2) << 30
 
-// migrateCDKToTraffic upgrades a pre-existing count-based cdks table (columns
-// remaining/used) to the traffic-based schema (remaining_bytes/used_bytes),
-// converting each credit to 2 GiB. The presence of the remaining_bytes column is
-// itself the version marker, so this is idempotent: once migrated, the legacy
-// `remaining` column is gone and this is a no-op. Fresh databases already have
-// the new schema and skip the rebuild.
-func migrateCDKToTraffic(db *sql.DB) error {
-	hasLegacy, err := columnExists(db, "cdks", "remaining")
+var credentialCDKColumns = []string{
+	"code",
+	"grant_bytes",
+	"duration_days",
+	"allow_proxy",
+	"created_at",
+	"redeemed_by_user_id",
+	"redeemed_at",
+	"revoked_at",
+}
+
+// migrateCDKsToCredentials rebuilds every historical CDK representation into
+// an issuance snapshot. In particular, remaining_bytes becomes grant_bytes
+// without adding used_bytes back; live subscription state is never read or
+// changed by this migration.
+func migrateCDKsToCredentials(db *sql.DB) error {
+	columns, err := tableColumnSet(db, "cdks")
 	if err != nil {
 		return err
 	}
-	hasBytes, err := columnExists(db, "cdks", "remaining_bytes")
-	if err != nil {
-		return err
+	if hasOnlyColumns(columns, credentialCDKColumns) {
+		return nil
 	}
-	if !hasLegacy || hasBytes {
-		return nil // already on the new schema (or a fresh install)
+	if !columns["code"] || !columns["created_at"] {
+		return errors.New("unsupported cdks schema: code and created_at are required")
+	}
+
+	grantExpr := ""
+	switch {
+	case columns["grant_bytes"]:
+		grantExpr = `max(grant_bytes, 0)`
+	case columns["remaining_bytes"]:
+		grantExpr = `max(remaining_bytes, 0)`
+	case columns["remaining"]:
+		grantExpr = fmt.Sprintf(`max(remaining, 0) * %d`, legacyCDKBytesPerCredit)
+	default:
+		return errors.New("unsupported cdks schema: no grant or remaining column")
+	}
+
+	durationExpr := "30"
+	if columns["duration_days"] {
+		durationExpr = `max(duration_days, 1)`
+	} else if columns["expires_at"] {
+		durationExpr = `max(1, CAST(((expires_at - created_at) + 86399) / 86400 AS INTEGER))`
+	}
+	allowProxyExpr := "1"
+	if columns["allow_proxy"] {
+		allowProxyExpr = "allow_proxy"
+	}
+	redeemedByExpr := "NULL"
+	if columns["redeemed_by_user_id"] {
+		redeemedByExpr = "redeemed_by_user_id"
+	}
+	redeemedAtExpr := "NULL"
+	if columns["redeemed_at"] {
+		redeemedAtExpr = "redeemed_at"
+	}
+	revokedAtExpr := "NULL"
+	if columns["revoked_at"] {
+		revokedAtExpr = "revoked_at"
 	}
 
 	tx, err := db.Begin()
@@ -436,26 +461,74 @@ func migrateCDKToTraffic(db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
-	stmts := []string{
-		`CREATE TABLE cdks_new (
-            code            TEXT PRIMARY KEY,
-            remaining_bytes INTEGER NOT NULL,
-            used_bytes      INTEGER NOT NULL DEFAULT 0,
-            expires_at      INTEGER NOT NULL,
-            created_at      INTEGER NOT NULL
-        )`,
-		fmt.Sprintf(`INSERT INTO cdks_new (code, remaining_bytes, used_bytes, expires_at, created_at)
-            SELECT code, remaining * %d, used * %d, expires_at, created_at FROM cdks`,
-			legacyCDKBytesPerCredit, legacyCDKBytesPerCredit),
-		`DROP TABLE cdks`,
-		`ALTER TABLE cdks_new RENAME TO cdks`,
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS cdks_credentials_new`); err != nil {
+		return err
 	}
-	for _, stmt := range stmts {
-		if _, err := tx.Exec(stmt); err != nil {
-			return err
-		}
+	if _, err := tx.Exec(`CREATE TABLE cdks_credentials_new (
+		code                TEXT PRIMARY KEY NOT NULL,
+		grant_bytes         INTEGER NOT NULL,
+		duration_days       INTEGER NOT NULL,
+		allow_proxy         INTEGER NOT NULL DEFAULT 1,
+		created_at          INTEGER NOT NULL,
+		redeemed_by_user_id TEXT,
+		redeemed_at         INTEGER,
+		revoked_at          INTEGER
+	)`); err != nil {
+		return err
+	}
+	copySQL := fmt.Sprintf(`INSERT INTO cdks_credentials_new (
+		code, grant_bytes, duration_days, allow_proxy, created_at,
+		redeemed_by_user_id, redeemed_at, revoked_at
+	) SELECT code, %s, %s, %s, created_at, %s, %s, %s FROM cdks`,
+		grantExpr, durationExpr, allowProxyExpr, redeemedByExpr, redeemedAtExpr, revokedAtExpr,
+	)
+	if _, err := tx.Exec(copySQL); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE cdks`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE cdks_credentials_new RENAME TO cdks`); err != nil {
+		return err
 	}
 	return tx.Commit()
+}
+
+func tableColumnSet(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dfltValue, &pk); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	return columns, rows.Err()
+}
+
+func hasOnlyColumns(got map[string]bool, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for _, column := range want {
+		if !got[column] {
+			return false
+		}
+	}
+	return true
 }
 
 // columnExists reports whether a table has a column of the given name.

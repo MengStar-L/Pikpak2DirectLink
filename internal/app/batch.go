@@ -62,7 +62,7 @@ type childSpec struct {
 // and are enqueued at the given priority so they fan out across the resolve queue
 // under the admin's concurrency limit. It returns the parent job, or an HTTP
 // status + message when a line cannot be recognized (status 0 means success).
-func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode, cdkCode, userID string, priority int, baseURL string) (*Job, int, string) {
+func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode, userID string, priority int, baseURL string) (*Job, int, string) {
 	if len(lines) > maxBatchLinks {
 		return nil, 400, fmt.Sprintf("too many links: maximum is %d per batch", maxBatchLinks)
 	}
@@ -94,7 +94,7 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 	var status int
 	var message string
 	if err := s.admission.withCapacity(userID, len(specs), func() error {
-		parent, status, message = s.createBatchJobAdmitted(specs, cleanLines, rawLines, mode, cdkCode, userID, priority, baseURL)
+		parent, status, message = s.createBatchJobAdmitted(specs, cleanLines, rawLines, mode, userID, priority, baseURL)
 		return nil
 	}); err != nil {
 		var limitErr *jobAdmissionError
@@ -109,7 +109,7 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 	return parent, status, message
 }
 
-func (s *Server) createBatchJobAdmitted(specs []childSpec, cleanLines, rawLines []string, mode, cdkCode, userID string, priority int, baseURL string) (*Job, int, string) {
+func (s *Server) createBatchJobAdmitted(specs []childSpec, cleanLines, rawLines []string, mode, userID string, priority int, baseURL string) (*Job, int, string) {
 	now := time.Now()
 	parentID, err := newJobID()
 	if err != nil {
@@ -125,7 +125,6 @@ func (s *Server) createBatchJobAdmitted(specs []childSpec, cleanLines, rawLines 
 		Stage:         StageTransfer,
 		Message:       fmt.Sprintf("解析中：0/%d 条完成", len(specs)),
 		BaseURL:       baseURL,
-		CDKCode:       cdkCode,
 		UserID:        userID,
 		ProxyAllowed:  userID != "" && mode == "proxy",
 		Batch:         &BatchProgress{Total: len(specs)},
@@ -165,7 +164,6 @@ func (s *Server) createBatchJobAdmitted(specs []childSpec, cleanLines, rawLines 
 			Stage:        StageTransfer,
 			Message:      "queued",
 			BaseURL:      baseURL,
-			CDKCode:      cdkCode,
 			UserID:       userID,
 			ProxyAllowed: userID != "" && mode == "proxy",
 			ParentID:     parentID,
@@ -293,7 +291,7 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 	if final {
 		s.removeBatch(parentID)
 		s.logJob(LogSuccess, parentID, fmt.Sprintf("批量解析完成，成功 %d/%d 条", succeeded, total))
-		s.saveCDKHistory(parentID)
+		s.saveResolveHistory(parentID)
 	}
 }
 

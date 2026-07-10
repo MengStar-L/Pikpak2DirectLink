@@ -13,8 +13,8 @@ var (
 	errQuotaReservationInvalidated = errors.New("quota reservation was invalidated")
 )
 
-// A negative generation marks an allocation invalidated by source-CDK
-// revocation or removal of its required proxy permission.
+// A negative generation marks an allocation invalidated by subscription
+// termination or removal of its required proxy permission.
 const invalidQuotaReservationGeneration int64 = -1
 
 type quotaReservationReconcileResult struct {
@@ -76,7 +76,7 @@ func (s *userStore) reserveQuota(jobID, userID string, bytes int64, requireProxy
 
 	query := `SELECT id, remaining_bytes, quota_generation
 		FROM user_subscriptions
-		WHERE user_id=? AND expires_at>? AND remaining_bytes>0`
+		WHERE user_id=? AND expires_at>? AND remaining_bytes>0 AND terminated_at IS NULL`
 	args := []any{userID, now.Unix()}
 	if requireProxy {
 		query += ` AND allow_proxy=1`
@@ -124,8 +124,8 @@ func (s *userStore) reserveQuota(jobID, userID string, bytes int64, requireProxy
 		}
 		result, err := tx.Exec(
 			`UPDATE user_subscriptions
-			 SET remaining_bytes=remaining_bytes-?
-			 WHERE id=? AND user_id=? AND remaining_bytes>=? AND quota_generation=?`,
+			 SET remaining_bytes=remaining_bytes-?, revision=revision+1
+			 WHERE id=? AND user_id=? AND remaining_bytes>=? AND quota_generation=? AND terminated_at IS NULL`,
 			take, bucket.id, userID, take, bucket.quotaGeneration,
 		)
 		if err != nil {
@@ -193,8 +193,8 @@ func (s *userStore) settleQuotaReservationTx(tx *sql.Tx, jobID string) (int64, e
 		}
 		result, err := tx.Exec(
 			`UPDATE user_subscriptions
-			 SET used_bytes=used_bytes+?
-			 WHERE id=? AND user_id=? AND quota_generation=?`,
+			 SET used_bytes=used_bytes+?, revision=revision+1
+			 WHERE id=? AND user_id=? AND quota_generation=? AND terminated_at IS NULL`,
 			reservation.reservedBytes, reservation.subscriptionID, reservation.userID, reservation.quotaGeneration,
 		)
 		if err != nil {
@@ -212,13 +212,13 @@ func (s *userStore) settleQuotaReservationTx(tx *sql.Tx, jobID string) (int64, e
 			if generation == reservation.quotaGeneration {
 				return 0, fmt.Errorf("reserved subscription %s could not be settled", reservation.subscriptionID)
 			}
-			// A CDK PATCH establishes a new available-remaining baseline. The old
+			// An admin quota reset establishes a new available-remaining baseline. The old
 			// debit is absorbed by that reset, while a successful job still counts
 			// toward the subscription's actual used bytes.
 			result, err = tx.Exec(
 				`UPDATE user_subscriptions
-				 SET used_bytes=used_bytes+?
-				 WHERE id=? AND user_id=? AND quota_generation=?`,
+				 SET used_bytes=used_bytes+?, revision=revision+1
+				 WHERE id=? AND user_id=? AND quota_generation=? AND terminated_at IS NULL`,
 				reservation.reservedBytes, reservation.subscriptionID, reservation.userID, generation,
 			)
 			if err != nil {
@@ -273,8 +273,8 @@ func (s *userStore) releaseQuotaReservationTx(tx *sql.Tx, jobID string) (int64, 
 		}
 		result, err := tx.Exec(
 			`UPDATE user_subscriptions
-			 SET remaining_bytes=remaining_bytes+?
-			 WHERE id=? AND user_id=? AND quota_generation=?`,
+			 SET remaining_bytes=remaining_bytes+?, revision=revision+1
+			 WHERE id=? AND user_id=? AND quota_generation=? AND terminated_at IS NULL`,
 			reservation.reservedBytes, reservation.subscriptionID, reservation.userID, reservation.quotaGeneration,
 		)
 		if err != nil {
@@ -291,6 +291,21 @@ func (s *userStore) releaseQuotaReservationTx(tx *sql.Tx, jobID string) (int64, 
 			}
 			if generation == reservation.quotaGeneration {
 				return 0, fmt.Errorf("reserved subscription %s could not be released", reservation.subscriptionID)
+			}
+			result, err = tx.Exec(
+				`UPDATE user_subscriptions
+				 SET revision=revision+1
+				 WHERE id=? AND user_id=? AND quota_generation=? AND terminated_at IS NULL`,
+				reservation.subscriptionID, reservation.userID, generation,
+			)
+			if err != nil {
+				return 0, err
+			}
+			if changed, err = result.RowsAffected(); err != nil {
+				return 0, err
+			}
+			if changed > 1 {
+				return 0, fmt.Errorf("updated %d copies of stale reserved subscription %s", changed, reservation.subscriptionID)
 			}
 			continue
 		} else if changed != 1 {

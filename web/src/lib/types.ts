@@ -251,20 +251,14 @@ export type LogEntry = {
 
 export type CDKView = {
   code: string
-  remaining_bytes: number
-  used_bytes: number
-  remaining_label: string
-  used_label: string
-  expires_at: string
-  created_at: string
-  days_left: number
-  expired: boolean
-  allow_proxy: boolean
+  grant_bytes: number
+  grant_label: string
   duration_days: number
-  redeemed: boolean
+  allow_proxy: boolean
+  created_at: string
+  status: 'unredeemed' | 'redeemed' | 'revoked'
   redeemed_by_user_id?: string
   redeemed_at?: string
-  revoked: boolean
   revoked_at?: string
 }
 
@@ -291,6 +285,16 @@ export type User = {
   updated_at: number
 }
 
+export type AdminUser = {
+  id: string
+  email?: string
+  display_name: string
+  avatar_url?: string
+  disabled: boolean
+  created_at: string
+  updated_at: string
+}
+
 export type UserSubscription = {
   id: string
   source_cdk_code?: string
@@ -305,11 +309,67 @@ export type UserSubscription = {
   allow_proxy: boolean
 }
 
+export type AdminSubscription = {
+  id: string
+  source: 'cdk' | 'admin'
+  source_cdk_code?: string
+  remaining_bytes: number
+  remaining_label: string
+  used_bytes: number
+  used_label: string
+  reserved_bytes: number
+  reserved_label: string
+  expires_at: string
+  created_at: string
+  days_left: number
+  expired: boolean
+  status: 'active' | 'exhausted' | 'expired' | 'terminated'
+  allow_proxy: boolean
+  revision: number
+  terminated_at?: string
+}
+
 export type UserQuota = {
   total_remaining_bytes: number
   total_remaining_label: string
   next_expires_at?: string
   allow_proxy_available: boolean
+}
+
+export type AdminUserSummary = {
+  user: AdminUser
+  auth_providers: string[]
+  quota: UserQuota
+  subscription_count: number
+  active_subscription_count: number
+}
+
+export type AdminUserDetail = AdminUserSummary & {
+  subscriptions: AdminSubscription[]
+}
+
+export type AdminUsersResponse = {
+  users: AdminUserSummary[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export type CreateAdminSubscriptionRequest = {
+  remaining_bytes: number
+  expires_at: string
+  allow_proxy: boolean
+}
+
+export type UpdateAdminSubscriptionRequest = {
+  expected_revision: number
+  remaining_bytes?: number
+  expires_at?: string
+  allow_proxy?: boolean
+}
+
+export type AdminSubscriptionRevisionRequest = {
+  expected_revision: number
 }
 
 export type UserAuthConfig = {

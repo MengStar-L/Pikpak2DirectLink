@@ -1,6 +1,6 @@
 // Shared resolve state machine: submit → poll GET → handle selection_required
 // (pause and expose items) → select → resume → terminal. Generic over the job
-// projection so admin (Job) and CDK user (UserJobView) reuse the same logic.
+// projection so admin (Job) and registered user (UserJobView) reuse the same logic.
 import { ref, computed, onUnmounted, type Ref } from 'vue'
 import type {
   BatchSummary,

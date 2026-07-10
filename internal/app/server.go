@@ -375,11 +375,15 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("POST /api/jobs", server.handleCreateJob)
 	server.mux.HandleFunc("GET /api/jobs/{id}", server.handleGetJob)
 	server.mux.HandleFunc("POST /api/jobs/{id}/select", server.handleSelectItem)
+	server.mux.HandleFunc("GET /api/users", server.handleAdminListUsers)
+	server.mux.HandleFunc("GET /api/users/{userID}", server.handleAdminGetUser)
+	server.mux.HandleFunc("POST /api/users/{userID}/subscriptions", server.handleAdminCreateSubscription)
+	server.mux.HandleFunc("PATCH /api/users/{userID}/subscriptions/{subscriptionID}", server.handleAdminUpdateSubscription)
+	server.mux.HandleFunc("POST /api/users/{userID}/subscriptions/{subscriptionID}/terminate", server.handleAdminTerminateSubscription)
 
 	// Admin-only CDK management (behind the access gate).
 	server.mux.HandleFunc("GET /api/cdks", server.handleListCDKs)
 	server.mux.HandleFunc("POST /api/cdks", server.handleCreateCDKs)
-	server.mux.HandleFunc("DELETE /api/cdks/expired", server.handleDeleteExpiredCDKs)
 	server.mux.HandleFunc("PATCH /api/cdks/{code}", server.handleUpdateCDK)
 	server.mux.HandleFunc("DELETE /api/cdks/{code}", server.handleDeleteCDK)
 
@@ -1032,7 +1036,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	// (multi-file resolution still pauses for a manual selection).
 	lines := splitResourceLineSpecs(req.Input)
 	if len(lines) > 1 {
-		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, "", "", priorityAdmin, s.baseURL(r))
+		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, "", priorityAdmin, s.baseURL(r))
 		if status != 0 {
 			if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
 				w.Header().Set("Retry-After", "30")
@@ -1327,8 +1331,9 @@ func (s *Server) clearProxyFailure(jobID, token string) {
 }
 
 // jobAllowsProxy reports whether a job may expose proxy links. Admin jobs always
-// may. User jobs only may when they were created in proxy mode; legacy CDK jobs
-// still follow the voucher's allow_proxy flag.
+// may. User jobs use their persisted permission snapshot. Historical CDK jobs
+// predate that snapshot, so retain access only when their persisted result proves
+// that a proxy capability was originally issued.
 func (s *Server) jobAllowsProxy(job *Job) bool {
 	if job == nil {
 		return true
@@ -1336,14 +1341,22 @@ func (s *Server) jobAllowsProxy(job *Job) bool {
 	if job.UserID != "" {
 		return job.ProxyAllowed
 	}
-	if job.CDKCode == "" {
-		return true
+	if job.CDKCode != "" {
+		if job.ProxyAllowed || resultHasProxyCapability(job.Result) {
+			return true
+		}
+		for i := range job.Results {
+			if resultHasProxyCapability(&job.Results[i]) {
+				return true
+			}
+		}
+		return false
 	}
-	c, ok, err := s.cdk.get(job.CDKCode)
-	if err != nil || !ok {
-		return true
-	}
-	return c.AllowProxy
+	return true
+}
+
+func resultHasProxyCapability(result *JobResult) bool {
+	return result != nil && (strings.TrimSpace(result.ProxyURL) != "" || strings.TrimSpace(result.ProxyToken) != "")
 }
 
 func proxyResultAccountID(job *Job, result *JobResult) string {
@@ -1448,14 +1461,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, proxyInvalidLinkError)
 		return
 	}
-	// Defense in depth: a CDK that may not use 中转 cannot pull files through the
-	// proxy even with a valid token (its results normally carry no proxy URL).
+	// Defense in depth: a user job created without 中转 permission cannot pull
+	// files through the proxy even with a valid token.
 	if !s.jobAllowsProxy(job) {
 		writeError(w, http.StatusForbidden, proxyInvalidLinkError)
 		return
 	}
 
-	// A job may carry a single result (admin path) or many (CDK-user batch). The
+	// A job may carry a single result (admin path) or many (user batch). The
 	// proxy token in the URL selects which file this request is for.
 	providedToken := strings.TrimSpace(r.URL.Query().Get("token"))
 	result := job.resultForToken(providedToken)
@@ -1468,6 +1481,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, proxyInvalidLinkError)
 			return
 		}
+	}
+	if job.CDKCode != "" && !job.ProxyAllowed && !resultHasProxyCapability(result) {
+		writeError(w, http.StatusForbidden, proxyInvalidLinkError)
+		return
 	}
 	if status, ok := s.cachedProxyFailure(jobID, providedToken); ok {
 		writeError(w, status, proxyDownloadFailedError)
@@ -2151,22 +2168,14 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 			return
 		}
 
-		// A CDK traffic overdraw is deterministic and not the account's fault:
-		// retrying on other accounts would just repeat the expensive transfer and
-		// hit the same refusal. Fail the job terminally instead.
-		var overdraw errCDKOverdraw
+		// A user quota refusal is deterministic and not the account's fault:
+		// retrying on other accounts would repeat the expensive transfer and hit
+		// the same refusal. Fail the job terminally instead.
 		var userOverdraw errUserQuotaOverdraw
-		if errors.As(err, &overdraw) || errors.As(err, &userOverdraw) {
+		if errors.As(err, &userOverdraw) || errors.Is(err, errUserQuotaExhausted) {
 			s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
 			s.finishAccountAttempt(jobID, account.ID, "failed", err.Error())
 			s.logJob(LogWarn, jobID, "resolved file exceeds remaining user quota", err.Error())
-			s.failJob(jobID, err)
-			return
-		}
-		if isCDKRefusalError(err) {
-			s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
-			s.finishAccountAttempt(jobID, account.ID, "failed", safeUserError(err.Error()))
-			s.logJob(LogWarn, jobID, "CDK refused the resolved file", safeUserError(err.Error()))
 			s.failJob(jobID, err)
 			return
 		}
@@ -2539,47 +2548,35 @@ func (s *Server) finishWithItems(ctx context.Context, jobID string, account Acco
 		s.logJob(LogWarn, jobID, fmt.Sprintf("检测到 %d 个可用文件，需要选择目标文件", len(items)), sampleItemDetail(items))
 		return s.requestSelection(jobID, StageResultSelection, "choose which file should become the final link", items, account.ID)
 	}
-	if err := s.cdkOverdrawError(jobID, items[0]); err != nil {
+	if err := s.jobQuotaError(jobID, items[0]); err != nil {
 		return err
 	}
 	return s.completeJob(ctx, jobID, account, items[0])
 }
 
-// cdkOverdrawError returns a typed quota error when a user/legacy CDK job's
-// resolved file is larger than the remaining quota. Admin jobs and lookups that
-// fail never block (the charge step still validates as a backstop).
-func (s *Server) cdkOverdrawError(jobID string, item DownloadItem) error {
+// jobQuotaError returns a typed quota error when a user's resolved file is
+// larger than the remaining quota. Admin jobs do not consume user quota.
+func (s *Server) jobQuotaError(jobID string, item DownloadItem) error {
 	job := mustJob(s.jobs.get(jobID))
-	if job.UserID == "" && job.CDKCode == "" {
+	if job.UserID == "" {
 		return nil
 	}
 	size := parseBytes(item.Size)
-	if job.UserID != "" && s.users != nil {
+	if s.users != nil {
 		return s.users.hasQuota(job.UserID, size, job.Mode == "proxy", s.now())
-	}
-	c, ok, err := s.cdk.get(job.CDKCode)
-	if err == nil && ok && size > c.RemainingBytes {
-		return errCDKOverdraw{size: size, remaining: c.RemainingBytes}
 	}
 	return nil
 }
 
-func isCDKRefusalError(err error) bool {
+func isQuotaRefusalError(err error) bool {
 	if err == nil {
 		return false
-	}
-	var overdraw errCDKOverdraw
-	if errors.As(err, &overdraw) {
-		return true
 	}
 	var userOverdraw errUserQuotaOverdraw
 	if errors.As(err, &userOverdraw) {
 		return true
 	}
-	return errors.Is(err, errCDKNotFound) ||
-		errors.Is(err, errCDKExpired) ||
-		errors.Is(err, errCDKExhausted) ||
-		errors.Is(err, errUserQuotaExhausted)
+	return errors.Is(err, errUserQuotaExhausted)
 }
 
 func (s *Server) requestSelection(jobID string, stage JobStage, message string, items []DownloadItem, accountID string) error {
@@ -2615,7 +2612,7 @@ func (s *Server) resolveExistingFile(ctx context.Context, jobID string, item Dow
 	}
 
 	if err := s.completeJob(ctx, jobID, account, item); err != nil {
-		if isCDKRefusalError(err) {
+		if isQuotaRefusalError(err) {
 			s.failJob(jobID, err)
 			return
 		}
@@ -2638,7 +2635,7 @@ func (s *Server) resolveExistingFiles(ctx context.Context, jobID string, items [
 	}
 
 	if err := s.completeJobBatch(ctx, jobID, account, items); err != nil {
-		if isCDKRefusalError(err) {
+		if isQuotaRefusalError(err) {
 			s.failJob(jobID, err)
 			return
 		}
@@ -2698,7 +2695,7 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 	reservedBytes = 0
 	s.logJob(LogSuccess, jobID, "解析任务完成", "文件："+firstNonEmpty(result.File.Name, result.File.Path))
 	s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(size))
-	s.saveCDKHistory(jobID)
+	s.saveResolveHistory(jobID)
 	return nil
 }
 
@@ -2736,8 +2733,7 @@ func (s *Server) resolveFileLink(ctx context.Context, jobID string, account Acco
 		AccountID: account.ID,
 	}
 	// Only mint a proxy (中转) link when the job is permitted to use it: admin
-	// jobs always, CDK jobs only if their CDK allows it. No-proxy CDK results
-	// then carry only a direct link, and the frontend hides the proxy row.
+	// jobs always, user jobs only when their subscription grants it.
 	if s.jobAllowsProxy(job) {
 		proxyToken, err := newJobID()
 		if err != nil {
@@ -2754,11 +2750,11 @@ func (s *Server) resolveFileLink(ctx context.Context, jobID string, account Acco
 }
 
 // completeJobBatch resolves a direct link for each selected file, accumulates
-// them into Job.Results, cleans up once, and charges the CDK the summed size.
-// It backs the CDK-user multi-select flow. A single GetFile failure aborts the
+// them into Job.Results, cleans up once, and settles the summed user quota.
+// It backs the user multi-select flow. A single GetFile failure aborts the
 // whole batch (the job fails) rather than delivering a partial set.
 func (s *Server) completeJobBatch(ctx context.Context, jobID string, account AccountRuntime, items []DownloadItem) error {
-	// Gate the summed size against the CDK's remaining traffic before doing any
+	// Reserve the summed size before doing any
 	// expensive link resolution. The user-select path is already pre-gated in
 	// applyItemsSelection; this also covers the batch-child path, which resolves
 	// every file unattended and would otherwise overdraw.
@@ -2781,14 +2777,6 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 				}
 			}
 		}()
-	} else if cdkCode := job.CDKCode; cdkCode != "" {
-		var sum int64
-		for _, item := range items {
-			sum += parseBytes(item.Size)
-		}
-		if c, ok, err := s.cdk.get(cdkCode); err == nil && ok && sum > c.RemainingBytes {
-			return errCDKOverdraw{size: sum, remaining: c.RemainingBytes}
-		}
 	}
 
 	results := make([]JobResult, 0, len(items))
@@ -2826,7 +2814,7 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 	reservedBytes = 0
 	s.logJob(LogSuccess, jobID, fmt.Sprintf("解析任务完成，共 %d 个文件", len(results)))
 	s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(totalSize))
-	s.saveCDKHistory(jobID)
+	s.saveResolveHistory(jobID)
 	return nil
 }
 
@@ -2898,13 +2886,6 @@ func (s *Server) finalizeCompletedJob(jobID string, account AccountRuntime, resu
 			} else if settledBytes != chargedBytes {
 				return fmt.Errorf("quota reservation settled %d bytes, want %d", settledBytes, chargedBytes)
 			}
-		} else if job.CDKCode != "" {
-			if s.cdk == nil {
-				return errors.New("CDK storage is not configured")
-			}
-			if err := s.cdk.chargeIfEnoughTx(tx, job.CDKCode, chargedBytes, now); err != nil {
-				return err
-			}
 		}
 		if err := traffic.writeTx(tx); err != nil {
 			return err
@@ -2912,7 +2893,7 @@ func (s *Server) finalizeCompletedJob(jobID string, account AccountRuntime, resu
 		return s.tempCleanups.recordTx(tx, jobID, account.ID, cleanupIDs, cleanupAfter, now)
 	})
 	if err != nil {
-		if errors.Is(err, errJobAlreadyCompleted) || isCDKRefusalError(err) {
+		if errors.Is(err, errJobAlreadyCompleted) || isQuotaRefusalError(err) {
 			return err
 		}
 		return wrapJobPersistenceError("persist completed job", err)

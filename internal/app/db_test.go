@@ -9,10 +9,9 @@ import (
 	"time"
 )
 
-// TestMigrateLegacyCDKToTraffic verifies the one-time rebuild of a count-based
-// cdks table into the traffic-based schema: each credit becomes 2 GiB, and the
-// migration is idempotent (running it again is a no-op).
-func TestMigrateLegacyCDKToTraffic(t *testing.T) {
+// TestMigrateLegacyCDKToCredential verifies that each unused legacy credit
+// becomes 2 GiB of grant snapshot without carrying the old used counter over.
+func TestMigrateLegacyCDKToCredential(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -39,36 +38,35 @@ func TestMigrateLegacyCDKToTraffic(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
-	// Columns should now be the byte-based schema.
+	// Columns should now be the credential-only schema.
 	hasLegacy, _ := columnExists(db, "cdks", "remaining")
-	hasBytes, _ := columnExists(db, "cdks", "remaining_bytes")
-	if hasLegacy || !hasBytes {
-		t.Fatalf("schema not rebuilt: legacy=%v bytes=%v", hasLegacy, hasBytes)
+	hasGrant, _ := columnExists(db, "cdks", "grant_bytes")
+	if hasLegacy || !hasGrant {
+		t.Fatalf("schema not rebuilt: legacy=%v grant=%v", hasLegacy, hasGrant)
 	}
 
-	var remaining, used int64
-	if err := db.QueryRow(`SELECT remaining_bytes, used_bytes FROM cdks WHERE code='OLD1'`).Scan(&remaining, &used); err != nil {
+	var grant int64
+	if err := db.QueryRow(`SELECT grant_bytes FROM cdks WHERE code='OLD1'`).Scan(&grant); err != nil {
 		t.Fatalf("scan migrated row: %v", err)
 	}
-	if remaining != 5*legacyCDKBytesPerCredit || used != 2*legacyCDKBytesPerCredit {
-		t.Fatalf("converted wrong: remaining=%d used=%d (want %d/%d)",
-			remaining, used, 5*legacyCDKBytesPerCredit, 2*legacyCDKBytesPerCredit)
+	if grant != 5*legacyCDKBytesPerCredit {
+		t.Fatalf("converted grant=%d, want %d", grant, 5*legacyCDKBytesPerCredit)
 	}
 
 	// Idempotent: a second pass leaves the data untouched.
 	if err := migrate(db); err != nil {
 		t.Fatalf("second migrate: %v", err)
 	}
-	if err := db.QueryRow(`SELECT remaining_bytes FROM cdks WHERE code='OLD1'`).Scan(&remaining); err != nil {
+	if err := db.QueryRow(`SELECT grant_bytes FROM cdks WHERE code='OLD1'`).Scan(&grant); err != nil {
 		t.Fatalf("scan after second migrate: %v", err)
 	}
-	if remaining != 5*legacyCDKBytesPerCredit {
-		t.Fatalf("second migrate changed data: remaining=%d", remaining)
+	if grant != 5*legacyCDKBytesPerCredit {
+		t.Fatalf("second migrate changed data: grant=%d", grant)
 	}
 }
 
 // TestMigrateFreshDBUsesNewSchema confirms a brand-new database is created
-// directly on the traffic schema (no legacy columns, no rebuild).
+// directly on the credential schema (no live quota columns).
 func TestMigrateFreshDBUsesNewSchema(t *testing.T) {
 	db, err := openDatabase(":memory:")
 	if err != nil {
@@ -76,14 +74,24 @@ func TestMigrateFreshDBUsesNewSchema(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	if has, _ := columnExists(db, "cdks", "remaining_bytes"); !has {
-		t.Fatal("fresh db missing remaining_bytes column")
+	if has, _ := columnExists(db, "cdks", "grant_bytes"); !has {
+		t.Fatal("fresh db missing grant_bytes column")
 	}
 	if has, _ := columnExists(db, "cdks", "remaining"); has {
 		t.Fatal("fresh db should not have legacy remaining column")
 	}
+	if has, _ := columnExists(db, "cdks", "remaining_bytes"); has {
+		t.Fatal("fresh db should not store subscription remaining_bytes")
+	}
+	assertPureCDKColumns(t, db)
 	if has, _ := columnExists(db, "user_subscriptions", "quota_generation"); !has {
 		t.Fatal("fresh db missing user_subscriptions.quota_generation")
+	}
+	if has, _ := columnExists(db, "user_subscriptions", "revision"); !has {
+		t.Fatal("fresh db missing user_subscriptions.revision")
+	}
+	if has, _ := columnExists(db, "user_subscriptions", "terminated_at"); !has {
+		t.Fatal("fresh db missing user_subscriptions.terminated_at")
 	}
 	if has, _ := columnExists(db, "user_quota_reservations", "quota_generation"); !has {
 		t.Fatal("fresh db missing user_quota_reservations.quota_generation")
@@ -92,12 +100,17 @@ func TestMigrateFreshDBUsesNewSchema(t *testing.T) {
 	if err := db.QueryRow(
 		`SELECT COUNT(*) FROM sqlite_master
 		 WHERE type='index'
-		   AND name IN ('idx_user_subscriptions_source_cdk', 'idx_user_quota_reservations_subscription')`,
+		   AND name IN (
+		       'idx_user_subscriptions_source_cdk',
+		       'idx_user_quota_reservations_subscription',
+		       'idx_users_created_id',
+		       'idx_user_subscriptions_user_timeline'
+		   )`,
 	).Scan(&quotaIndexes); err != nil {
 		t.Fatalf("count quota indexes: %v", err)
 	}
-	if quotaIndexes != 2 {
-		t.Fatalf("quota indexes = %d, want 2", quotaIndexes)
+	if quotaIndexes != 4 {
+		t.Fatalf("quota indexes = %d, want 4", quotaIndexes)
 	}
 }
 

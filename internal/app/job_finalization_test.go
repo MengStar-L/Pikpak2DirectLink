@@ -37,20 +37,36 @@ func TestFinalizeCompletedJobCommitsAllLedgersAtomically(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cdk := newCDKStore(db)
-			codes, err := cdk.createBatch(1, 500, 1, true, now)
-			if err != nil {
+			userID := "usr_atomic"
+			if _, err := db.Exec(
+				`INSERT INTO users(id, email, display_name, avatar_url, disabled, created_at, updated_at)
+				 VALUES(?,?,?,?,?,?,?)`,
+				userID, "atomic@example.com", "Atomic User", "", 0, now.Unix(), now.Unix(),
+			); err != nil {
 				t.Fatal(err)
 			}
+			subscriptionID := "sub_atomic"
+			if _, err := db.Exec(
+				`INSERT INTO user_subscriptions
+				 (id, user_id, source_cdk_code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy)
+				 VALUES(?,?,?,?,?,?,?,?)`,
+				subscriptionID, userID, nil, 500, 0, now.Add(24*time.Hour).Unix(), now.Unix(), 1,
+			); err != nil {
+				t.Fatal(err)
+			}
+			users := newUserStore(db)
 			durable := newSQLJobStore(db, cipher)
 			jobs := newJobStore(20, durable)
 			job := &Job{
 				ID: "atomic-job", Kind: ResourceMagnet, Mode: "proxy", Status: JobRunning,
-				Stage: StageTransfer, CDKCode: codes[0].Code, AccountID: account.ID,
+				Stage: StageTransfer, UserID: userID, ProxyAllowed: true, AccountID: account.ID,
 				TempAccountID: account.ID, TempIDs: []string{"temporary-file-id"},
 				CreatedAt: now, UpdatedAt: now,
 			}
 			if err := jobs.create(job); err != nil {
+				t.Fatal(err)
+			}
+			if err := users.reserveQuota(job.ID, userID, 100, true, now); err != nil {
 				t.Fatal(err)
 			}
 			cleanups := newProxyTempCleanupStore(db, cipher)
@@ -64,15 +80,18 @@ func TestFinalizeCompletedJobCommitsAllLedgersAtomically(t *testing.T) {
 			}
 			server := &Server{
 				db: db, jobs: jobs, durableJobs: durable, accounts: accounts,
-				accountStore: accountStore, cdk: cdk, tempCleanups: cleanups,
+				accountStore: accountStore, users: users, tempCleanups: cleanups,
 				nowFunc: func() time.Time { return now },
 			}
 			result := &JobResult{File: DownloadItem{ID: "temporary-file-id", Size: "100"}}
 			err = server.finalizeCompletedJob(job.ID, AccountRuntime{ID: account.ID}, result, nil, 100, result.File.ID)
 
-			storedCDK, ok, getErr := cdk.get(codes[0].Code)
-			if getErr != nil || !ok {
-				t.Fatalf("get CDK: ok=%v err=%v", ok, getErr)
+			var remaining, used int64
+			if err := db.QueryRow(
+				`SELECT remaining_bytes, used_bytes FROM user_subscriptions WHERE id=?`,
+				subscriptionID,
+			).Scan(&remaining, &used); err != nil {
+				t.Fatal(err)
 			}
 			storedAccounts, listErr := accountStore.List()
 			if listErr != nil {
@@ -91,20 +110,20 @@ func TestFinalizeCompletedJobCommitsAllLedgersAtomically(t *testing.T) {
 				if err == nil {
 					t.Fatal("finalization succeeded despite cleanup trigger")
 				}
-				if storedCDK.RemainingBytes != 500 || storedAccounts[0].TrafficUsed != 0 ||
+				if remaining != 400 || used != 0 || storedAccounts[0].TrafficUsed != 0 ||
 					storedJob.Status != JobRunning || cleanupCount != 1 {
-					t.Fatalf("partial commit: cdk=%d traffic=%d job=%s cleanups=%d",
-						storedCDK.RemainingBytes, storedAccounts[0].TrafficUsed, storedJob.Status, cleanupCount)
+					t.Fatalf("partial commit: remaining=%d used=%d traffic=%d job=%s cleanups=%d",
+						remaining, used, storedAccounts[0].TrafficUsed, storedJob.Status, cleanupCount)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("finalizeCompletedJob: %v", err)
 			}
-			if storedCDK.RemainingBytes != 400 || storedAccounts[0].TrafficUsed != 100 ||
+			if remaining != 400 || used != 100 || storedAccounts[0].TrafficUsed != 100 ||
 				storedJob.Status != JobCompleted || storedJob.ChargedBytes != 100 || cleanupCount != 1 {
-				t.Fatalf("incomplete commit: cdk=%d traffic=%d job=%s charged=%d cleanups=%d",
-					storedCDK.RemainingBytes, storedAccounts[0].TrafficUsed, storedJob.Status,
+				t.Fatalf("incomplete commit: remaining=%d used=%d traffic=%d job=%s charged=%d cleanups=%d",
+					remaining, used, storedAccounts[0].TrafficUsed, storedJob.Status,
 					storedJob.ChargedBytes, cleanupCount)
 			}
 			var encryptedIDs string
@@ -119,13 +138,18 @@ func TestFinalizeCompletedJobCommitsAllLedgersAtomically(t *testing.T) {
 			if !errors.Is(secondErr, errJobAlreadyCompleted) {
 				t.Fatalf("second finalization error = %v, want errJobAlreadyCompleted", secondErr)
 			}
-			storedCDK, _, _ = cdk.get(codes[0].Code)
+			if err := db.QueryRow(
+				`SELECT remaining_bytes, used_bytes FROM user_subscriptions WHERE id=?`,
+				subscriptionID,
+			).Scan(&remaining, &used); err != nil {
+				t.Fatal(err)
+			}
 			storedAccounts, err = accountStore.List()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if storedCDK.RemainingBytes != 400 || storedAccounts[0].TrafficUsed != 100 {
-				t.Fatalf("duplicate charge: cdk=%d traffic=%d", storedCDK.RemainingBytes, storedAccounts[0].TrafficUsed)
+			if remaining != 400 || used != 100 || storedAccounts[0].TrafficUsed != 100 {
+				t.Fatalf("duplicate charge: remaining=%d used=%d traffic=%d", remaining, used, storedAccounts[0].TrafficUsed)
 			}
 		})
 	}

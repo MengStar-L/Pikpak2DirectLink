@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { Ticket, ExternalLink, Trash2, Plus, Inbox } from 'lucide-vue-next'
+import { Ticket, ExternalLink, Plus, Inbox } from 'lucide-vue-next'
 import GlassCard from '../GlassCard.vue'
 import PrimaryButton from '../PrimaryButton.vue'
 import CdkCard from '../CdkCard.vue'
@@ -9,6 +9,8 @@ import { api } from '../../lib/api'
 import { copyText } from '../../lib/clipboard'
 import { toast } from '../../composables/useToast'
 import type { CDKView } from '../../lib/types'
+
+const emit = defineEmits<{ (e: 'open-user', userID: string): void }>()
 
 const cdks = ref<CDKView[]>([])
 const loading = ref(true)
@@ -57,22 +59,12 @@ async function generate() {
   }
 }
 
-async function purgeExpired() {
-  try {
-    const { deleted } = await api.cdks.deleteExpired()
-    toast(deleted ? `已清理 ${deleted} 个过期 CDK` : '没有过期 CDK', 'success')
-    await load()
-  } catch (e: any) {
-    toast(e?.message || '清理失败', 'error')
-  }
-}
-
 async function action(code: string, kind: 'update' | 'delete', payload?: { traffic_gb: number; days: number; allow_proxy: boolean }) {
   busyCode.value = code
   try {
     if (kind === 'update' && payload) await api.cdks.update(code, payload)
     else if (kind === 'delete') await api.cdks.remove(code)
-    toast(kind === 'delete' ? '已撤销 CDK' : '已重置额度', 'success')
+    toast(kind === 'delete' ? '已撤销 CDK' : '凭证已更新', 'success')
     await load()
   } catch (e: any) {
     toast(e?.message || '操作失败', 'error')
@@ -91,11 +83,10 @@ defineExpose({ refresh: load })
       <div class="sec-head mb">
         <div class="sec-title">
           <span class="sec-glyph"><Ticket /></span>
-          <div><span class="eyebrow">cdk</span><h2>CDK 分发</h2><p>生成兑换码，用户登录后兑换为空间订阅</p></div>
+          <div><span class="eyebrow">cdk</span><h2>CDK 凭证</h2><p>生成核销凭证，权益以用户订阅为准</p></div>
         </div>
         <div class="head-actions">
           <a class="link-btn" href="/u" target="_blank" rel="noreferrer noopener"><ExternalLink />用户入口</a>
-          <PrimaryButton variant="line" size="sm" @click="purgeExpired"><template #icon><Trash2 /></template>清理过期</PrimaryButton>
         </div>
       </div>
       <form class="gen-form" @submit.prevent="generate">
@@ -120,6 +111,7 @@ defineExpose({ refresh: load })
           :busy="busyCode === c.code"
           @update="(code, gb, days, allowProxy) => action(code, 'update', { traffic_gb: gb, days, allow_proxy: allowProxy })"
           @delete="(code) => action(code, 'delete')"
+          @open-user="(userID) => emit('open-user', userID)"
         />
       </template>
       <GlassCard v-else>

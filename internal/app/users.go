@@ -24,6 +24,7 @@ var (
 	errInvalidCredentials = errors.New("invalid email or password")
 	errVoucherRedeemed    = errors.New("CDK has already been redeemed")
 	errVoucherRevoked     = errors.New("CDK has been revoked")
+	errVoucherDuration    = errors.New("CDK duration exceeds the supported range")
 	errUserQuotaExhausted = errors.New("user quota exhausted")
 )
 
@@ -68,6 +69,8 @@ type UserSubscription struct {
 	DaysLeft       int    `json:"days_left"`
 	Expired        bool   `json:"expired"`
 	AllowProxy     bool   `json:"allow_proxy"`
+	Revision       int64  `json:"revision"`
+	TerminatedAt   string `json:"terminated_at,omitempty"`
 }
 
 type UserQuota struct {
@@ -347,7 +350,8 @@ func (s *userStore) userForSession(token string, now time.Time) (User, bool, err
 
 func (s *userStore) listSubscriptions(userID string, now time.Time) ([]UserSubscription, error) {
 	rows, err := s.db.Query(
-		`SELECT id, user_id, COALESCE(source_cdk_code, ''), remaining_bytes, used_bytes, expires_at, created_at, allow_proxy
+		`SELECT id, user_id, COALESCE(source_cdk_code, ''), remaining_bytes, used_bytes, expires_at, created_at,
+		        allow_proxy, revision, terminated_at
 		 FROM user_subscriptions
 		 WHERE user_id=?
 		 ORDER BY expires_at ASC, created_at ASC, id`,
@@ -376,7 +380,7 @@ func (s *userStore) quota(userID string, now time.Time) (UserQuota, []UserSubscr
 	}
 	var quota UserQuota
 	for _, sub := range subs {
-		if sub.Expired || sub.RemainingBytes <= 0 {
+		if sub.TerminatedAt != "" || sub.Expired || sub.RemainingBytes <= 0 {
 			continue
 		}
 		quota.TotalRemainingBytes += sub.RemainingBytes
@@ -409,7 +413,7 @@ func (s *userStore) hasQuota(userID string, bytes int64, requireProxy bool, now 
 func (s *userStore) remainingQuota(userID string, requireProxy bool, now time.Time) (int64, error) {
 	query := `SELECT COALESCE(SUM(remaining_bytes), 0)
 		FROM user_subscriptions
-		WHERE user_id=? AND expires_at>? AND remaining_bytes>0`
+		WHERE user_id=? AND expires_at>? AND remaining_bytes>0 AND terminated_at IS NULL`
 	args := []any{strings.TrimSpace(userID), now.Unix()}
 	if requireProxy {
 		query += ` AND allow_proxy=1`
@@ -442,7 +446,7 @@ func (s *userStore) chargeIfEnoughTx(tx *sql.Tx, userID string, bytes int64, req
 	}
 	query := `SELECT id, remaining_bytes
 		FROM user_subscriptions
-		WHERE user_id=? AND expires_at>? AND remaining_bytes>0`
+		WHERE user_id=? AND expires_at>? AND remaining_bytes>0 AND terminated_at IS NULL`
 	args := []any{strings.TrimSpace(userID), now.Unix()}
 	if requireProxy {
 		query += ` AND allow_proxy=1`
@@ -489,8 +493,8 @@ func (s *userStore) chargeIfEnoughTx(tx *sql.Tx, userID string, bytes int64, req
 		}
 		if _, err := tx.Exec(
 			`UPDATE user_subscriptions
-			 SET remaining_bytes=remaining_bytes-?, used_bytes=used_bytes+?
-			 WHERE id=? AND remaining_bytes>=?`,
+			 SET remaining_bytes=remaining_bytes-?, used_bytes=used_bytes+?, revision=revision+1
+			 WHERE id=? AND remaining_bytes>=? AND terminated_at IS NULL`,
 			take, take, b.id, take,
 		); err != nil {
 			return err
@@ -516,8 +520,7 @@ func (s *userStore) redeemCDK(userID, code string, now time.Time) (UserSubscript
 	defer tx.Rollback()
 
 	var (
-		remaining    int64
-		used         int64
+		grantBytes   int64
 		createdAt    int64
 		allowProxy   int
 		durationDays int
@@ -526,10 +529,10 @@ func (s *userStore) redeemCDK(userID, code string, now time.Time) (UserSubscript
 		revokedAt    sql.NullInt64
 	)
 	err = tx.QueryRow(
-		`SELECT remaining_bytes, used_bytes, created_at, allow_proxy, duration_days, redeemed_by_user_id, redeemed_at, revoked_at
+		`SELECT grant_bytes, created_at, allow_proxy, duration_days, redeemed_by_user_id, redeemed_at, revoked_at
 		 FROM cdks WHERE code=?`,
 		code,
-	).Scan(&remaining, &used, &createdAt, &allowProxy, &durationDays, &redeemedBy, &redeemedAt, &revokedAt)
+	).Scan(&grantBytes, &createdAt, &allowProxy, &durationDays, &redeemedBy, &redeemedAt, &revokedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return UserSubscription{}, errCDKNotFound
 	}
@@ -542,11 +545,14 @@ func (s *userStore) redeemCDK(userID, code string, now time.Time) (UserSubscript
 	if redeemedAt.Valid && redeemedAt.Int64 > 0 {
 		return UserSubscription{}, errVoucherRedeemed
 	}
-	if remaining <= 0 {
+	if grantBytes <= 0 {
 		return UserSubscription{}, errCDKExhausted
 	}
 	if durationDays < 1 {
 		durationDays = 1
+	}
+	if !cdkDurationDaysSupported(durationDays) {
+		return UserSubscription{}, errVoucherDuration
 	}
 
 	nowUnix := now.Unix()
@@ -555,22 +561,26 @@ func (s *userStore) redeemCDK(userID, code string, now time.Time) (UserSubscript
 		ID:             newSubscriptionID(),
 		UserID:         userID,
 		SourceCDKCode:  code,
-		RemainingBytes: remaining,
+		RemainingBytes: grantBytes,
 		UsedBytes:      0,
 		AllowProxy:     allowProxy != 0,
+		Revision:       1,
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO user_subscriptions(id, user_id, source_cdk_code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy)
-		 VALUES(?,?,?,?,?,?,?,?)`,
-		sub.ID, userID, code, remaining, 0, expiresAt, nowUnix, allowProxy,
+		`INSERT INTO user_subscriptions
+		 (id, user_id, source_cdk_code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy, revision)
+		 VALUES(?,?,?,?,?,?,?,?,1)`,
+		sub.ID, userID, code, grantBytes, 0, expiresAt, nowUnix, allowProxy,
 	); err != nil {
 		return UserSubscription{}, err
 	}
 	res, err := tx.Exec(
 		`UPDATE cdks
-		 SET redeemed_by_user_id=?, redeemed_at=?, expires_at=?
-		 WHERE code=? AND redeemed_at IS NULL AND revoked_at IS NULL`,
-		userID, nowUnix, expiresAt, code,
+		 SET redeemed_by_user_id=?, redeemed_at=?
+		 WHERE code=?
+		   AND (redeemed_at IS NULL OR redeemed_at=0)
+		   AND (revoked_at IS NULL OR revoked_at=0)`,
+		userID, nowUnix, code,
 	)
 	if err != nil {
 		return UserSubscription{}, err
@@ -581,8 +591,8 @@ func (s *userStore) redeemCDK(userID, code string, now time.Time) (UserSubscript
 	if err := tx.Commit(); err != nil {
 		return UserSubscription{}, err
 	}
-	sub.ExpiresAt = time.Unix(expiresAt, 0).Format(time.RFC3339)
-	sub.CreatedAt = time.Unix(nowUnix, 0).Format(time.RFC3339)
+	sub.ExpiresAt = formatUnixRFC3339(expiresAt)
+	sub.CreatedAt = formatUnixRFC3339(nowUnix)
 	sub.DaysLeft = durationDays
 	sub.RemainingLabel = formatTrafficLabel(sub.RemainingBytes)
 	sub.UsedLabel = formatTrafficLabel(sub.UsedBytes)
@@ -640,7 +650,19 @@ func scanUserSubscription(scanner subscriptionScanner, now time.Time) (UserSubsc
 	var allow int
 	var expiresAt int64
 	var createdAt int64
-	if err := scanner.Scan(&sub.ID, &sub.UserID, &sub.SourceCDKCode, &sub.RemainingBytes, &sub.UsedBytes, &expiresAt, &createdAt, &allow); err != nil {
+	var terminatedAt sql.NullInt64
+	if err := scanner.Scan(
+		&sub.ID,
+		&sub.UserID,
+		&sub.SourceCDKCode,
+		&sub.RemainingBytes,
+		&sub.UsedBytes,
+		&expiresAt,
+		&createdAt,
+		&allow,
+		&sub.Revision,
+		&terminatedAt,
+	); err != nil {
 		return UserSubscription{}, err
 	}
 	sub.AllowProxy = allow != 0
@@ -648,8 +670,11 @@ func scanUserSubscription(scanner subscriptionScanner, now time.Time) (UserSubsc
 	if !sub.Expired {
 		sub.DaysLeft = int((expiresAt - now.Unix() + 86399) / 86400)
 	}
-	sub.ExpiresAt = time.Unix(expiresAt, 0).Format(time.RFC3339)
-	sub.CreatedAt = time.Unix(createdAt, 0).Format(time.RFC3339)
+	sub.ExpiresAt = formatUnixRFC3339(expiresAt)
+	sub.CreatedAt = formatUnixRFC3339(createdAt)
+	if terminatedAt.Valid {
+		sub.TerminatedAt = formatUnixRFC3339(terminatedAt.Int64)
+	}
 	sub.RemainingLabel = formatTrafficLabel(sub.RemainingBytes)
 	sub.UsedLabel = formatTrafficLabel(sub.UsedBytes)
 	return sub, nil

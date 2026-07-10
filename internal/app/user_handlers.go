@@ -422,7 +422,7 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 
 	lines := splitResourceLineSpecs(req.Input)
 	if len(lines) > 1 {
-		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, "", user.ID, priorityUser, s.baseURL(r))
+		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, user.ID, priorityUser, s.baseURL(r))
 		if status != 0 {
 			if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
 				w.Header().Set("Retry-After", "30")

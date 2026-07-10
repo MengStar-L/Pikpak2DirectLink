@@ -199,6 +199,42 @@ func TestProxyErrorsDoNotExposeInternalDetails(t *testing.T) {
 	}
 }
 
+func TestLegacyCDKJobProxyUsesPersistedCapability(t *testing.T) {
+	server := &Server{jobs: newJobStore(10)}
+	legacyDirect := &Job{
+		ID:      "legacy-cdk-direct",
+		CDKCode: "LEGACY-DIRECT",
+		Status:  JobCompleted,
+		Result: &JobResult{
+			File:      DownloadItem{ID: "legacy-file"},
+			DirectURL: "https://example.com/direct",
+		},
+	}
+	if err := server.jobs.create(legacyDirect); err != nil {
+		t.Fatalf("create legacy job: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/proxy/legacy-cdk-direct", nil)
+	req.SetPathValue("id", legacyDirect.ID)
+	rec := httptest.NewRecorder()
+	server.handleProxy(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("legacy direct-only proxy status = %d body=%s, want 403", rec.Code, rec.Body.String())
+	}
+
+	admin := &Job{ID: "admin"}
+	if !server.jobAllowsProxy(admin) {
+		t.Fatal("admin job unexpectedly lost proxy access")
+	}
+	legacyProxy := &Job{
+		ID:      "legacy-cdk-proxy",
+		CDKCode: "LEGACY-PROXY",
+		Result:  &JobResult{ProxyURL: "/proxy/legacy-cdk-proxy?token=stored", ProxyToken: "stored"},
+	}
+	if !server.jobAllowsProxy(legacyProxy) {
+		t.Fatal("legacy job with a persisted proxy capability was denied")
+	}
+}
+
 func TestProxyRefreshesExpiredDirectURLBeforeDownload(t *testing.T) {
 	now := time.Now()
 	payload := []byte("fresh payload")

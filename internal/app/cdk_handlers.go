@@ -10,7 +10,12 @@ import (
 	"time"
 )
 
-// --- shared job-selection helper (used by admin and CDK-user endpoints) ---
+const (
+	maxCDKTrafficGB    = int64(^uint64(0)>>1) / bytesPerGB
+	maxCDKDurationDays = int64(^uint64(0)>>1) / int64(24*time.Hour)
+)
+
+// --- shared job-selection helper (used by admin and registered-user endpoints) ---
 
 type selectionUpdateError struct {
 	status  int
@@ -40,12 +45,6 @@ func (s *Server) jobQuotaSelectionError(job *Job, size int64) error {
 	if job.UserID != "" && s.users != nil {
 		return s.users.hasQuota(job.UserID, size, job.Mode == "proxy", s.now())
 	}
-	if job.CDKCode != "" && s.cdk != nil {
-		c, ok, err := s.cdk.get(job.CDKCode)
-		if err == nil && ok && size > c.RemainingBytes {
-			return errCDKOverdraw{size: size, remaining: c.RemainingBytes}
-		}
-	}
 	return nil
 }
 
@@ -53,10 +52,6 @@ func quotaSelectionMessage(err error) string {
 	var userOverdraw errUserQuotaOverdraw
 	if errors.As(err, &userOverdraw) {
 		return "Selected files exceed remaining quota."
-	}
-	var cdkOverdraw errCDKOverdraw
-	if errors.As(err, &cdkOverdraw) {
-		return "Selected files exceed remaining CDK traffic."
 	}
 	if errors.Is(err, errUserQuotaExhausted) {
 		return "User quota has been used up."
@@ -159,8 +154,8 @@ func (s *Server) applyItemSelection(jobID, itemID string) (*Job, int, string) {
 }
 
 // applyItemsSelection is the multi-select counterpart of applyItemSelection.
-// It accepts several selected files, gates them against the CDK's remaining
-// traffic as a SUM, and resolves each into its own link.
+// It accepts several selected files, gates their summed size against the user's
+// subscription quota, and resolves each into its own link.
 func (s *Server) applyItemsSelection(jobID string, itemIDs []string) (*Job, int, string) {
 	seen := make(map[string]bool, len(itemIDs))
 	ordered := make([]string, 0, len(itemIDs))
@@ -322,7 +317,6 @@ type updateCDKRequest struct {
 }
 
 func (s *Server) handleListCDKs(w http.ResponseWriter, _ *http.Request) {
-	now := time.Now()
 	cdks, err := s.cdk.list()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -330,7 +324,7 @@ func (s *Server) handleListCDKs(w http.ResponseWriter, _ *http.Request) {
 	}
 	views := make([]cdkView, 0, len(cdks))
 	for _, c := range cdks {
-		views = append(views, toCDKView(c, now))
+		views = append(views, toCDKView(c))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"cdks": views})
 }
@@ -353,13 +347,22 @@ func (s *Server) handleCreateCDKs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "流量额度至少为 1G")
 		return
 	}
+	grantBytes, ok := cdkGrantBytesFromGB(req.TrafficGB)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "流量额度超出支持范围")
+		return
+	}
 	if req.Days < 1 {
 		writeError(w, http.StatusBadRequest, "到期天数至少为 1")
 		return
 	}
+	if !cdkDurationDaysSupported(req.Days) {
+		writeError(w, http.StatusBadRequest, "到期天数超出支持范围")
+		return
+	}
 
 	now := time.Now()
-	created, err := s.cdk.createBatch(req.Count, int64(req.TrafficGB)*bytesPerGB, req.Days, req.AllowProxy, now)
+	created, err := s.cdk.createBatch(req.Count, grantBytes, req.Days, req.AllowProxy, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -367,7 +370,7 @@ func (s *Server) handleCreateCDKs(w http.ResponseWriter, r *http.Request) {
 
 	views := make([]cdkView, 0, len(created))
 	for _, c := range created {
-		views = append(views, toCDKView(c, now))
+		views = append(views, toCDKView(c))
 	}
 	proxyLabel := "否"
 	if req.AllowProxy {
@@ -388,16 +391,25 @@ func (s *Server) handleUpdateCDK(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "流量额度不能为负")
 		return
 	}
+	grantBytes, ok := cdkGrantBytesFromGB(req.TrafficGB)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "流量额度超出支持范围")
+		return
+	}
 	if req.Days < 1 {
 		writeError(w, http.StatusBadRequest, "到期天数至少为 1")
 		return
 	}
+	if !cdkDurationDaysSupported(req.Days) {
+		writeError(w, http.StatusBadRequest, "到期天数超出支持范围")
+		return
+	}
 
 	now := time.Now()
-	updated, ok, err := s.cdk.update(code, int64(req.TrafficGB)*bytesPerGB, req.Days, req.AllowProxy, now)
+	updated, ok, err := s.cdk.update(code, grantBytes, req.Days, req.AllowProxy, now)
 	if err != nil {
-		if errors.Is(err, errVoucherRevoked) {
-			writeError(w, http.StatusConflict, "CDK has been revoked")
+		if errors.Is(err, errVoucherRedeemed) || errors.Is(err, errVoucherRevoked) {
+			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -407,13 +419,28 @@ func (s *Server) handleUpdateCDK(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "CDK 不存在")
 		return
 	}
-	writeJSON(w, http.StatusOK, toCDKView(updated, now))
+	writeJSON(w, http.StatusOK, toCDKView(updated))
+}
+
+func cdkGrantBytesFromGB(trafficGB int) (int64, bool) {
+	if trafficGB < 0 || int64(trafficGB) > maxCDKTrafficGB {
+		return 0, false
+	}
+	return int64(trafficGB) * bytesPerGB, true
+}
+
+func cdkDurationDaysSupported(days int) bool {
+	return days >= 1 && int64(days) <= maxCDKDurationDays
 }
 
 func (s *Server) handleDeleteCDK(w http.ResponseWriter, r *http.Request) {
 	code := normalizeCode(r.PathValue("code"))
 	_, ok, err := s.cdk.revoke(code, time.Now())
 	if err != nil {
+		if errors.Is(err, errVoucherRedeemed) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -424,23 +451,9 @@ func (s *Server) handleDeleteCDK(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }
 
-// handleDeleteExpiredCDKs removes every CDK that has already expired and reports
-// how many were cleared.
-func (s *Server) handleDeleteExpiredCDKs(w http.ResponseWriter, _ *http.Request) {
-	deleted, err := s.cdk.deleteExpired(time.Now())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if deleted > 0 {
-		s.logJob(LogSuccess, "", "已清理过期 CDK", "数量："+itoa(int(deleted)))
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
-}
-
 // --- user portal handlers live in user_handlers.go ---
 
-// userJobView is the CDK-user-facing projection of a Job. It deliberately omits
+// userJobView is the registered-user-facing projection of a Job. It deliberately omits
 // admin-only details such as which PikPak account was used.
 type userJobView struct {
 	ID               string         `json:"id"`
@@ -463,14 +476,14 @@ type userJobView struct {
 	UpdatedAt        time.Time      `json:"updated_at"`
 }
 
-// genericUserJobError is the fallback failure text a CDK user sees. Internal
+// genericUserJobError is the fallback failure text a registered user sees. Internal
 // errors are deliberately collapsed into it because the raw error can embed
 // platform secrets — most notably the PikPak account usernames, which
-// processJob concatenates into the "all accounts failed" error. CDK users must
+// processJob concatenates into the "all accounts failed" error. Registered users must
 // never receive those.
 const genericUserJobError = "解析失败，请稍后重试；如多次失败请联系管理员。"
 
-// toUserJobView is the CDK-user-facing projection of a Job. It deliberately
+// toUserJobView is the registered-user-facing projection of a Job. It deliberately
 // omits admin-only details such as which PikPak account was used, and — for the
 // same reason — never forwards the raw Message or Error, both of which can carry
 // the platform account username. The progress message is reconstructed from the
@@ -541,7 +554,7 @@ func safeUserError(message string) string {
 	return genericUserJobError
 }
 
-// safeUserMessage derives a CDK-user-facing progress string purely from the
+// safeUserMessage derives a registered-user-facing progress string purely from the
 // job's status and stage. The job's internal Message is never exposed because
 // it can embed platform details (e.g. "starting with <account-username>").
 func safeUserMessage(job *Job) string {
