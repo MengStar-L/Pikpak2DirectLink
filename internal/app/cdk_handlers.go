@@ -396,6 +396,10 @@ func (s *Server) handleUpdateCDK(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	updated, ok, err := s.cdk.update(code, int64(req.TrafficGB)*bytesPerGB, req.Days, req.AllowProxy, now)
 	if err != nil {
+		if errors.Is(err, errVoucherRevoked) {
+			writeError(w, http.StatusConflict, "CDK has been revoked")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -515,6 +519,9 @@ func safeUserError(message string) string {
 	}
 	if message == errUserQuotaExhausted.Error() {
 		return "User quota has been used up."
+	}
+	if message == selectionCapacityUserError {
+		return selectionCapacityUserError
 	}
 	lower := strings.ToLower(message)
 	if strings.Contains(lower, "user quota") || strings.Contains(lower, "remaining quota") {

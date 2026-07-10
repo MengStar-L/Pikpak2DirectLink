@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -88,6 +90,26 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 		rawLines = append(rawLines, line.raw)
 	}
 
+	var parent *Job
+	var status int
+	var message string
+	if err := s.admission.withCapacity(userID, len(specs), func() error {
+		parent, status, message = s.createBatchJobAdmitted(specs, cleanLines, rawLines, mode, cdkCode, userID, priority, baseURL)
+		return nil
+	}); err != nil {
+		var limitErr *jobAdmissionError
+		if errors.As(err, &limitErr) {
+			if limitErr.Global || userID == "" {
+				return nil, http.StatusServiceUnavailable, "resolve service is at capacity"
+			}
+			return nil, http.StatusTooManyRequests, "too many active user jobs"
+		}
+		return nil, http.StatusInternalServerError, "failed to admit batch job"
+	}
+	return parent, status, message
+}
+
+func (s *Server) createBatchJobAdmitted(specs []childSpec, cleanLines, rawLines []string, mode, cdkCode, userID string, priority int, baseURL string) (*Job, int, string) {
 	now := time.Now()
 	parentID, err := newJobID()
 	if err != nil {
@@ -193,7 +215,12 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 	if bs == nil {
 		return
 	}
-	child, ok := s.jobs.get(childID)
+	child, ok, readErr := s.jobs.getWithError(childID)
+	if readErr != nil {
+		s.logJob(LogError, parentID, "batch child state read failed", readErr.Error())
+		s.requestRestart()
+		return
+	}
 
 	// Hold bs.mu across the parent update so concurrent children apply their
 	// updates in counter order — otherwise a slower second-to-last child could
@@ -228,7 +255,7 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 	failures := append([]BatchFailure(nil), bs.failures...)
 
 	final := done >= total
-	_, _ = s.jobs.update(parentID, func(p *Job) error {
+	_, updateErr := s.jobs.update(parentID, func(p *Job) error {
 		if p.Batch == nil {
 			p.Batch = &BatchProgress{}
 		}
@@ -257,6 +284,11 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 		}
 		return nil
 	})
+	if updateErr != nil {
+		s.logJob(LogError, parentID, "batch parent state persistence failed", updateErr.Error())
+		s.requestRestart()
+		return
+	}
 
 	if final {
 		s.removeBatch(parentID)

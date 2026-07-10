@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 const (
 	userHost         = "https://user.mypikpak.com"
 	driveHost        = "https://api-drive.mypikpak.com"
+	maxResponseBytes = 8 << 20
 	clientID         = "YNxT9w7GMdWvEOKa"
 	clientSecret     = "dbw2OtmVEeuUvIptb1Coyg"
 	clientVersion    = "1.47.1"
@@ -585,7 +587,7 @@ func (c *Client) doJSON(ctx context.Context, method, baseURL, path string, query
 		req, err := http.NewRequestWithContext(requestCtx, method, buildURL(baseURL, path, query), body)
 		if err != nil {
 			cancelRequest()
-			return err
+			return redactRequestURLError(err)
 		}
 
 		accessToken, userID := "", ""
@@ -730,7 +732,7 @@ func (c *Client) loginLocked(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, loginURL, body)
 	if err != nil {
 		cancelRequest()
-		return err
+		return redactRequestURLError(err)
 	}
 
 	for key, value := range c.defaultHeaders("", "", "") {
@@ -779,7 +781,7 @@ func (c *Client) refreshTokenLocked(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, userHost+"/v1/auth/token", body)
 	if err != nil {
 		cancelRequest()
-		return err
+		return redactRequestURLError(err)
 	}
 
 	for key, value := range c.defaultHeaders("", "", "") {
@@ -844,7 +846,7 @@ func (c *Client) initCaptcha(ctx context.Context, action string, meta map[string
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, userHost+"/v1/shield/captcha/init", body)
 	if err != nil {
 		cancelRequest()
-		return "", err
+		return "", redactRequestURLError(err)
 	}
 
 	for key, value := range c.defaultHeaders("", "", "") {
@@ -878,15 +880,29 @@ func (c *Client) initCaptcha(ctx context.Context, action string, meta map[string
 func (c *Client) send(req *http.Request) ([]byte, int, error) {
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, redactRequestURLError(err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, resp.StatusCode, err
 	}
+	if len(body) > maxResponseBytes {
+		return nil, resp.StatusCode, fmt.Errorf("pikpak response body exceeds 8 MiB limit")
+	}
 	return body, resp.StatusCode, nil
+}
+
+func redactRequestURLError(err error) error {
+	var requestErr *url.Error
+	if !errors.As(err, &requestErr) {
+		return err
+	}
+	redacted := *requestErr
+	redacted.URL = "[redacted PikPak URL]"
+	redacted.Err = redactRequestURLError(requestErr.Err)
+	return &redacted
 }
 
 func (c *Client) defaultHeaders(accessToken, captchaToken, userID string) map[string]string {

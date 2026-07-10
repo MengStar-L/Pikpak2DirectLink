@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -77,11 +78,12 @@ type UserQuota struct {
 }
 
 type userStore struct {
-	db *sql.DB
+	db        *sql.DB
+	hashSlots chan struct{}
 }
 
 func newUserStore(db *sql.DB) *userStore {
-	return &userStore{db: db}
+	return &userStore{db: db, hashSlots: defaultPasswordHashSlots}
 }
 
 func newUserID() string {
@@ -97,6 +99,16 @@ func normalizeEmail(email string) string {
 }
 
 func (s *userStore) createEmailUser(email, password string, now time.Time) (User, error) {
+	return s.createEmailUserWithHasher(email, password, now, hashPasswordRecord)
+}
+
+func (s *userStore) createEmailUserContext(ctx context.Context, email, password string, now time.Time) (User, error) {
+	return s.createEmailUserWithHasher(email, password, now, func(password string) (credentialRecord, error) {
+		return hashPasswordRecordContext(ctx, password, s.hashSlots)
+	})
+}
+
+func (s *userStore) createEmailUserWithHasher(email, password string, now time.Time, hashPassword func(string) (credentialRecord, error)) (User, error) {
 	email = normalizeEmail(email)
 	if email == "" || !strings.Contains(email, "@") {
 		return User{}, errors.New("valid email is required")
@@ -105,7 +117,7 @@ func (s *userStore) createEmailUser(email, password string, now time.Time) (User
 		return User{}, errors.New("password must be at least 6 characters")
 	}
 
-	rec, err := hashPasswordRecord(password)
+	rec, err := hashPassword(password)
 	if err != nil {
 		return User{}, err
 	}
@@ -154,19 +166,41 @@ func (s *userStore) createEmailUser(email, password string, now time.Time) (User
 }
 
 func (s *userStore) verifyEmailLogin(email, password string) (User, error) {
+	return s.verifyEmailLoginWithVerifier(email, password, func(rec credentialRecord, password string) (bool, error) {
+		return verifyPasswordRecord(rec, password), nil
+	})
+}
+
+func (s *userStore) verifyEmailLoginContext(ctx context.Context, email, password string) (User, error) {
+	return s.verifyEmailLoginWithVerifier(email, password, func(rec credentialRecord, password string) (bool, error) {
+		return verifyPasswordRecordContext(ctx, rec, password, s.hashSlots)
+	})
+}
+
+func (s *userStore) verifyEmailLoginWithVerifier(email, password string, verifyPassword func(credentialRecord, string) (bool, error)) (User, error) {
 	email = normalizeEmail(email)
 	identity, ok, err := loadUserIdentity(s.db, "email", email)
 	if err != nil {
 		return User{}, err
 	}
 	if !ok || strings.TrimSpace(identity.passwordHash) == "" {
+		if _, err := verifyPassword(dummyPasswordRecord, password); err != nil {
+			return User{}, err
+		}
 		return User{}, errInvalidCredentials
 	}
 	var rec credentialRecord
 	if err := json.Unmarshal([]byte(identity.passwordHash), &rec); err != nil {
+		if _, verifyErr := verifyPassword(dummyPasswordRecord, password); verifyErr != nil {
+			return User{}, verifyErr
+		}
 		return User{}, errInvalidCredentials
 	}
-	if !verifyPasswordRecord(rec, password) {
+	verified, err := verifyPassword(rec, password)
+	if err != nil {
+		return User{}, err
+	}
+	if !verified {
 		return User{}, errInvalidCredentials
 	}
 	user, ok, err := s.get(identity.userID)
@@ -174,10 +208,10 @@ func (s *userStore) verifyEmailLogin(email, password string) (User, error) {
 		return User{}, err
 	}
 	if !ok {
-		return User{}, errUserNotFound
+		return User{}, errInvalidCredentials
 	}
 	if user.Disabled {
-		return User{}, errUserDisabled
+		return User{}, errInvalidCredentials
 	}
 	return user, nil
 }

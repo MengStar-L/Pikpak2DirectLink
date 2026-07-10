@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
@@ -18,6 +19,13 @@ import (
 // pbkdf2Iterations controls the work factor for password hashing. 600k matches
 // the OWASP recommendation for PBKDF2-HMAC-SHA256.
 const pbkdf2Iterations = 600000
+
+var dummyPasswordRecord = credentialRecord{
+	Algo:       "pbkdf2-sha256",
+	Iterations: pbkdf2Iterations,
+	Salt:       "7d9b33f04b431c6c5166ebf5fe8eb812",
+	Hash:       "fdf04d1d4b5568e471fe8451bb1f625bebfb1a45a01a68a8bcf7d19301e0514a",
+}
 
 type authSessionStore struct {
 	mu       sync.RWMutex
@@ -87,13 +95,20 @@ func sessionTokenDigest(token string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func constantTimeTokenEqual(expected, provided string) bool {
+	expectedDigest := sha256.Sum256([]byte(expected))
+	providedDigest := sha256.Sum256([]byte(provided))
+	return subtle.ConstantTimeCompare(expectedDigest[:], providedDigest[:]) == 1
+}
+
 // credentialStore persists a salted PBKDF2 hash of the admin password to disk so
 // the first visitor can set a password that survives restarts. The plaintext is
 // never written; only the salt and derived key are stored.
 type credentialStore struct {
-	mu   sync.RWMutex
-	path string
-	rec  credentialRecord
+	mu        sync.RWMutex
+	path      string
+	rec       credentialRecord
+	hashSlots chan struct{}
 }
 
 type credentialRecord struct {
@@ -109,7 +124,7 @@ func newCredentialStore(path string) (*credentialStore, error) {
 	if path == "" {
 		path = "data/auth.json"
 	}
-	store := &credentialStore{path: path}
+	store := &credentialStore{path: path, hashSlots: defaultPasswordHashSlots}
 	if err := store.load(); err != nil {
 		return nil, err
 	}
@@ -179,7 +194,27 @@ func (c *credentialStore) Verify(password string) bool {
 	return verifyPasswordRecord(rec, password)
 }
 
+func (c *credentialStore) VerifyContext(ctx context.Context, password string) (bool, error) {
+	c.mu.RLock()
+	rec := c.rec
+	c.mu.RUnlock()
+
+	return verifyPasswordRecordContext(ctx, rec, password, c.hashSlots)
+}
+
 func hashPasswordRecord(password string) (credentialRecord, error) {
+	return hashPasswordRecordWithSlot(password, func() (func(), error) {
+		return acquirePasswordHashSlot(), nil
+	})
+}
+
+func hashPasswordRecordContext(ctx context.Context, password string, slots chan struct{}) (credentialRecord, error) {
+	return hashPasswordRecordWithSlot(password, func() (func(), error) {
+		return tryAcquirePasswordHashSlot(ctx, slots)
+	})
+}
+
+func hashPasswordRecordWithSlot(password string, acquire func() (func(), error)) (credentialRecord, error) {
 	if strings.TrimSpace(password) == "" {
 		return credentialRecord{}, errors.New("password is required")
 	}
@@ -187,7 +222,12 @@ func hashPasswordRecord(password string) (credentialRecord, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return credentialRecord{}, err
 	}
+	release, err := acquire()
+	if err != nil {
+		return credentialRecord{}, err
+	}
 	hash, err := pbkdf2.Key(sha256.New, password, salt, pbkdf2Iterations, 32)
+	release()
 	if err != nil {
 		return credentialRecord{}, err
 	}
@@ -201,26 +241,44 @@ func hashPasswordRecord(password string) (credentialRecord, error) {
 }
 
 func verifyPasswordRecord(rec credentialRecord, password string) bool {
+	ok, _ := verifyPasswordRecordWithSlot(rec, password, func() (func(), error) {
+		return acquirePasswordHashSlot(), nil
+	})
+	return ok
+}
+
+func verifyPasswordRecordContext(ctx context.Context, rec credentialRecord, password string, slots chan struct{}) (bool, error) {
+	return verifyPasswordRecordWithSlot(rec, password, func() (func(), error) {
+		return tryAcquirePasswordHashSlot(ctx, slots)
+	})
+}
+
+func verifyPasswordRecordWithSlot(rec credentialRecord, password string, acquire func() (func(), error)) (bool, error) {
 	if rec.Hash == "" {
-		return false
+		return false, nil
 	}
 	salt, err := hex.DecodeString(rec.Salt)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	expected, err := hex.DecodeString(rec.Hash)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	iterations := rec.Iterations
 	if iterations <= 0 {
 		iterations = pbkdf2Iterations
 	}
-	candidate, err := pbkdf2.Key(sha256.New, password, salt, iterations, len(expected))
+	release, err := acquire()
 	if err != nil {
-		return false
+		return false, err
 	}
-	return subtle.ConstantTimeCompare(candidate, expected) == 1
+	candidate, err := pbkdf2.Key(sha256.New, password, salt, iterations, len(expected))
+	release()
+	if err != nil {
+		return false, err
+	}
+	return subtle.ConstantTimeCompare(candidate, expected) == 1, nil
 }
 
 func (c *credentialStore) saveLocked() error {

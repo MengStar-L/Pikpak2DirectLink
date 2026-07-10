@@ -44,6 +44,8 @@ type selectItemsRequest struct {
 	ItemID  string   `json:"item_id"`
 }
 
+const linuxDoOAuthNonceCookieName = "linuxdo_oauth_nonce"
+
 func (s *Server) handleUserPortal(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -136,22 +138,43 @@ func (s *Server) handleLinuxDoAuthStart(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusServiceUnavailable, "LinuxDo login is not configured")
 		return
 	}
-	state, err := s.oauthStates.create(s.now())
+	nonce, err := generateSessionID()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create OAuth state")
 		return
 	}
+	now := s.now()
+	state, err := s.oauthStates.create(nonce, now)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create OAuth state")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     linuxDoOAuthNonceCookieName,
+		Value:    nonce,
+		Path:     "/api/u/auth/linuxdo",
+		HttpOnly: true,
+		Secure:   s.secureCookies(),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(oauthStateTTL.Seconds()),
+		Expires:  now.Add(oauthStateTTL),
+	})
 	http.Redirect(w, r, s.linuxDoAuthorizationURL(r, state), http.StatusFound)
 }
 
 func (s *Server) handleLinuxDoAuthCallback(w http.ResponseWriter, r *http.Request) {
-	if errText := strings.TrimSpace(r.URL.Query().Get("error")); errText != "" {
-		redirectUserAuthError(w, r, errText)
+	nonce := ""
+	if cookie, err := r.Cookie(linuxDoOAuthNonceCookieName); err == nil {
+		nonce = cookie.Value
+	}
+	clearLinuxDoOAuthNonceCookie(w, s.secureCookies())
+	state := strings.TrimSpace(r.URL.Query().Get("state"))
+	if !s.oauthStates.consume(state, nonce, s.now()) {
+		redirectUserAuthError(w, r, "invalid_state")
 		return
 	}
-	state := strings.TrimSpace(r.URL.Query().Get("state"))
-	if !s.oauthStates.consume(state, s.now()) {
-		redirectUserAuthError(w, r, "invalid_state")
+	if errText := strings.TrimSpace(r.URL.Query().Get("error")); errText != "" {
+		redirectUserAuthError(w, r, errText)
 		return
 	}
 	code := strings.TrimSpace(r.URL.Query().Get("code"))
@@ -192,6 +215,19 @@ func (s *Server) handleLinuxDoAuthCallback(w http.ResponseWriter, r *http.Reques
 	http.Redirect(w, r, "/u", http.StatusFound)
 }
 
+func clearLinuxDoOAuthNonceCookie(w http.ResponseWriter, secure bool) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     linuxDoOAuthNonceCookieName,
+		Value:    "",
+		Path:     "/api/u/auth/linuxdo",
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+	})
+}
+
 func redirectUserAuthError(w http.ResponseWriter, r *http.Request, message string) {
 	q := url.Values{}
 	q.Set("error", message)
@@ -208,7 +244,23 @@ func (s *Server) handleEmailRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	user, err := s.users.createEmailUser(req.Email, req.Password, s.now())
+	attempt := authAttemptForRequest(r, "register:"+normalizeEmail(req.Email))
+	admission, retryAfter, admitted := s.authLimiter.admit(attempt, s.now())
+	if !admitted {
+		writeAuthRateLimit(w, retryAfter)
+		return
+	}
+	defer func() { admission.cancel(s.now()) }()
+
+	user, err := s.users.createEmailUserContext(r.Context(), req.Email, req.Password, s.now())
+	if errors.Is(err, errPasswordHashBusy) {
+		writePasswordHashBusy(w)
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	admission.consume(s.now())
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, errEmailExists) {
@@ -239,15 +291,32 @@ func (s *Server) handleEmailLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	user, err := s.users.verifyEmailLogin(req.Email, req.Password)
-	if err != nil {
-		status := http.StatusUnauthorized
-		if errors.Is(err, errUserDisabled) {
-			status = http.StatusForbidden
-		}
-		writeError(w, status, err.Error())
+	attempt := authAttemptForRequest(r, "email:"+normalizeEmail(req.Email))
+	admission, retryAfter, admitted := s.authLimiter.admit(attempt, s.now())
+	if !admitted {
+		writeAuthRateLimit(w, retryAfter)
 		return
 	}
+	defer func() { admission.cancel(s.now()) }()
+
+	user, err := s.users.verifyEmailLoginContext(r.Context(), req.Email, req.Password)
+	if err != nil {
+		if errors.Is(err, errPasswordHashBusy) {
+			writePasswordHashBusy(w)
+			return
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		if errors.Is(err, errInvalidCredentials) {
+			admission.fail(s.now())
+			writeError(w, http.StatusUnauthorized, errInvalidCredentials.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to authenticate user")
+		return
+	}
+	admission.succeed(s.now())
 	if err := s.setUserSessionCookie(w, user.ID, s.now()); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -355,6 +424,9 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 	if len(lines) > 1 {
 		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, "", user.ID, priorityUser, s.baseURL(r))
 		if status != 0 {
+			if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
+				w.Header().Set("Retry-After", "30")
+			}
 			writeError(w, status, msg)
 			return
 		}
@@ -411,7 +483,18 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:     now,
 	}
 
-	if err := s.jobs.create(job); err != nil {
+	createErr := s.admission.withCapacity(user.ID, 1, func() error { return s.jobs.create(job) })
+	if createErr != nil {
+		var limitErr *jobAdmissionError
+		if errors.As(createErr, &limitErr) {
+			w.Header().Set("Retry-After", "30")
+			if limitErr.Global {
+				writeError(w, http.StatusServiceUnavailable, "resolve service is at capacity")
+			} else {
+				writeError(w, http.StatusTooManyRequests, "too many active user jobs")
+			}
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to persist job")
 		return
 	}
@@ -419,7 +502,12 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 	if err := s.resolver.enqueue(job.ID, priorityUser, func(ctx context.Context) {
 		s.processJob(ctx, job.ID)
 	}); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "resolve queue is shutting down")
+		if errors.Is(err, errResolveQueueFull) {
+			w.Header().Set("Retry-After", "30")
+			writeError(w, http.StatusServiceUnavailable, "resolve service is at capacity")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "resolve queue is shutting down")
+		}
 		return
 	}
 

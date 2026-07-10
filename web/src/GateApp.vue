@@ -17,6 +17,9 @@ const showPw = ref(false)
 const showConfirm = ref(false)
 const loading = ref(false)
 const error = ref('')
+const setupToken = ref('')
+
+const SETUP_TOKEN_STORAGE_KEY = 'pikpak-initial-setup-token'
 
 const STRENGTH_LABEL = ['', '密码强度：弱', '密码强度：一般', '密码强度：良好', '密码强度：强']
 
@@ -47,6 +50,20 @@ function showError(msg: string) {
   error.value = msg
 }
 
+function captureSetupToken() {
+  const fragment = new URLSearchParams(window.location.hash.slice(1))
+  const token = fragment.get('setup_token')?.trim() || ''
+  try {
+    if (token) sessionStorage.setItem(SETUP_TOKEN_STORAGE_KEY, token)
+    setupToken.value = token || sessionStorage.getItem(SETUP_TOKEN_STORAGE_KEY)?.trim() || ''
+  } catch {
+    setupToken.value = token
+  }
+  if (fragment.has('setup_token')) {
+    window.history.replaceState(null, '', window.location.pathname + window.location.search)
+  }
+}
+
 async function checkStatus() {
   try {
     const data = await api.auth.status()
@@ -72,9 +89,13 @@ async function submit() {
   }
 
   loading.value = true
-  const endpoint = mode.value === 'setup' ? api.auth.setup : api.auth.login
   try {
-    await endpoint(password.value)
+    if (mode.value === 'setup') {
+      await api.auth.setup(password.value, setupToken.value)
+      try { sessionStorage.removeItem(SETUP_TOKEN_STORAGE_KEY) } catch { /* storage may be unavailable */ }
+    } else {
+      await api.auth.login(password.value)
+    }
     window.location.replace('/')
   } catch (e: any) {
     if (e?.status === 409 && mode.value === 'setup') {
@@ -88,7 +109,10 @@ async function submit() {
   }
 }
 
-onMounted(checkStatus)
+onMounted(() => {
+  captureSetupToken()
+  void checkStatus()
+})
 </script>
 
 <template>

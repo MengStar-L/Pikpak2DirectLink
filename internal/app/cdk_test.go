@@ -143,15 +143,17 @@ func TestMigrateCDKAddAllowProxyOnExistingDB(t *testing.T) {
 		t.Fatalf("migrate voucher columns: %v", err)
 	}
 
-	c, ok, err := newCDKStore(db).get("OLDCODE-AAAA-BBBB-CCCC")
-	if err != nil || !ok {
-		t.Fatalf("get migrated row: ok=%v err=%v", ok, err)
+	var allowProxy, durationDays int
+	if err := db.QueryRow(
+		`SELECT allow_proxy, duration_days FROM cdks WHERE code='OLDCODE-AAAA-BBBB-CCCC'`,
+	).Scan(&allowProxy, &durationDays); err != nil {
+		t.Fatalf("get migrated row: %v", err)
 	}
-	if !c.AllowProxy {
+	if allowProxy == 0 {
 		t.Fatal("existing CDK should default to AllowProxy=true after migration")
 	}
-	if c.DurationDays != 17 {
-		t.Fatalf("duration_days = %d, want 17 from legacy expires_at-created_at span", c.DurationDays)
+	if durationDays != 17 {
+		t.Fatalf("duration_days = %d, want 17 from legacy expires_at-created_at span", durationDays)
 	}
 }
 
@@ -286,6 +288,316 @@ func TestCDKUpdateAndDelete(t *testing.T) {
 	stored, ok, err := store.get(code)
 	if err != nil || !ok || stored.RevokedAt == 0 {
 		t.Fatalf("expected revoked code to remain listed, got %+v ok=%v err=%v", stored, ok, err)
+	}
+}
+
+func TestRedeemedCDKUpdateSynchronizesSubscriptionAndProjection(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	store := newTestCDKStore(t)
+	users := newUserStore(store.db)
+	if _, err := store.db.Exec(
+		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_update', 'cdk-update@example.com', ?, ?)`,
+		now.Unix(), now.Unix(),
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	created, err := store.createBatch(1, 1_000, 10, true, now)
+	if err != nil {
+		t.Fatalf("createBatch: %v", err)
+	}
+	subscription, err := users.redeemCDK("usr_cdk_update", created[0].Code, now)
+	if err != nil {
+		t.Fatalf("redeemCDK: %v", err)
+	}
+	if err := users.chargeIfEnough("usr_cdk_update", 200, false, now); err != nil {
+		t.Fatalf("chargeIfEnough: %v", err)
+	}
+
+	updatedAt := now.Add(time.Hour)
+	updated, ok, err := store.update(created[0].Code, 750, 20, false, updatedAt)
+	if err != nil || !ok {
+		t.Fatalf("update: ok=%v err=%v", ok, err)
+	}
+	wantExpiry := updatedAt.Add(20 * 24 * time.Hour).Unix()
+	if updated.RemainingBytes != 750 || updated.UsedBytes != 200 || updated.ExpiresAt != wantExpiry || updated.AllowProxy {
+		t.Fatalf("projected CDK = %+v, want subscription state 750/200 expiry=%d proxy=false", updated, wantExpiry)
+	}
+
+	var remaining, used, expiresAt int64
+	var allowProxy int
+	if err := store.db.QueryRow(
+		`SELECT remaining_bytes, used_bytes, expires_at, allow_proxy FROM user_subscriptions WHERE id=?`,
+		subscription.ID,
+	).Scan(&remaining, &used, &expiresAt, &allowProxy); err != nil {
+		t.Fatalf("read subscription: %v", err)
+	}
+	if remaining != 750 || used != 200 || expiresAt != wantExpiry || allowProxy != 0 {
+		t.Fatalf("subscription = remaining:%d used:%d expiry:%d proxy:%d", remaining, used, expiresAt, allowProxy)
+	}
+	listed := mustList(t, store)
+	if len(listed) != 1 || listed[0].RemainingBytes != 750 || listed[0].UsedBytes != 200 || listed[0].AllowProxy {
+		t.Fatalf("list projection = %+v", listed)
+	}
+}
+
+func TestRedeemedCDKUpdateRebasesExistingQuotaReservationAccounting(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	store := newTestCDKStore(t)
+	users := newUserStore(store.db)
+	if _, err := store.db.Exec(
+		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_generation', 'cdk-generation@example.com', ?, ?)`,
+		now.Unix(), now.Unix(),
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	created, err := store.createBatch(1, 1_000, 10, true, now)
+	if err != nil {
+		t.Fatalf("createBatch: %v", err)
+	}
+	subscription, err := users.redeemCDK("usr_cdk_generation", created[0].Code, now)
+	if err != nil {
+		t.Fatalf("redeemCDK: %v", err)
+	}
+	if err := users.chargeIfEnough("usr_cdk_generation", 100, false, now); err != nil {
+		t.Fatalf("chargeIfEnough: %v", err)
+	}
+
+	if err := users.reserveQuota("job_stale_release", "usr_cdk_generation", 200, false, now); err != nil {
+		t.Fatalf("reserve release job: %v", err)
+	}
+	if _, ok, err := store.update(created[0].Code, 750, 20, true, now.Add(time.Hour)); err != nil || !ok {
+		t.Fatalf("update before release: ok=%v err=%v", ok, err)
+	}
+	released, err := users.releaseQuotaReservation("job_stale_release")
+	if err != nil || released != 0 {
+		t.Fatalf("release stale reservation = %d, %v; want 0, nil", released, err)
+	}
+	assertSubscriptionQuotaState(t, store.db, subscription.ID, 750, 100)
+
+	if err := users.reserveQuota("job_stale_settle", "usr_cdk_generation", 200, false, now.Add(2*time.Hour)); err != nil {
+		t.Fatalf("reserve settle job: %v", err)
+	}
+	if _, ok, err := store.update(created[0].Code, 700, 30, true, now.Add(3*time.Hour)); err != nil || !ok {
+		t.Fatalf("update before settle: ok=%v err=%v", ok, err)
+	}
+	settled, err := users.settleQuotaReservation("job_stale_settle")
+	if err != nil || settled != 200 {
+		t.Fatalf("settle stale reservation = %d, %v; want 200, nil", settled, err)
+	}
+	assertSubscriptionQuotaState(t, store.db, subscription.ID, 700, 300)
+
+	if err := users.reserveQuota("job_disabled_proxy", "usr_cdk_generation", 100, true, now.Add(4*time.Hour)); err != nil {
+		t.Fatalf("reserve proxy job: %v", err)
+	}
+	if _, ok, err := store.update(created[0].Code, 650, 30, false, now.Add(5*time.Hour)); err != nil || !ok {
+		t.Fatalf("disable proxy before settle: ok=%v err=%v", ok, err)
+	}
+	if err := users.reserveQuota("job_disabled_proxy", "usr_cdk_generation", 100, true, now.Add(5*time.Hour)); !errors.Is(err, errQuotaReservationInvalidated) {
+		t.Fatalf("repeat invalidated proxy reservation = %v, want invalidated error", err)
+	}
+	settled, err = users.settleQuotaReservation("job_disabled_proxy")
+	if settled != 0 || !errors.Is(err, errQuotaReservationInvalidated) {
+		t.Fatalf("settle disabled proxy reservation = %d, %v; want invalidated error", settled, err)
+	}
+	assertSubscriptionQuotaState(t, store.db, subscription.ID, 650, 300)
+
+	var reservations int
+	if err := store.db.QueryRow(
+		`SELECT COUNT(*) FROM user_quota_reservations WHERE job_id IN ('job_stale_release', 'job_stale_settle', 'job_disabled_proxy')`,
+	).Scan(&reservations); err != nil {
+		t.Fatalf("count stale reservations: %v", err)
+	}
+	if reservations != 0 {
+		t.Fatalf("stale reservations remaining = %d, want 0", reservations)
+	}
+}
+
+func TestRedeemedCDKRevokePreventsExistingQuotaReservationSettlement(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	store := newTestCDKStore(t)
+	users := newUserStore(store.db)
+	if _, err := store.db.Exec(
+		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_revoke_reservation', 'cdk-revoke-reservation@example.com', ?, ?)`,
+		now.Unix(), now.Unix(),
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	created, err := store.createBatch(1, 1_000, 10, true, now)
+	if err != nil {
+		t.Fatalf("createBatch: %v", err)
+	}
+	subscription, err := users.redeemCDK("usr_cdk_revoke_reservation", created[0].Code, now)
+	if err != nil {
+		t.Fatalf("redeemCDK: %v", err)
+	}
+	if err := users.reserveQuota("job_revoked_reservation", "usr_cdk_revoke_reservation", 200, false, now); err != nil {
+		t.Fatalf("reserveQuota: %v", err)
+	}
+	if _, ok, err := store.revoke(created[0].Code, now.Add(time.Hour)); err != nil || !ok {
+		t.Fatalf("revoke: ok=%v err=%v", ok, err)
+	}
+
+	settled, err := users.settleQuotaReservation("job_revoked_reservation")
+	if settled != 0 || !errors.Is(err, errQuotaReservationInvalidated) || !errors.Is(err, errUserQuotaExhausted) {
+		t.Fatalf("settle revoked reservation = %d, %v; want invalidated quota error", settled, err)
+	}
+	assertSubscriptionQuotaState(t, store.db, subscription.ID, 800, 0)
+	var reservations int
+	if err := store.db.QueryRow(
+		`SELECT COUNT(*) FROM user_quota_reservations WHERE job_id='job_revoked_reservation'`,
+	).Scan(&reservations); err != nil {
+		t.Fatalf("count revoked reservation: %v", err)
+	}
+	if reservations != 0 {
+		t.Fatalf("revoked reservation remaining = %d, want 0", reservations)
+	}
+}
+
+func TestCDKGenerationChangesKeepMultiSubscriptionReservationAtomic(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	store := newTestCDKStore(t)
+	users := newUserStore(store.db)
+	if _, err := store.db.Exec(
+		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_multi_generation', 'cdk-multi-generation@example.com', ?, ?)`,
+		now.Unix(), now.Unix(),
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	earlyCDKs, err := store.createBatch(1, 100, 1, true, now)
+	if err != nil {
+		t.Fatalf("create early CDK: %v", err)
+	}
+	lateCDKs, err := store.createBatch(1, 100, 2, true, now)
+	if err != nil {
+		t.Fatalf("create late CDK: %v", err)
+	}
+	early, err := users.redeemCDK("usr_cdk_multi_generation", earlyCDKs[0].Code, now)
+	if err != nil {
+		t.Fatalf("redeem early CDK: %v", err)
+	}
+	late, err := users.redeemCDK("usr_cdk_multi_generation", lateCDKs[0].Code, now)
+	if err != nil {
+		t.Fatalf("redeem late CDK: %v", err)
+	}
+
+	if err := users.reserveQuota("job_multi_patch", "usr_cdk_multi_generation", 150, false, now); err != nil {
+		t.Fatalf("reserve across subscriptions before PATCH: %v", err)
+	}
+	if _, ok, err := store.update(earlyCDKs[0].Code, 80, 1, true, now.Add(time.Hour)); err != nil || !ok {
+		t.Fatalf("update early CDK: ok=%v err=%v", ok, err)
+	}
+	settled, err := users.settleQuotaReservation("job_multi_patch")
+	if err != nil || settled != 150 {
+		t.Fatalf("settle multi-subscription PATCH reservation = %d, %v; want 150, nil", settled, err)
+	}
+	assertSubscriptionQuotaState(t, store.db, early.ID, 80, 100)
+	assertSubscriptionQuotaState(t, store.db, late.ID, 50, 50)
+
+	if err := users.reserveQuota("job_multi_revoke", "usr_cdk_multi_generation", 120, false, now.Add(2*time.Hour)); err != nil {
+		t.Fatalf("reserve across subscriptions before revoke: %v", err)
+	}
+	if _, ok, err := store.revoke(earlyCDKs[0].Code, now.Add(3*time.Hour)); err != nil || !ok {
+		t.Fatalf("revoke early CDK: ok=%v err=%v", ok, err)
+	}
+	settled, err = users.settleQuotaReservation("job_multi_revoke")
+	if settled != 0 || !errors.Is(err, errQuotaReservationInvalidated) {
+		t.Fatalf("settle multi-subscription revoked reservation = %d, %v; want invalidated error", settled, err)
+	}
+	assertSubscriptionQuotaState(t, store.db, early.ID, 0, 100)
+	assertSubscriptionQuotaState(t, store.db, late.ID, 50, 50)
+	var reservations int
+	if err := store.db.QueryRow(
+		`SELECT COUNT(*) FROM user_quota_reservations WHERE job_id IN ('job_multi_patch', 'job_multi_revoke')`,
+	).Scan(&reservations); err != nil {
+		t.Fatalf("count multi-subscription reservations: %v", err)
+	}
+	if reservations != 0 {
+		t.Fatalf("multi-subscription reservations remaining = %d, want 0", reservations)
+	}
+}
+
+func assertSubscriptionQuotaState(t *testing.T, db *sql.DB, subscriptionID string, wantRemaining, wantUsed int64) {
+	t.Helper()
+	var remaining, used int64
+	if err := db.QueryRow(
+		`SELECT remaining_bytes, used_bytes FROM user_subscriptions WHERE id=?`,
+		subscriptionID,
+	).Scan(&remaining, &used); err != nil {
+		t.Fatalf("read subscription quota state: %v", err)
+	}
+	if remaining != wantRemaining || used != wantUsed {
+		t.Fatalf("subscription quota state = remaining:%d used:%d, want remaining:%d used:%d", remaining, used, wantRemaining, wantUsed)
+	}
+}
+
+func TestRedeemedCDKRevokeImmediatelyExpiresSubscription(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	store := newTestCDKStore(t)
+	users := newUserStore(store.db)
+	if _, err := store.db.Exec(
+		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_revoke', 'cdk-revoke@example.com', ?, ?)`,
+		now.Unix(), now.Unix(),
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	created, err := store.createBatch(1, 1_000, 10, true, now)
+	if err != nil {
+		t.Fatalf("createBatch: %v", err)
+	}
+	if _, err := users.redeemCDK("usr_cdk_revoke", created[0].Code, now); err != nil {
+		t.Fatalf("redeemCDK: %v", err)
+	}
+
+	revokedAt := now.Add(time.Hour)
+	revoked, ok, err := store.revoke(created[0].Code, revokedAt)
+	if err != nil || !ok {
+		t.Fatalf("revoke: ok=%v err=%v", ok, err)
+	}
+	if revoked.RevokedAt != revokedAt.Unix() || revoked.ExpiresAt != revokedAt.Unix() {
+		t.Fatalf("revoked projection = %+v, want revoked and expired at %d", revoked, revokedAt.Unix())
+	}
+	if err := users.hasQuota("usr_cdk_revoke", 1, false, revokedAt); !errors.Is(err, errUserQuotaExhausted) {
+		t.Fatalf("quota after revoke = %v, want errUserQuotaExhausted", err)
+	}
+	if _, ok, err := store.update(created[0].Code, 2_000, 30, true, revokedAt.Add(time.Hour)); !ok || !errors.Is(err, errVoucherRevoked) {
+		t.Fatalf("update revoked CDK = ok:%v err:%v, want existing revoked error", ok, err)
+	}
+	if err := users.hasQuota("usr_cdk_revoke", 1, false, revokedAt.Add(2*time.Hour)); !errors.Is(err, errUserQuotaExhausted) {
+		t.Fatalf("quota after rejected revoked update = %v, want errUserQuotaExhausted", err)
+	}
+}
+
+func TestRedeemedCDKUpdateRollsBackWhenSubscriptionUpdateFails(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	store := newTestCDKStore(t)
+	users := newUserStore(store.db)
+	if _, err := store.db.Exec(
+		`INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_cdk_rollback', 'cdk-rollback@example.com', ?, ?)`,
+		now.Unix(), now.Unix(),
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	created, err := store.createBatch(1, 1_000, 10, true, now)
+	if err != nil {
+		t.Fatalf("createBatch: %v", err)
+	}
+	if _, err := users.redeemCDK("usr_cdk_rollback", created[0].Code, now); err != nil {
+		t.Fatalf("redeemCDK: %v", err)
+	}
+	if _, err := store.db.Exec(`CREATE TRIGGER reject_subscription_update BEFORE UPDATE ON user_subscriptions BEGIN SELECT RAISE(FAIL, 'reject update'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	if _, _, err := store.update(created[0].Code, 500, 20, false, now.Add(time.Hour)); err == nil {
+		t.Fatal("update unexpectedly succeeded")
+	}
+	var remaining int64
+	var durationDays int
+	if err := store.db.QueryRow(`SELECT remaining_bytes, duration_days FROM cdks WHERE code=?`, created[0].Code).Scan(&remaining, &durationDays); err != nil {
+		t.Fatalf("read CDK after rollback: %v", err)
+	}
+	if remaining != 1_000 || durationDays != 10 {
+		t.Fatalf("CDK changed despite rollback: remaining=%d duration=%d", remaining, durationDays)
 	}
 }
 

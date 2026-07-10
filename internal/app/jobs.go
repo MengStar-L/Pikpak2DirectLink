@@ -255,6 +255,47 @@ func (s *jobStore) firstEvictableLocked() int {
 	return -1
 }
 
+func (s *jobStore) admissionCounts(userID, excludeID string) (global, user, selections int) {
+	if s == nil {
+		return 0, 0, 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for id, job := range s.jobs {
+		if id == excludeID || job == nil || isTerminalJobStatus(job.Status) {
+			continue
+		}
+		// A batch parent coordinates child results but consumes no resolver slot.
+		if job.Kind == ResourceBatch && job.ParentID == "" {
+			continue
+		}
+		global++
+		if userID != "" && job.UserID == userID {
+			user++
+			if job.Status == JobSelectionRequired {
+				selections++
+			}
+		}
+	}
+	return global, user, selections
+}
+
+func (s *jobStore) expiredSelectionIDs(cutoff time.Time) []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]string, 0)
+	for id, job := range s.jobs {
+		if job != nil && job.Status == JobSelectionRequired && !job.UpdatedAt.After(cutoff) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func isTerminalJobStatus(status JobStatus) bool {
 	return status == JobCompleted || status == JobFailed
 }

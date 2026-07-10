@@ -191,8 +191,11 @@ func TestProxyErrorsDoNotExposeInternalDetails(t *testing.T) {
 	if len(logs) != 1 {
 		t.Fatalf("expected one internal log entry, got %d", len(logs))
 	}
-	if len(logs[0].Details) == 0 || !strings.Contains(logs[0].Details[0], leakedAccount) {
-		t.Fatalf("expected internal log to retain the diagnostic detail, got %+v", logs[0])
+	if len(logs[0].Details) == 0 || !strings.Contains(logs[0].Details[0], "invalid control character in URL") {
+		t.Fatalf("expected internal log to retain a safe diagnostic detail, got %+v", logs[0])
+	}
+	if strings.Contains(logs[0].Details[0], leakedAccount) || strings.Contains(logs[0].Details[0], "http://example.com") {
+		t.Fatalf("internal proxy log leaked the upstream URL: %+v", logs[0])
 	}
 }
 

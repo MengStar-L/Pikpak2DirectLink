@@ -132,14 +132,14 @@ func TestSetupThenLoginFlow(t *testing.T) {
 
 	// setup with a too-short password is rejected.
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/auth/setup", `{"password":"123"}`))
+	handler.ServeHTTP(rec, localSetupRequest(srv, `{"password":"123"}`))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for short password, got %d", rec.Code)
 	}
 
 	// valid setup issues a session cookie and grants access.
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/auth/setup", `{"password":"admin-secret"}`))
+	handler.ServeHTTP(rec, localSetupRequest(srv, `{"password":"admin-secret"}`))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for setup, got %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -160,7 +160,7 @@ func TestSetupThenLoginFlow(t *testing.T) {
 
 	// setup is closed once a password exists.
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/auth/setup", `{"password":"another"}`))
+	handler.ServeHTTP(rec, localSetupRequest(srv, `{"password":"another"}`))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 on second setup, got %d", rec.Code)
 	}
@@ -221,7 +221,7 @@ func TestChangePasswordFlow(t *testing.T) {
 
 	// Establish a password and capture the session.
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/auth/setup", `{"password":"admin-secret"}`))
+	handler.ServeHTTP(rec, localSetupRequest(srv, `{"password":"admin-secret"}`))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("setup: expected 200, got %d", rec.Code)
 	}
@@ -377,6 +377,14 @@ func TestCDKAdminGatedUserPortalPublic(t *testing.T) {
 func jsonRequest(method, target, body string) *http.Request {
 	req := httptest.NewRequest(method, target, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+func localSetupRequest(srv *Server, body string) *http.Request {
+	req := jsonRequest(http.MethodPost, "/api/auth/setup", body)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Host = "localhost"
+	req.Header.Set(setupBootstrapHeader, srv.setupBootstrapToken)
 	return req
 }
 

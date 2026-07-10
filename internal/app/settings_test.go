@@ -55,6 +55,7 @@ func TestUpdateSettingsRejectsBelowDynamicMinimum(t *testing.T) {
 
 	s := newTestSettingsServer(t, Config{})
 	req := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"concurrency":1,"task_timeout_seconds":60}`))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
 	s.handleUpdateSettings(rec, req)
@@ -74,6 +75,7 @@ func TestUpdateSettingsAcceptsDynamicMinimum(t *testing.T) {
 	minTimeout := minResolveTaskTimeout(s.config)
 	body := `{"concurrency":1,"task_timeout_seconds":` + strconv.Itoa(int(minTimeout.Seconds())) + `}`
 	req := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
 	s.handleUpdateSettings(rec, req)

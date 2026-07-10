@@ -42,9 +42,9 @@ type Config struct {
 }
 
 func LoadConfig() Config {
-	requestTimeout := durationOrDefault("PIKPAK_REQUEST_TIMEOUT", 20*time.Second)
+	requestTimeout := positiveDurationOrDefault("PIKPAK_REQUEST_TIMEOUT", 20*time.Second)
 	return Config{
-		Addr:                       envOrDefault("ADDR", ":51873"),
+		Addr:                       envOrDefault("ADDR", "127.0.0.1:51873"),
 		PublicBaseURL:              strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
 		DataEncryptionKey:          os.Getenv("DATA_ENCRYPTION_KEY"),
 		DataEncryptionPreviousKeys: commaSeparatedEnv("DATA_ENCRYPTION_PREVIOUS_KEYS"),
@@ -61,20 +61,20 @@ func LoadConfig() Config {
 		BackupInterval:             positiveDurationOrDefault("BACKUP_INTERVAL", defaultBackupInterval),
 		BackupRetention:            positiveIntOrDefault("BACKUP_RETENTION", defaultBackupRetention),
 		RequestTimeout:             requestTimeout,
-		ResolveTimeout:             durationOrDefault("RESOLVE_TIMEOUT", 12*time.Minute),
-		QueueTimeout:               durationOrDefault("QUEUE_TIMEOUT", 60*time.Second),
-		ParallelTimeout:            durationOrDefault("PARALLEL_QUEUE_TIMEOUT", 2*time.Minute),
+		ResolveTimeout:             positiveDurationOrDefault("RESOLVE_TIMEOUT", 12*time.Minute),
+		QueueTimeout:               positiveDurationOrDefault("QUEUE_TIMEOUT", 60*time.Second),
+		ParallelTimeout:            positiveDurationOrDefault("PARALLEL_QUEUE_TIMEOUT", 2*time.Minute),
 		ResolveConcurrency:         intOrDefault("RESOLVE_CONCURRENCY", 1),
-		PollInterval:               durationOrDefault("POLL_INTERVAL", 5*time.Second),
+		PollInterval:               positiveDurationOrDefault("POLL_INTERVAL", 5*time.Second),
 		UpdateRepo:                 strings.TrimSpace(os.Getenv("UPDATE_REPO")),
-		UpdateCheckPeriod:          durationOrDefault("UPDATE_CHECK_INTERVAL", 6*time.Hour),
-		ShareParseTimeout:          durationOrDefault("SHARE_PARSE_TIMEOUT", 60*time.Second),
-		ShareURLTimeout:            durationOrDefault("SHARE_URL_TIMEOUT", 60*time.Second),
-		SharePollInterval:          durationOrDefault("SHARE_POLL_INTERVAL", 3*time.Second),
+		UpdateCheckPeriod:          nonNegativeDurationOrDefault("UPDATE_CHECK_INTERVAL", 6*time.Hour),
+		ShareParseTimeout:          positiveDurationOrDefault("SHARE_PARSE_TIMEOUT", 60*time.Second),
+		ShareURLTimeout:            positiveDurationOrDefault("SHARE_URL_TIMEOUT", 60*time.Second),
+		SharePollInterval:          positiveDurationOrDefault("SHARE_POLL_INTERVAL", 3*time.Second),
 		AccountHealthURL:           envOrDefault("ACCOUNT_HEALTH_CHECK_URL", defaultAccountHealthCheckURL),
-		AccountHealthEvery:         durationOrDefault("ACCOUNT_HEALTH_CHECK_INTERVAL", defaultAccountHealthCheckInterval),
-		AccountRefreshGap:          durationOrDefault("ACCOUNT_AUTO_REFRESH_GAP", defaultAccountAutoRefreshGap),
-		AccountHealthTimeout:       durationOrDefault("ACCOUNT_HEALTH_CHECK_TIMEOUT", maxDuration(requestTimeout*3, time.Minute)),
+		AccountHealthEvery:         positiveDurationOrDefault("ACCOUNT_HEALTH_CHECK_INTERVAL", defaultAccountHealthCheckInterval),
+		AccountRefreshGap:          positiveDurationOrDefault("ACCOUNT_AUTO_REFRESH_GAP", defaultAccountAutoRefreshGap),
+		AccountHealthTimeout:       positiveDurationOrDefault("ACCOUNT_HEALTH_CHECK_TIMEOUT", maxDuration(requestTimeout*3, time.Minute)),
 	}
 }
 
@@ -105,17 +105,17 @@ func envOrDefault(key, fallback string) string {
 	return value
 }
 
-func durationOrDefault(key string, fallback time.Duration) time.Duration {
+func nonNegativeDurationOrDefault(key string, fallback time.Duration) time.Duration {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
 		return fallback
 	}
 
-	if parsed, err := time.ParseDuration(value); err == nil {
+	if parsed, err := time.ParseDuration(value); err == nil && parsed >= 0 {
 		return parsed
 	}
 
-	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
 		return time.Duration(seconds) * time.Second
 	}
 

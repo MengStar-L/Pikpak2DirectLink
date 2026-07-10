@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -19,8 +20,13 @@ const (
 // applies its schema. modernc.org/sqlite is a pure-Go driver, so the binary
 // still cross-compiles with CGO disabled.
 func openDatabase(path string) (*sql.DB, error) {
-	if dir := filepath.Dir(path); dir != "." && dir != "" {
-		if err := durableMkdirAll(dir, 0o755); err != nil {
+	if path != ":memory:" {
+		if dir := filepath.Dir(path); dir != "." && dir != "" {
+			if err := durableMkdirAll(dir, 0o700); err != nil {
+				return nil, err
+			}
+		}
+		if err := prepareDatabaseFile(path); err != nil {
 			return nil, err
 		}
 	}
@@ -51,7 +57,37 @@ func openDatabase(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	if path != ":memory:" {
+		if err := hardenSQLiteFileModes(path); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	return db, nil
+}
+
+func prepareDatabaseFile(path string) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("prepare database file: %w", err)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("secure database file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close prepared database file: %w", err)
+	}
+	return nil
+}
+
+func hardenSQLiteFileModes(path string) error {
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(candidate, 0o600); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("secure SQLite file %s: %w", candidate, err)
+		}
+	}
+	return nil
 }
 
 // sqliteDatabaseDSN builds a URI instead of appending query parameters to the
@@ -147,10 +183,29 @@ CREATE TABLE IF NOT EXISTS user_subscriptions (
     expires_at      INTEGER NOT NULL,
     created_at      INTEGER NOT NULL,
     allow_proxy     INTEGER NOT NULL DEFAULT 1,
+    quota_generation INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user_expiry
 ON user_subscriptions(user_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_user_subscriptions_source_cdk
+ON user_subscriptions(source_cdk_code, user_id, created_at, id);
+CREATE TABLE IF NOT EXISTS user_quota_reservations (
+    job_id          TEXT NOT NULL,
+    subscription_id TEXT NOT NULL,
+    user_id         TEXT NOT NULL,
+    reserved_bytes  INTEGER NOT NULL CHECK(reserved_bytes > 0),
+    require_proxy   INTEGER NOT NULL DEFAULT 0 CHECK(require_proxy IN (0, 1)),
+    created_at      INTEGER NOT NULL,
+    quota_generation INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(job_id, subscription_id),
+    FOREIGN KEY(subscription_id) REFERENCES user_subscriptions(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_user_quota_reservations_user
+ON user_quota_reservations(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_user_quota_reservations_subscription
+ON user_quota_reservations(subscription_id, require_proxy);
 CREATE TABLE IF NOT EXISTS cdk_resolve_history (
     id           TEXT PRIMARY KEY,
     cdk_code     TEXT NOT NULL,
@@ -184,6 +239,9 @@ ON proxy_temp_cleanups(cleanup_after);`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	if err := migrateQuotaReservationGenerations(db); err != nil {
+		return fmt.Errorf("migrate quota reservation generations: %w", err)
+	}
 	if err := migrateCDKToTraffic(db); err != nil {
 		return fmt.Errorf("migrate cdks to traffic: %w", err)
 	}
@@ -203,6 +261,23 @@ ON proxy_temp_cleanups(cleanup_after);`
 		return fmt.Errorf("migrate storage schema: %w", err)
 	}
 	return nil
+}
+
+func migrateQuotaReservationGenerations(db *sql.DB) error {
+	if err := addColumnIfMissing(
+		db,
+		"user_subscriptions",
+		"quota_generation",
+		`ALTER TABLE user_subscriptions ADD COLUMN quota_generation INTEGER NOT NULL DEFAULT 0`,
+	); err != nil {
+		return err
+	}
+	return addColumnIfMissing(
+		db,
+		"user_quota_reservations",
+		"quota_generation",
+		`ALTER TABLE user_quota_reservations ADD COLUMN quota_generation INTEGER NOT NULL DEFAULT 0`,
+	)
 }
 
 func migrateUserSessionsToDigests(db *sql.DB) error {

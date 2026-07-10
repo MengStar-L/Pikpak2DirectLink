@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"embed"
@@ -9,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -34,6 +37,9 @@ type Server struct {
 	logs                 *logStore
 	authSessions         adminSessionStore
 	creds                adminCredentialStore
+	authLimiter          *authLimiter
+	setupBootstrapToken  string
+	setupBootstrapUntil  time.Time
 	secrets              *SecretCipher
 	appSecrets           *appSecretStore
 	legacyBackup         *migrationBackup
@@ -54,6 +60,13 @@ type Server struct {
 	batches              map[string]*batchState
 	proxyFailuresMu      sync.Mutex
 	proxyFailures        map[string]proxyFailureCacheEntry
+	admission            *jobAdmission
+	proxyLimit           *proxyLimiter
+	premiumRefreshMu     sync.Mutex
+	premiumRefreshCancel context.CancelFunc
+	premiumRefreshActive bool
+	premiumRefreshClosed bool
+	premiumRefreshWG     sync.WaitGroup
 	healthCancel         context.CancelFunc
 	healthDone           chan struct{}
 	historyCancel        context.CancelFunc
@@ -71,7 +84,11 @@ type Server struct {
 	nowFunc              func() time.Time
 }
 
-const resourceParseErrorThreshold = 2
+const (
+	resourceParseErrorThreshold = 2
+	setupBootstrapTTL           = 30 * time.Minute
+	setupBootstrapHeader        = "X-Setup-Token"
+)
 
 type configResponse struct {
 	Configured            bool   `json:"configured"`
@@ -222,6 +239,15 @@ func NewServer(cfg Config) (*Server, error) {
 			authSessions.invalidateAll()
 		}
 	}
+	setupBootstrapToken := ""
+	setupBootstrapUntil := time.Time{}
+	if !creds.HasPassword() {
+		setupBootstrapToken, err = generateSessionID()
+		if err != nil {
+			return nil, fmt.Errorf("generate initial setup token: %w", err)
+		}
+		setupBootstrapUntil = time.Now().Add(setupBootstrapTTL)
+	}
 	sqlJobs := newSQLJobStore(db, secretCipher)
 	if err := sqlJobs.RotateSecrets(); err != nil {
 		return nil, fmt.Errorf("rotate resolve job secrets: %w", err)
@@ -231,6 +257,10 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	if _, err := sqlJobs.markNonterminalInterrupted(time.Now()); err != nil {
 		return nil, fmt.Errorf("mark interrupted resolve jobs: %w", err)
+	}
+	users := newUserStore(db)
+	if _, err := users.reconcileQuotaReservations(time.Now()); err != nil {
+		return nil, fmt.Errorf("reconcile user quota reservations: %w", err)
 	}
 	tempCleanups := newProxyTempCleanupStore(db, secretCipher)
 	if err := tempCleanups.RotateSecrets(); err != nil {
@@ -245,33 +275,38 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	server := &Server{
-		config:        cfg,
-		accounts:      accounts,
-		accountStore:  accountStore,
-		jobs:          newJobStore(200, sqlJobs),
-		durableJobs:   sqlJobs,
-		logs:          newLogStore(500),
-		authSessions:  authSessions,
-		creds:         creds,
-		secrets:       secretCipher,
-		appSecrets:    appSecrets,
-		legacyBackup:  legacyBackup,
-		backups:       backups,
-		storageLock:   storageLock,
-		db:            db,
-		cdk:           newCDKStore(db),
-		users:         newUserStore(db),
-		settings:      settings,
-		history:       newResolveHistoryStore(db, sqlJobs),
-		tempCleanups:  tempCleanups,
-		oauthStates:   newOAuthStateStore(),
-		gateHTML:      gateHTML,
-		userHTML:      userHTML,
-		mux:           http.NewServeMux(),
-		batches:       make(map[string]*batchState),
-		proxyFailures: make(map[string]proxyFailureCacheEntry),
-		restartCh:     make(chan struct{}),
+		config:              cfg,
+		accounts:            accounts,
+		accountStore:        accountStore,
+		jobs:                newJobStore(maxGlobalNonterminalJobs+100, sqlJobs),
+		durableJobs:         sqlJobs,
+		logs:                newLogStore(500),
+		authSessions:        authSessions,
+		creds:               creds,
+		authLimiter:         newAuthLimiter(),
+		setupBootstrapToken: setupBootstrapToken,
+		setupBootstrapUntil: setupBootstrapUntil,
+		secrets:             secretCipher,
+		appSecrets:          appSecrets,
+		legacyBackup:        legacyBackup,
+		backups:             backups,
+		storageLock:         storageLock,
+		db:                  db,
+		cdk:                 newCDKStore(db),
+		users:               users,
+		settings:            settings,
+		history:             newResolveHistoryStore(db, sqlJobs),
+		tempCleanups:        tempCleanups,
+		oauthStates:         newOAuthStateStore(),
+		gateHTML:            gateHTML,
+		userHTML:            userHTML,
+		mux:                 http.NewServeMux(),
+		batches:             make(map[string]*batchState),
+		proxyFailures:       make(map[string]proxyFailureCacheEntry),
+		proxyLimit:          newDefaultProxyLimiter(),
+		restartCh:           make(chan struct{}),
 	}
+	server.admission = newJobAdmission(server.jobs)
 
 	if err := server.accounts.EnsureCredentialSchedule(time.Now(), server.accountHealthInterval()); err != nil {
 		db.Close()
@@ -420,6 +455,12 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.closeOnce.Do(func() {
+		s.premiumRefreshMu.Lock()
+		s.premiumRefreshClosed = true
+		if s.premiumRefreshCancel != nil {
+			s.premiumRefreshCancel()
+		}
+		s.premiumRefreshMu.Unlock()
 		if s.updaterCancel != nil {
 			s.updaterCancel()
 		}
@@ -440,6 +481,7 @@ func (s *Server) Close() error {
 				<-done
 			}
 		}
+		s.premiumRefreshWG.Wait()
 		if s.db != nil {
 			if s.config.DBFile != ":memory:" {
 				if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
@@ -511,11 +553,19 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleAuthSetup lets the first visitor set the admin password. Once a password
-// exists this endpoint is closed, so it can only ever be used once.
+// handleAuthSetup lets the local operator holding the startup token set the
+// admin password. Once a password exists this endpoint is closed permanently.
 func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	if s.creds.HasPassword() {
 		writeError(w, http.StatusConflict, "password has already been set")
+		return
+	}
+	if !isLocalSetupRequest(r) {
+		writeError(w, http.StatusForbidden, "initial password setup is only available from localhost")
+		return
+	}
+	if !s.validSetupBootstrapToken(r.Header.Get(setupBootstrapHeader)) {
+		writeError(w, http.StatusForbidden, "initial setup token is invalid or expired")
 		return
 	}
 
@@ -541,6 +591,40 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "configured"})
 }
 
+func (s *Server) validSetupBootstrapToken(provided string) bool {
+	if s == nil || s.setupBootstrapToken == "" || !s.now().Before(s.setupBootstrapUntil) {
+		return false
+	}
+	return constantTimeTokenEqual(s.setupBootstrapToken, strings.TrimSpace(provided))
+}
+
+// InitialSetupURL returns the short-lived, localhost-only URL used to transfer
+// the in-memory bootstrap token from the server console into the gate page.
+// The token lives in the fragment so browsers never send it in an HTTP URL.
+func (s *Server) InitialSetupURL() string {
+	if s == nil || s.creds == nil || s.creds.HasPassword() || !s.validSetupBootstrapToken(s.setupBootstrapToken) {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(strings.TrimSpace(s.config.Addr))
+	if err != nil || port == "" {
+		return ""
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	hostIP := net.ParseIP(host)
+	switch {
+	case host == "" || hostIP != nil && hostIP.IsUnspecified():
+		host = "127.0.0.1"
+	case strings.EqualFold(host, "localhost"):
+	case hostIP == nil || !hostIP.IsLoopback():
+		return ""
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/#setup_token=" + s.setupBootstrapToken
+}
+
+func (s *Server) InitialSetupRequired() bool {
+	return s != nil && s.creds != nil && !s.creds.HasPassword()
+}
+
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if !s.creds.HasPassword() {
 		writeError(w, http.StatusConflict, "password has not been set yet")
@@ -552,17 +636,76 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	attempt := authAttemptForRequest(r, "admin")
+	admission, retryAfter, admitted := s.authLimiter.admit(attempt, s.now())
+	if !admitted {
+		writeAuthRateLimit(w, retryAfter)
+		return
+	}
+	defer func() { admission.cancel(s.now()) }()
 
-	if !s.creds.Verify(req.Password) {
+	verified, err := s.creds.VerifyContext(r.Context(), req.Password)
+	if errors.Is(err, errPasswordHashBusy) {
+		writePasswordHashBusy(w)
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to authenticate")
+		return
+	}
+	if !verified {
+		admission.fail(s.now())
 		writeError(w, http.StatusUnauthorized, "incorrect password")
 		return
 	}
+	admission.succeed(s.now())
 
 	if err := s.issueSession(w); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create session")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "authenticated"})
+}
+
+func isLocalSetupRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	for _, header := range []string{
+		"Forwarded",
+		"Via",
+		"X-Forwarded-For",
+		"X-Forwarded-Host",
+		"X-Forwarded-Port",
+		"X-Forwarded-Proto",
+		"X-Real-IP",
+	} {
+		if strings.TrimSpace(r.Header.Get(header)) != "" {
+			return false
+		}
+	}
+	remoteHost, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		remoteHost = strings.Trim(strings.TrimSpace(r.RemoteAddr), "[]")
+	}
+	remoteIP := net.ParseIP(strings.Trim(remoteHost, "[]"))
+	if remoteIP == nil || !remoteIP.IsLoopback() {
+		return false
+	}
+
+	host := strings.TrimSpace(r.Host)
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	hostIP := net.ParseIP(host)
+	return hostIP != nil && hostIP.IsLoopback()
 }
 
 func (s *Server) issueSession(w http.ResponseWriter) error {
@@ -693,13 +836,56 @@ func (s *Server) handleClearLogs(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
-	defer cancel()
-	s.accounts.RefreshPremiumInfo(ctx)
+	s.triggerPremiumRefresh()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts": s.accounts.List(),
 	})
+}
+
+func (s *Server) triggerPremiumRefresh() {
+	if s == nil || s.accounts == nil {
+		return
+	}
+	s.premiumRefreshMu.Lock()
+	if s.premiumRefreshClosed || s.premiumRefreshActive {
+		s.premiumRefreshMu.Unlock()
+		return
+	}
+	timeout := s.config.RequestTimeout
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	s.premiumRefreshActive = true
+	s.premiumRefreshCancel = cancel
+	s.premiumRefreshWG.Add(1)
+	s.premiumRefreshMu.Unlock()
+
+	go func() {
+		defer s.premiumRefreshWG.Done()
+		defer cancel()
+		if err := s.accounts.RefreshPremiumInfo(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			s.logJob(LogError, "", "account premium state persistence failed", err.Error())
+			s.requestRestart()
+		}
+		s.premiumRefreshMu.Lock()
+		s.premiumRefreshActive = false
+		s.premiumRefreshCancel = nil
+		s.premiumRefreshMu.Unlock()
+	}()
+}
+
+func (s *Server) handleAccountStatePersistence(operation, accountID string, err error) {
+	if err == nil {
+		return
+	}
+	details := []string{"operation=" + operation, "error=" + err.Error()}
+	if accountID != "" {
+		details = append(details, "account="+accountID)
+	}
+	s.logJob(LogError, "", "account state persistence failed", details...)
+	s.requestRestart()
 }
 
 func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
@@ -785,7 +971,8 @@ func (s *Server) handleRefreshAccountLogin(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	checkedAt := s.now()
-	s.accounts.MarkCredentialCheckSuccess(account.ID, checkedAt, checkedAt.Add(s.accountHealthInterval()), nil)
+	s.handleAccountStatePersistence("credential-check-success", account.ID,
+		s.accounts.MarkCredentialCheckSuccess(account.ID, checkedAt, checkedAt.Add(s.accountHealthInterval()), nil))
 	if refreshed, ok := s.accounts.Summary(account.ID); ok {
 		account = refreshed
 	}
@@ -846,6 +1033,9 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if len(lines) > 1 {
 		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, "", "", priorityAdmin, s.baseURL(r))
 		if status != 0 {
+			if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
+				w.Header().Set("Retry-After", "30")
+			}
 			writeError(w, status, msg)
 			return
 		}
@@ -895,7 +1085,14 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		job.PassCode = passCode
 	}
 
-	if err := s.jobs.create(job); err != nil {
+	createErr := s.admission.withCapacity("", 1, func() error { return s.jobs.create(job) })
+	if createErr != nil {
+		var limitErr *jobAdmissionError
+		if errors.As(createErr, &limitErr) {
+			w.Header().Set("Retry-After", "30")
+			writeError(w, http.StatusServiceUnavailable, "resolve service is at capacity")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to persist job")
 		return
 	}
@@ -903,7 +1100,12 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if err := s.resolver.enqueue(job.ID, priorityAdmin, func(ctx context.Context) {
 		s.processJob(ctx, job.ID)
 	}); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "resolve queue is shutting down")
+		if errors.Is(err, errResolveQueueFull) {
+			w.Header().Set("Retry-After", "30")
+			writeError(w, http.StatusServiceUnavailable, "resolve service is at capacity")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "resolve queue is shutting down")
+		}
 		return
 	}
 
@@ -976,6 +1178,7 @@ var proxyHTTPClient = &http.Client{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   32,
+		MaxConnsPerHost:       32,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -997,11 +1200,11 @@ type proxyMultipartConfig struct {
 
 var defaultProxyMultipartConfig = proxyMultipartConfig{
 	Concurrency:    4,
-	ChunkSize:      16 << 20,
+	ChunkSize:      4 << 20,
 	MinSize:        64 << 20,
 	MaxAttempts:    3,
 	RetryBaseDelay: 250 * time.Millisecond,
-	WindowChunks:   8,
+	WindowChunks:   4,
 }
 
 const (
@@ -1092,8 +1295,24 @@ func (s *Server) rememberProxyFailure(jobID, token string, status int) {
 	if status == 0 {
 		status = http.StatusBadGateway
 	}
+	now := s.now()
+	for key, entry := range s.proxyFailures {
+		if !entry.Until.After(now) {
+			delete(s.proxyFailures, key)
+		}
+	}
+	if len(s.proxyFailures) >= maxProxyFailureCacheEntries {
+		var oldestKey string
+		var oldest time.Time
+		for key, entry := range s.proxyFailures {
+			if oldestKey == "" || entry.Until.Before(oldest) {
+				oldestKey, oldest = key, entry.Until
+			}
+		}
+		delete(s.proxyFailures, oldestKey)
+	}
 	s.proxyFailures[s.proxyFailureKey(jobID, token)] = proxyFailureCacheEntry{
-		Until:  s.now().Add(proxyFailureCacheTTL),
+		Until:  now.Add(proxyFailureCacheTTL),
 		Status: status,
 	}
 }
@@ -1257,6 +1476,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, proxyNotReadyError)
 		return
 	}
+	releaseProxy, limitStatus := s.proxyLimit.tryAcquire(s.proxyFailureKey(jobID, providedToken))
+	if limitStatus != 0 {
+		w.Header().Set("Retry-After", "5")
+		writeError(w, limitStatus, "proxy is busy; retry later")
+		return
+	}
+	defer releaseProxy()
 
 	sourceURL := strings.TrimSpace(result.DirectURL)
 	refreshed := false
@@ -1333,7 +1559,7 @@ func (s *Server) serveProxySingleStream(w http.ResponseWriter, r *http.Request, 
 
 	proxyReq, err := http.NewRequestWithContext(r.Context(), upstreamMethod, sourceURL, nil)
 	if err != nil {
-		return err
+		return redactProxyRequestError(err, sourceURL)
 	}
 	copyHeaderIfPresent(proxyReq.Header, r.Header, "Range")
 	copyHeaderIfPresent(proxyReq.Header, r.Header, "If-Range")
@@ -1342,7 +1568,7 @@ func (s *Server) serveProxySingleStream(w http.ResponseWriter, r *http.Request, 
 
 	resp, err := proxyHTTPClient.Do(proxyReq)
 	if err != nil {
-		return newProxyStreamRefreshError(err)
+		return newProxyStreamRefreshError(redactProxyRequestError(err, sourceURL))
 	}
 	defer resp.Body.Close()
 	if shouldRefreshProxyStatus(resp.StatusCode) {
@@ -1420,6 +1646,15 @@ func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sou
 	if cfg.Concurrency < 1 || cfg.ChunkSize <= 0 || cfg.MinSize <= 0 {
 		return false, nil
 	}
+	windowChunks := int64(cfg.WindowChunks)
+	if windowChunks < 1 || cfg.ChunkSize > maxProxyBufferedBytes/windowChunks {
+		return false, nil
+	}
+	releaseMultipart, ok := s.proxyLimit.tryAcquireMultipart(cfg.ChunkSize * windowChunks)
+	if !ok {
+		return false, nil
+	}
+	defer releaseMultipart()
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -1526,14 +1761,14 @@ func (s *Server) serveProxyMultipart(w http.ResponseWriter, r *http.Request, sou
 func probeProxyRangeSupport(ctx context.Context, sourceURL string) (proxyRangeProbe, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
 	if err != nil {
-		return proxyRangeProbe{}, false, err
+		return proxyRangeProbe{}, false, redactProxyRequestError(err, sourceURL)
 	}
 	req.Header.Set("Range", "bytes=0-0")
 	req.Header.Set("Accept-Encoding", "identity")
 
 	resp, err := proxyHTTPClient.Do(req)
 	if err != nil {
-		return proxyRangeProbe{}, false, newProxyStreamRefreshError(err)
+		return proxyRangeProbe{}, false, newProxyStreamRefreshError(redactProxyRequestError(err, sourceURL))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusPartialContent {
@@ -1662,14 +1897,14 @@ func fetchProxyRange(ctx context.Context, sourceURL string, br proxyByteRange, c
 func fetchProxyRangeOnce(ctx context.Context, sourceURL string, br proxyByteRange) proxyRangeResult {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
 	if err != nil {
-		return proxyRangeResult{Range: br, Err: newProxyRangeError(err, false)}
+		return proxyRangeResult{Range: br, Err: newProxyRangeError(redactProxyRequestError(err, sourceURL), false)}
 	}
 	req.Header.Set("Range", formatProxyRange(br))
 	req.Header.Set("Accept-Encoding", "identity")
 
 	resp, err := proxyHTTPClient.Do(req)
 	if err != nil {
-		return proxyRangeResult{Range: br, Err: newProxyRangeError(err, true)}
+		return proxyRangeResult{Range: br, Err: newProxyRangeError(redactProxyRequestError(err, sourceURL), true)}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusPartialContent {
@@ -1687,6 +1922,32 @@ func fetchProxyRangeOnce(ctx context.Context, sourceURL string, br proxyByteRang
 		return proxyRangeResult{Range: br, Err: newProxyRangeError(err, true)}
 	}
 	return proxyRangeResult{Range: br, Data: data}
+}
+
+func redactProxyRequestError(err error, sourceURL string) error {
+	if err == nil {
+		return nil
+	}
+	redacted := redactURLError(err, "[redacted upstream URL]")
+	message := redacted.Error()
+	if sourceURL != "" {
+		message = strings.ReplaceAll(message, sourceURL, "[redacted upstream URL]")
+	}
+	if message == redacted.Error() {
+		return redacted
+	}
+	return errors.New(message)
+}
+
+func redactURLError(err error, replacement string) error {
+	var requestErr *url.Error
+	if !errors.As(err, &requestErr) {
+		return err
+	}
+	redacted := *requestErr
+	redacted.URL = replacement
+	redacted.Err = redactURLError(requestErr.Err, replacement)
+	return &redacted
 }
 
 func proxyRangeFailureDetails(res proxyRangeResult) []string {
@@ -1785,6 +2046,8 @@ const (
 
 const jobPersistenceUserError = "job could not be completed because durable storage is unavailable"
 
+const selectionCapacityUserError = "too many jobs are waiting for file selection; complete an existing selection and try again"
+
 var errJobAlreadyCompleted = errors.New("job is already completed")
 
 type jobPersistenceError struct {
@@ -1822,7 +2085,7 @@ func (s *Server) handleJobPersistenceFailure(jobID string, account AccountRuntim
 		s.requestRestart()
 		return true
 	}
-	s.accounts.MarkAvailable(account.ID)
+	s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
 	if finishAttempt {
 		s.finishAccountAttempt(jobID, account.ID, "failed", jobPersistenceUserError)
 	}
@@ -1864,7 +2127,7 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 		cancel()
 
 		if err == nil {
-			s.accounts.MarkAvailable(account.ID)
+			s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
 			s.finishAccountAttempt(jobID, account.ID, "success", "")
 			return
 		}
@@ -1878,20 +2141,29 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 			return
 		}
 
+		var selectionLimitErr *jobAdmissionError
+		if errors.As(err, &selectionLimitErr) && selectionLimitErr.Selection {
+			s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
+			s.finishAccountAttempt(jobID, account.ID, "failed", selectionCapacityUserError)
+			s.logJob(LogWarn, jobID, "user selection capacity reached", selectionLimitErr.Error())
+			s.failJobWithCode(jobID, errors.New(selectionCapacityUserError), "selection_capacity")
+			return
+		}
+
 		// A CDK traffic overdraw is deterministic and not the account's fault:
 		// retrying on other accounts would just repeat the expensive transfer and
 		// hit the same refusal. Fail the job terminally instead.
 		var overdraw errCDKOverdraw
 		var userOverdraw errUserQuotaOverdraw
 		if errors.As(err, &overdraw) || errors.As(err, &userOverdraw) {
-			s.accounts.MarkAvailable(account.ID)
+			s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
 			s.finishAccountAttempt(jobID, account.ID, "failed", err.Error())
 			s.logJob(LogWarn, jobID, "resolved file exceeds remaining user quota", err.Error())
 			s.failJob(jobID, err)
 			return
 		}
 		if isCDKRefusalError(err) {
-			s.accounts.MarkAvailable(account.ID)
+			s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
 			s.finishAccountAttempt(jobID, account.ID, "failed", safeUserError(err.Error()))
 			s.logJob(LogWarn, jobID, "CDK refused the resolved file", safeUserError(err.Error()))
 			s.failJob(jobID, err)
@@ -1905,7 +2177,7 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 		// whole account pool as failed.
 		if isResourceUnavailableError(err) {
 			message := friendlyPikPakError(err)
-			s.accounts.MarkAvailable(account.ID)
+			s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
 			s.finishAccountAttempt(jobID, account.ID, "failed", message)
 			s.logJob(LogWarn, jobID, "资源已被 PikPak 下架或失效，已终止解析", message)
 			s.failJob(jobID, errors.New(message))
@@ -1918,7 +2190,7 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 		if isResourceParseError(err) {
 			parseErrors++
 			message := friendlyPikPakError(err)
-			s.accounts.MarkAvailable(account.ID)
+			s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
 			s.accounts.RecordParseError(account.ID, jobID, message)
 			s.finishAccountAttempt(jobID, account.ID, "failed", message)
 			s.logJob(LogWarn, jobID, fmt.Sprintf("资源解析错误（%d/%d），账号不禁用", parseErrors, resourceParseErrorThreshold), message)
@@ -1937,7 +2209,7 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 		}
 
 		message := friendlyPikPakError(err)
-		s.accounts.MarkFailed(account.ID, err)
+		s.handleAccountStatePersistence("mark-failed", account.ID, s.accounts.MarkFailed(account.ID, err))
 		s.finishAccountAttempt(jobID, account.ID, "failed", message)
 		failures = append(failures, account.Username+": "+message)
 	}
@@ -2065,7 +2337,7 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 		}
 	}
 
-	restoreIDs := []string{}
+	var restoreIDs []string
 	var items []DownloadItem
 	if len(selectedIDs) == 0 {
 		if parentID != "" && !scopedByTail {
@@ -2311,17 +2583,25 @@ func isCDKRefusalError(err error) bool {
 
 func (s *Server) requestSelection(jobID string, stage JobStage, message string, items []DownloadItem, accountID string) error {
 	sortItems(items)
-	_, err := s.jobs.update(jobID, func(job *Job) error {
-		job.Status = JobSelectionRequired
-		job.Stage = stage
-		job.Message = message
-		job.Error = ""
-		job.Items = items
-		if accountID != "" {
-			job.AccountID = accountID
-		}
-		return nil
+	job := mustJob(s.jobs.get(jobID))
+	err := s.admission.withSelection(job.UserID, jobID, func() error {
+		_, err := s.jobs.update(jobID, func(job *Job) error {
+			job.Status = JobSelectionRequired
+			job.Stage = stage
+			job.Message = message
+			job.Error = ""
+			job.Items = items
+			if accountID != "" {
+				job.AccountID = accountID
+			}
+			return nil
+		})
+		return err
 	})
+	var limitErr *jobAdmissionError
+	if errors.As(err, &limitErr) {
+		return err
+	}
 	return wrapJobPersistenceError("persist job selection", err)
 }
 
@@ -2341,7 +2621,7 @@ func (s *Server) resolveExistingFile(ctx context.Context, jobID string, item Dow
 		if s.handleJobPersistenceFailure(jobID, account, err, false) {
 			return
 		}
-		s.accounts.MarkFailed(account.ID, err)
+		s.handleAccountStatePersistence("mark-failed", account.ID, s.accounts.MarkFailed(account.ID, err))
 		s.failJob(jobID, err)
 	}
 }
@@ -2364,24 +2644,57 @@ func (s *Server) resolveExistingFiles(ctx context.Context, jobID string, items [
 		if s.handleJobPersistenceFailure(jobID, account, err, false) {
 			return
 		}
-		s.accounts.MarkFailed(account.ID, err)
+		s.handleAccountStatePersistence("mark-failed", account.ID, s.accounts.MarkFailed(account.ID, err))
 		s.failJob(jobID, err)
 	}
 }
 
 func (s *Server) completeJob(ctx context.Context, jobID string, account AccountRuntime, item DownloadItem) error {
+	job := mustJob(s.jobs.get(jobID))
+	reservedBytes := int64(0)
+	if job.UserID != "" && s.users != nil {
+		reservedBytes = parseBytes(item.Size)
+		if reservedBytes > 0 {
+			if err := s.users.reserveQuota(jobID, job.UserID, reservedBytes, job.Mode == "proxy", s.now()); err != nil {
+				return err
+			}
+		}
+		defer func() {
+			if reservedBytes > 0 {
+				if _, err := s.users.releaseQuotaReservation(jobID); err != nil {
+					s.logJob(LogError, jobID, "quota reservation release failed", err.Error())
+					s.requestRestart()
+				}
+			}
+		}()
+	}
 	result, err := s.resolveFileLink(ctx, jobID, account, item)
 	if err != nil {
 		return err
 	}
 
 	size := parseBytes(result.File.Size)
+	if job.UserID != "" && s.users != nil && size != reservedBytes {
+		if reservedBytes > 0 {
+			if _, err := s.users.releaseQuotaReservation(jobID); err != nil {
+				return fmt.Errorf("adjust quota reservation: %w", err)
+			}
+			reservedBytes = 0
+		}
+		if size > 0 {
+			if err := s.users.reserveQuota(jobID, job.UserID, size, job.Mode == "proxy", s.now()); err != nil {
+				return err
+			}
+			reservedBytes = size
+		}
+	}
 	if err := s.finalizeCompletedJob(jobID, account, result, nil, size, item.ID); err != nil {
 		if errors.Is(err, errJobAlreadyCompleted) {
 			return nil
 		}
 		return err
 	}
+	reservedBytes = 0
 	s.logJob(LogSuccess, jobID, "解析任务完成", "文件："+firstNonEmpty(result.File.Name, result.File.Path))
 	s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(size))
 	s.saveCDKHistory(jobID)
@@ -2449,14 +2762,24 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 	// applyItemsSelection; this also covers the batch-child path, which resolves
 	// every file unattended and would otherwise overdraw.
 	job := mustJob(s.jobs.get(jobID))
+	reservedBytes := int64(0)
 	if job.UserID != "" && s.users != nil {
-		var sum int64
 		for _, item := range items {
-			sum += parseBytes(item.Size)
+			reservedBytes += parseBytes(item.Size)
 		}
-		if err := s.users.hasQuota(job.UserID, sum, job.Mode == "proxy", s.now()); err != nil {
-			return err
+		if reservedBytes > 0 {
+			if err := s.users.reserveQuota(jobID, job.UserID, reservedBytes, job.Mode == "proxy", s.now()); err != nil {
+				return err
+			}
 		}
+		defer func() {
+			if reservedBytes > 0 {
+				if _, err := s.users.releaseQuotaReservation(jobID); err != nil {
+					s.logJob(LogError, jobID, "quota reservation release failed", err.Error())
+					s.requestRestart()
+				}
+			}
+		}()
 	} else if cdkCode := job.CDKCode; cdkCode != "" {
 		var sum int64
 		for _, item := range items {
@@ -2477,6 +2800,20 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 		results = append(results, *result)
 		totalSize += parseBytes(result.File.Size)
 	}
+	if job.UserID != "" && s.users != nil && totalSize != reservedBytes {
+		if reservedBytes > 0 {
+			if _, err := s.users.releaseQuotaReservation(jobID); err != nil {
+				return fmt.Errorf("adjust quota reservation: %w", err)
+			}
+			reservedBytes = 0
+		}
+		if totalSize > 0 {
+			if err := s.users.reserveQuota(jobID, job.UserID, totalSize, job.Mode == "proxy", s.now()); err != nil {
+				return err
+			}
+			reservedBytes = totalSize
+		}
+	}
 
 	fallbackIDs := downloadItemIDs(items)
 	if err := s.finalizeCompletedJob(jobID, account, nil, results, totalSize, fallbackIDs...); err != nil {
@@ -2485,6 +2822,7 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 		}
 		return err
 	}
+	reservedBytes = 0
 	s.logJob(LogSuccess, jobID, fmt.Sprintf("解析任务完成，共 %d 个文件", len(results)))
 	s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(totalSize))
 	s.saveCDKHistory(jobID)
@@ -2547,8 +2885,17 @@ func (s *Server) finalizeCompletedJob(jobID string, account AccountRuntime, resu
 			if s.users == nil {
 				return errors.New("user quota storage is not configured")
 			}
-			if err := s.users.chargeIfEnoughTx(tx, job.UserID, chargedBytes, job.Mode == "proxy", now); err != nil {
+			settledBytes, err := s.users.settleQuotaReservationTx(tx, jobID)
+			if err != nil {
 				return err
+			}
+			if settledBytes == 0 && chargedBytes > 0 {
+				// Compatibility backstop for pre-reservation callers and legacy tests.
+				if err := s.users.chargeIfEnoughTx(tx, job.UserID, chargedBytes, job.Mode == "proxy", now); err != nil {
+					return err
+				}
+			} else if settledBytes != chargedBytes {
+				return fmt.Errorf("quota reservation settled %d bytes, want %d", settledBytes, chargedBytes)
 			}
 		} else if job.CDKCode != "" {
 			if s.cdk == nil {
@@ -3424,28 +3771,52 @@ func (s *Server) finishAccountAttempt(jobID, accountID, status, errText string) 
 }
 
 func (s *Server) updateJobState(jobID string, status JobStatus, stage JobStage, message, errText string) {
-	_, _ = s.jobs.update(jobID, func(job *Job) error {
+	_, err := s.jobs.update(jobID, func(job *Job) error {
 		job.Status = status
 		job.Stage = stage
 		job.Message = message
 		job.Error = errText
 		return nil
 	})
+	if err != nil {
+		s.logJob(LogError, jobID, "job state persistence failed", err.Error())
+		s.requestRestart()
+	}
 }
 
 func (s *Server) failJob(jobID string, err error) {
 	failureCode := "resolve_failed"
 	if errors.Is(err, errResolveQueueClosed) {
 		failureCode = "service_shutdown"
+	} else if errors.Is(err, errResolveQueueFull) {
+		failureCode = "service_busy"
 	}
-	_, _ = s.jobs.update(jobID, func(job *Job) error {
+	s.failJobWithCode(jobID, err, failureCode)
+}
+
+func (s *Server) failJobWithCode(jobID string, cause error, failureCode string) {
+	if cause == nil {
+		cause = errors.New("resolve failed")
+	}
+	updated, err := s.jobs.update(jobID, func(job *Job) error {
 		job.Status = JobFailed
 		job.Stage = StageFailed
 		job.Message = ""
-		job.Error = err.Error()
+		job.Error = cause.Error()
 		job.FailureCode = failureCode
 		return nil
 	})
+	if err != nil {
+		s.logJob(LogError, jobID, "terminal job persistence failed", err.Error())
+		s.requestRestart()
+		return
+	}
+	if updated != nil && updated.UserID != "" && s.users != nil {
+		if _, err := s.users.releaseQuotaReservation(jobID); err != nil {
+			s.logJob(LogError, jobID, "quota reservation release failed", err.Error())
+			s.requestRestart()
+		}
+	}
 }
 
 func (s *Server) baseURL(r *http.Request) string {
@@ -3469,10 +3840,29 @@ func (s *Server) baseURL(r *http.Request) string {
 
 func decodeJSON(r *http.Request, dst any) error {
 	defer r.Body.Close()
-	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || !(mediaType == "application/json" || strings.HasPrefix(mediaType, "application/") && strings.HasSuffix(mediaType, "+json")) {
+		return errors.New("Content-Type must be application/json")
+	}
+	const maxJSONBody = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBody+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > maxJSONBody {
+		return errors.New("JSON request body exceeds 1 MiB")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {
 		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain a single JSON value")
+		}
+		return fmt.Errorf("invalid trailing JSON content: %w", err)
 	}
 	return nil
 }

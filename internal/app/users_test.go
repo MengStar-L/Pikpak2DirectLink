@@ -6,6 +6,22 @@ import (
 	"time"
 )
 
+func TestVerifyEmailLoginKeepsUnknownEmailGeneric(t *testing.T) {
+	db, err := openDatabase(":memory:")
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	users := newUserStore(db)
+	if _, err := users.verifyEmailLogin("missing@example.com", "candidate-password"); !errors.Is(err, errInvalidCredentials) {
+		t.Fatalf("unknown email err = %v, want errInvalidCredentials", err)
+	}
+	if !verifyPasswordRecord(dummyPasswordRecord, "pikpak2directlink-dummy-password") {
+		t.Fatal("reusable dummy password record is invalid")
+	}
+}
+
 func TestUserRedeemAndChargeSubscriptionsByExpiry(t *testing.T) {
 	db, err := openDatabase(":memory:")
 	if err != nil {

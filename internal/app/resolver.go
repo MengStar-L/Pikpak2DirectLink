@@ -24,6 +24,7 @@ const (
 const maxResolveConcurrency = 32
 
 var errResolveQueueClosed = errors.New("resolve queue is closed")
+var errResolveQueueFull = errors.New("resolve queue is full")
 
 // queueEntry is one unit of work waiting for a resolution slot.
 type queueEntry struct {
@@ -112,6 +113,13 @@ func (q *resolveQueue) enqueue(jobID string, priority int, run func(ctx context.
 			q.fail(jobID, errResolveQueueClosed)
 		}
 		return errResolveQueueClosed
+	}
+	if len(q.entries)+len(q.running) >= maxGlobalNonterminalJobs {
+		q.mu.Unlock()
+		if q.fail != nil {
+			q.fail(jobID, errResolveQueueFull)
+		}
+		return errResolveQueueFull
 	}
 
 	insertAt := len(q.entries)

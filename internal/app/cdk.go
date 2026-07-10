@@ -225,7 +225,7 @@ func (s *cdkStore) createBatch(count int, remainingBytes int64, days int, allowP
 }
 
 func (s *cdkStore) list() ([]CDK, error) {
-	rows, err := s.db.Query(cdkSelectSQL + ` ORDER BY created_at DESC, code`)
+	rows, err := s.db.Query(cdkSelectSQL + ` ORDER BY c.created_at DESC, c.code`)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +243,7 @@ func (s *cdkStore) list() ([]CDK, error) {
 }
 
 func (s *cdkStore) get(code string) (CDK, bool, error) {
-	c, err := scanCDK(s.db.QueryRow(cdkSelectSQL+` WHERE code=?`, code))
+	c, err := scanCDK(s.db.QueryRow(cdkSelectSQL+` WHERE c.code=?`, code))
 	if errors.Is(err, sql.ErrNoRows) {
 		return CDK{}, false, nil
 	}
@@ -257,7 +257,25 @@ type cdkScanner interface {
 	Scan(dest ...any) error
 }
 
-const cdkSelectSQL = `SELECT code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy, duration_days, COALESCE(redeemed_by_user_id, ''), COALESCE(redeemed_at, 0), COALESCE(revoked_at, 0) FROM cdks`
+const cdkSelectSQL = `SELECT
+ c.code,
+ CASE WHEN c.redeemed_at>0 AND s.id IS NOT NULL THEN s.remaining_bytes ELSE c.remaining_bytes END,
+ CASE WHEN c.redeemed_at>0 AND s.id IS NOT NULL THEN s.used_bytes ELSE c.used_bytes END,
+ CASE WHEN c.redeemed_at>0 AND s.id IS NOT NULL THEN s.expires_at ELSE c.expires_at END,
+ c.created_at,
+ CASE WHEN c.redeemed_at>0 AND s.id IS NOT NULL THEN s.allow_proxy ELSE c.allow_proxy END,
+ c.duration_days,
+ COALESCE(c.redeemed_by_user_id, ''),
+ COALESCE(c.redeemed_at, 0),
+ COALESCE(c.revoked_at, 0)
+ FROM cdks AS c
+ LEFT JOIN user_subscriptions AS s ON s.id=(
+     SELECT us.id FROM user_subscriptions AS us
+     WHERE us.source_cdk_code=c.code
+       AND us.user_id=COALESCE(c.redeemed_by_user_id, '')
+     ORDER BY us.created_at, us.id
+     LIMIT 1
+ )`
 
 func scanCDK(scanner cdkScanner) (CDK, error) {
 	var c CDK
@@ -282,21 +300,70 @@ func (s *cdkStore) update(code string, remainingBytes int64, days int, allowProx
 		days = 1
 	}
 	expiresAt := now.Add(time.Duration(days) * 24 * time.Hour).Unix()
-	res, err := s.db.Exec(`UPDATE cdks SET remaining_bytes=?, expires_at=?, allow_proxy=?, duration_days=? WHERE code=?`, remainingBytes, expiresAt, b2i(allowProxy), days, code)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return CDK{}, false, err
+	}
+	defer tx.Rollback()
+	var revokedAt sql.NullInt64
+	if err := tx.QueryRow(`SELECT revoked_at FROM cdks WHERE code=?`, code).Scan(&revokedAt); errors.Is(err, sql.ErrNoRows) {
+		return CDK{}, false, nil
+	} else if err != nil {
+		return CDK{}, false, err
+	} else if revokedAt.Valid && revokedAt.Int64 > 0 {
+		return CDK{}, true, errVoucherRevoked
+	}
+
+	res, err := tx.Exec(`UPDATE cdks SET remaining_bytes=?, expires_at=?, allow_proxy=?, duration_days=? WHERE code=?`, remainingBytes, expiresAt, b2i(allowProxy), days, code)
 	if err != nil {
 		return CDK{}, false, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return CDK{}, false, nil
 	}
-	return s.get(code)
+	if _, err := tx.Exec(
+		`UPDATE user_subscriptions
+		 SET remaining_bytes=?, expires_at=?, allow_proxy=?, quota_generation=quota_generation+1
+		 WHERE source_cdk_code=?
+		   AND EXISTS (
+		       SELECT 1 FROM cdks
+		       WHERE code=? AND redeemed_at IS NOT NULL AND redeemed_at>0
+		   )`,
+		remainingBytes, expiresAt, b2i(allowProxy), code, code,
+	); err != nil {
+		return CDK{}, false, err
+	}
+	if !allowProxy {
+		if _, err := tx.Exec(
+			`UPDATE user_quota_reservations
+			 SET quota_generation=?
+			 WHERE require_proxy=1
+			   AND subscription_id IN (
+			       SELECT id FROM user_subscriptions WHERE source_cdk_code=?
+			   )`,
+			invalidQuotaReservationGeneration, code,
+		); err != nil {
+			return CDK{}, false, err
+		}
+	}
+	updated, err := scanCDK(tx.QueryRow(cdkSelectSQL+` WHERE c.code=?`, code))
+	if err != nil {
+		return CDK{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return CDK{}, false, err
+	}
+	return updated, true, nil
 }
 
 func (s *cdkStore) revoke(code string, now time.Time) (CDK, bool, error) {
-	if _, ok, err := s.get(code); err != nil || !ok {
-		return CDK{}, ok, err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return CDK{}, false, err
 	}
-	_, err := s.db.Exec(
+	defer tx.Rollback()
+
+	res, err := tx.Exec(
 		`UPDATE cdks
 		 SET revoked_at=CASE WHEN revoked_at IS NULL OR revoked_at=0 THEN ? ELSE revoked_at END
 		 WHERE code=?`,
@@ -305,8 +372,35 @@ func (s *cdkStore) revoke(code string, now time.Time) (CDK, bool, error) {
 	if err != nil {
 		return CDK{}, false, err
 	}
-	updated, ok, err := s.get(code)
-	return updated, ok, err
+	if n, _ := res.RowsAffected(); n == 0 {
+		return CDK{}, false, nil
+	}
+	if _, err := tx.Exec(
+		`UPDATE user_subscriptions
+		 SET expires_at=min(expires_at, ?), quota_generation=quota_generation+1
+		 WHERE source_cdk_code=?`,
+		now.Unix(), code,
+	); err != nil {
+		return CDK{}, false, err
+	}
+	if _, err := tx.Exec(
+		`UPDATE user_quota_reservations
+		 SET quota_generation=?
+		 WHERE subscription_id IN (
+		     SELECT id FROM user_subscriptions WHERE source_cdk_code=?
+		 )`,
+		invalidQuotaReservationGeneration, code,
+	); err != nil {
+		return CDK{}, false, err
+	}
+	updated, err := scanCDK(tx.QueryRow(cdkSelectSQL+` WHERE c.code=?`, code))
+	if err != nil {
+		return CDK{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return CDK{}, false, err
+	}
+	return updated, true, nil
 }
 
 // merge moves the secondary CDK's remaining traffic into the primary CDK, keeps
@@ -335,7 +429,7 @@ func (s *cdkStore) merge(primaryCode, secondaryCode string, now time.Time) (CDK,
 
 	load := func(code string) (CDK, bool, error) {
 		c, err := scanCDK(tx.QueryRow(
-			cdkSelectSQL+` WHERE code=?`,
+			cdkSelectSQL+` WHERE c.code=?`,
 			code,
 		))
 		if errors.Is(err, sql.ErrNoRows) {

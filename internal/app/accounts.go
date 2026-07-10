@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -126,13 +127,18 @@ type accountState struct {
 	client pikpakClient
 }
 
+type accountRecordReplacer interface {
+	Replace([]accountRecord) error
+}
+
 type AccountPool struct {
-	mu       sync.RWMutex
-	config   AccountPoolConfig
-	accounts map[string]*accountState
-	order    []string
-	cursor   uint64 // rotating round-robin starting point for parallel resolves
-	store    *accountStore
+	mu             sync.RWMutex
+	config         AccountPoolConfig
+	accounts       map[string]*accountState
+	order          []string
+	cursor         uint64 // rotating round-robin starting point for parallel resolves
+	store          *accountStore
+	recordReplacer accountRecordReplacer
 }
 
 type accountPoolSnapshot struct {
@@ -140,7 +146,10 @@ type accountPoolSnapshot struct {
 	order    []string
 }
 
-const premiumRefreshInterval = 30 * time.Minute
+const (
+	premiumRefreshInterval    = 30 * time.Minute
+	premiumRefreshConcurrency = 4
+)
 
 const badResourceParseUserError = "该磁链连续遇到解析错误，请不要反复重试此链接。"
 
@@ -158,6 +167,9 @@ func NewAccountPool(cfg AccountPoolConfig) (*AccountPool, error) {
 		config:   cfg,
 		accounts: make(map[string]*accountState),
 		store:    cfg.Store,
+	}
+	if cfg.Store != nil {
+		pool.recordReplacer = cfg.Store
 	}
 	if err := pool.load(); err != nil {
 		return nil, err
@@ -386,12 +398,19 @@ func (p *AccountPool) NextCredentialCheck(now time.Time) (credentialCheckTarget,
 	return target, target.Account.ID != ""
 }
 
-func (p *AccountPool) RefreshPremiumInfo(ctx context.Context) {
+func (p *AccountPool) RefreshPremiumInfo(ctx context.Context) error {
 	now := time.Now()
 
 	type target struct {
 		id     string
+		state  *accountState
 		client pikpakClient
+	}
+	type result struct {
+		target    target
+		info      *pikpak.VIPInfo
+		err       error
+		checkedAt time.Time
 	}
 
 	p.mu.RLock()
@@ -402,37 +421,81 @@ func (p *AccountPool) RefreshPremiumInfo(ctx context.Context) {
 			continue
 		}
 		if premiumInfoNeedsRefresh(state.record, now) {
-			targets = append(targets, target{id: id, client: state.client})
+			targets = append(targets, target{
+				id:     id,
+				state:  state,
+				client: state.client,
+			})
 		}
 	}
 	p.mu.RUnlock()
-
-	for _, item := range targets {
-		if ctx.Err() != nil {
-			return
-		}
-
-		info, err := item.client.GetVIPInfo(ctx)
-
-		p.mu.Lock()
-		state := p.accounts[item.id]
-		if state != nil {
-			snapshot := p.snapshotLocked()
-			updatePremiumRecord(&state.record, info, err, time.Now())
-			state.record.UpdatedAt = time.Now()
-			_ = p.saveOrRollbackLocked(snapshot)
-		}
-		p.mu.Unlock()
+	if len(targets) == 0 {
+		return nil
 	}
+
+	jobs := make(chan target, len(targets))
+	results := make(chan result, len(targets))
+	for _, item := range targets {
+		jobs <- item
+	}
+	close(jobs)
+
+	workerCount := min(len(targets), premiumRefreshConcurrency)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for item := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				info, err := item.client.GetVIPInfo(ctx)
+				results <- result{target: item, info: info, err: err, checkedAt: time.Now()}
+			}
+		}()
+	}
+	workers.Wait()
+	close(results)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	snapshot := p.snapshotLocked()
+	changed := false
+	for item := range results {
+		state := p.accounts[item.target.id]
+		if state == nil || state != item.target.state || !samePikPakClient(state.client, item.target.client) {
+			continue
+		}
+		updatePremiumRecord(&state.record, item.info, item.err, item.checkedAt)
+		state.record.UpdatedAt = item.checkedAt
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return p.saveOrRollbackLocked(snapshot)
 }
 
-func (p *AccountPool) MarkCredentialCheckSuccess(id string, checkedAt, nextAt time.Time, cleanupErr error) {
+func samePikPakClient(current, snapshot pikpakClient) bool {
+	currentValue := reflect.ValueOf(current)
+	snapshotValue := reflect.ValueOf(snapshot)
+	if !currentValue.IsValid() || !snapshotValue.IsValid() {
+		return !currentValue.IsValid() && !snapshotValue.IsValid()
+	}
+	if currentValue.Type() != snapshotValue.Type() || !currentValue.Comparable() {
+		return false
+	}
+	return currentValue.Interface() == snapshotValue.Interface()
+}
+
+func (p *AccountPool) MarkCredentialCheckSuccess(id string, checkedAt, nextAt time.Time, cleanupErr error) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	state := p.accounts[id]
 	if state == nil {
-		return
+		return nil
 	}
 	snapshot := p.snapshotLocked()
 	state.record.Status = AccountAvailable
@@ -445,16 +508,16 @@ func (p *AccountPool) MarkCredentialCheckSuccess(id string, checkedAt, nextAt ti
 		state.record.CredentialCheckError = "测试文件清理失败：" + friendlyPikPakError(cleanupErr)
 	}
 	state.record.UpdatedAt = checkedAt
-	_ = p.saveOrRollbackLocked(snapshot)
+	return p.saveOrRollbackLocked(snapshot)
 }
 
-func (p *AccountPool) MarkCredentialCheckFailed(id string, err error, checkedAt, nextAt time.Time) {
+func (p *AccountPool) MarkCredentialCheckFailed(id string, err error, checkedAt, nextAt time.Time) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	state := p.accounts[id]
 	if state == nil {
-		return
+		return nil
 	}
 	snapshot := p.snapshotLocked()
 	message := friendlyPikPakError(err)
@@ -468,7 +531,7 @@ func (p *AccountPool) MarkCredentialCheckFailed(id string, err error, checkedAt,
 	state.record.CredentialNextCheckAt = formatAccountTime(nextAt)
 	state.record.CredentialCheckError = message
 	state.record.UpdatedAt = checkedAt
-	_ = p.saveOrRollbackLocked(snapshot)
+	return p.saveOrRollbackLocked(snapshot)
 }
 
 func (p *AccountPool) Snapshot() []AccountRuntime {
@@ -656,36 +719,36 @@ func (p *AccountPool) RefreshLogin(ctx context.Context, id string) (AccountSumma
 	return p.summaryLocked(id), nil
 }
 
-func (p *AccountPool) MarkFailed(id string, err error) {
+func (p *AccountPool) MarkFailed(id string, err error) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	state := p.accounts[id]
 	if state == nil {
-		return
+		return nil
 	}
 	snapshot := p.snapshotLocked()
 	state.record.Status = AccountFailed
 	state.record.LastError = friendlyPikPakError(err)
 	state.record.LastFailedAt = time.Now().Format(time.RFC3339)
 	state.record.UpdatedAt = time.Now()
-	_ = p.saveOrRollbackLocked(snapshot)
+	return p.saveOrRollbackLocked(snapshot)
 }
 
-func (p *AccountPool) MarkAvailable(id string) {
+func (p *AccountPool) MarkAvailable(id string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	state := p.accounts[id]
 	if state == nil {
-		return
+		return nil
 	}
 	snapshot := p.snapshotLocked()
 	state.record.Status = AccountAvailable
 	state.record.LastError = ""
 	state.record.LastFailedAt = ""
 	state.record.UpdatedAt = time.Now()
-	_ = p.saveOrRollbackLocked(snapshot)
+	return p.saveOrRollbackLocked(snapshot)
 }
 
 func (p *AccountPool) RecordParseError(id, jobID, message string) {
@@ -891,6 +954,9 @@ func (p *AccountPool) saveLocked() error {
 			continue
 		}
 		records = append(records, state.record)
+	}
+	if p.recordReplacer != nil {
+		return p.recordReplacer.Replace(records)
 	}
 	if p.store != nil {
 		return p.store.Replace(records)

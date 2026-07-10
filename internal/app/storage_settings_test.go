@@ -76,14 +76,18 @@ func TestStorageSettingsBackupAndMigrationDeletion(t *testing.T) {
 
 	wrongBody := bytes.NewBufferString(`{"backup_id":"wrong"}`)
 	recorder = httptest.NewRecorder()
-	server.handleDeleteMigrationBackup(recorder, httptest.NewRequest(http.MethodDelete, "/api/settings/storage/migration-backup", wrongBody))
+	request := httptest.NewRequest(http.MethodDelete, "/api/settings/storage/migration-backup", wrongBody)
+	request.Header.Set("Content-Type", "application/json")
+	server.handleDeleteMigrationBackup(recorder, request)
 	if recorder.Code != http.StatusConflict {
 		t.Fatalf("wrong ID status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 
 	body := bytes.NewBufferString(`{"backup_id":"` + backup.ID + `"}`)
 	recorder = httptest.NewRecorder()
-	server.handleDeleteMigrationBackup(recorder, httptest.NewRequest(http.MethodDelete, "/api/settings/storage/migration-backup", body))
+	request = httptest.NewRequest(http.MethodDelete, "/api/settings/storage/migration-backup", body)
+	request.Header.Set("Content-Type", "application/json")
+	server.handleDeleteMigrationBackup(recorder, request)
 	if recorder.Code != http.StatusNoContent {
 		t.Fatalf("delete status=%d body=%s", recorder.Code, recorder.Body.String())
 	}

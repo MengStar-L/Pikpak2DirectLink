@@ -43,12 +43,12 @@ function makeError(message: string, status?: number): ApiError {
   return err
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function request<T>(method: string, path: string, body?: unknown, extraHeaders?: Record<string, string>): Promise<T> {
   let res: Response
   try {
     res = await fetch(path, {
       method,
-      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+      headers: body !== undefined ? { 'Content-Type': 'application/json', ...extraHeaders } : extraHeaders,
       body: body !== undefined ? JSON.stringify(body) : undefined,
       credentials: 'same-origin',
     })
@@ -84,7 +84,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 export const api = {
   auth: {
     status: () => request<AuthStatus>('GET', '/api/auth/status'),
-    setup: (password: string) => request<AuthResult>('POST', '/api/auth/setup', { password }),
+    setup: (password: string, setupToken: string) =>
+      request<AuthResult>('POST', '/api/auth/setup', { password }, setupToken ? { 'X-Setup-Token': setupToken } : undefined),
     login: (password: string) => request<AuthResult>('POST', '/api/auth/login', { password }),
     logout: () => request<AuthResult>('POST', '/api/auth/logout'),
     password: (current_password: string, new_password: string) =>

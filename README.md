@@ -8,7 +8,7 @@
   <a href="https://github.com/MengStar-L/Pikpak2DirectLink/releases/latest">
     <img alt="Release" src="https://img.shields.io/github/v/release/MengStar-L/Pikpak2DirectLink?style=for-the-badge&label=release&color=ff6b35">
   </a>
-  <img alt="Go" src="https://img.shields.io/badge/go-1.26.2-334155?style=for-the-badge&logo=go&logoColor=white">
+  <img alt="Go" src="https://img.shields.io/badge/go-1.26.5-334155?style=for-the-badge&logo=go&logoColor=white">
   <img alt="Self Hosted" src="https://img.shields.io/badge/self--hosted-prod-111827?style=for-the-badge">
   <img alt="Proxy" src="https://img.shields.io/badge/proxy-token-0ea5e9?style=for-the-badge">
 </p>
@@ -35,7 +35,7 @@
 
 ## 快速开始
 
-下面以 Linux x86_64 服务器为例。默认安装目录为 `/opt/Pikpak2DirectLink`，默认监听端口为 `51873`。
+下面以 Linux x86_64 服务器为例。默认安装目录为 `/opt/Pikpak2DirectLink`，服务默认只监听 `127.0.0.1:51873`。
 
 ```bash
 sudo apt update
@@ -61,7 +61,15 @@ export DATA_ENCRYPTION_KEY="$(tr -d '\r\n' < .data-encryption-key)"
 curl http://127.0.0.1:51873/api/auth/status
 ```
 
-公网使用前请先配置 HTTPS 反向代理和 `PUBLIC_BASE_URL=https://你的域名`，再通过 `https://你的域名` 打开管理后台。首次访问时设置管理员密码，然后进入后台添加 PikPak 账号。
+首次初始化不要先开放反向代理。服务器没有桌面环境时，在自己的电脑上建立 SSH 隧道：
+
+```bash
+ssh -L 51873:127.0.0.1:51873 your-user@your-server
+```
+
+启动日志会输出一条包含 `#setup_token=...` 的初始设置 URL；systemd 部署可用 `journalctl -u Pikpak2DirectLink -n 50` 查看。保持隧道连接，在本机浏览器打开这条完整 URL 并设置管理员密码。URL 中的 token 只保存在内存中、启动 30 分钟后过期，过期后重启服务即可生成新 URL。
+
+初始化完成后再关闭隧道、配置 HTTPS 反向代理及 `PUBLIC_BASE_URL=https://你的域名`，然后通过域名访问管理后台。不要把初始设置 URL 发给其他人，也不要经公网反向代理打开它。
 
 > `DATA_ENCRYPTION_KEY` 是必填的 32 字节 Base64 密钥。首次生成后必须长期保留，后续启动继续使用同一密钥；丢失或误换密钥会导致已保存的账号凭据、session 和任务详情无法解密。请把密钥与数据库备份分开保管，不要提交到 Git。
 
@@ -112,10 +120,10 @@ Pikpak2DirectLink_windows_amd64.exe
 sudo apt update
 sudo apt install -y git curl ca-certificates openssl
 
-curl -LO https://go.dev/dl/go1.26.2.linux-amd64.tar.gz
+curl -LO https://go.dev/dl/go1.26.5.linux-amd64.tar.gz
 sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf go1.26.2.linux-amd64.tar.gz
-rm -f go1.26.2.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.26.5.linux-amd64.tar.gz
+rm -f go1.26.5.linux-amd64.tar.gz
 
 sudo mkdir -p /opt/Pikpak2DirectLink
 sudo chown -R "$USER:$USER" /opt/Pikpak2DirectLink
@@ -143,8 +151,10 @@ export DATA_ENCRYPTION_KEY="$(tr -d '\r\n' < .data-encryption-key)"
 如需修改监听地址或端口：
 
 ```bash
-ADDR=:8080 ./Pikpak2DirectLink
+ADDR=127.0.0.1:8080 ./Pikpak2DirectLink
 ```
+
+只有在完成管理员初始化并配置好防火墙或受信任的反向代理后，才应把 `ADDR` 改为非 loopback 地址。
 
 ### systemd 自启动
 
@@ -173,8 +183,8 @@ Type=simple
 User=$(whoami)
 WorkingDirectory=/opt/Pikpak2DirectLink
 EnvironmentFile=/etc/Pikpak2DirectLink/server.env
-Environment=ADDR=:51873
-# 公网部署：在 HTTPS 反向代理后运行，并设置外部 HTTPS 地址。
+Environment=ADDR=127.0.0.1:51873
+# 反向代理与程序位于同一台服务器时保留 loopback 监听，并设置外部 HTTPS 地址。
 #Environment=PUBLIC_BASE_URL=https://dl.example.com
 # 可选：固定管理员访问密码。保持注释则首次打开网页时在页面中设置密码。
 #Environment=ACCESS_PASSWORD=your_secure_password
@@ -212,14 +222,15 @@ sudo systemctl stop Pikpak2DirectLink
 
 ### 管理员后台
 
-1. 公网部署通过 HTTPS 反向代理打开 `https://dl.example.com`；`http://127.0.0.1:51873` 仅用于服务器本机调试。
-2. 首次访问时设置管理员密码；如果配置了 `ACCESS_PASSWORD`，则直接使用该固定密码登录。
-3. 进入「账号」页面，添加一个或多个 PikPak 账号，并按需要调整每月流量额度。
-4. 回到「解析」页面，粘贴磁力链接或 PikPak 分享链接；多行输入会自动创建批量任务。
-5. 如分享链接需要提取码，填写提取码。
-6. 选择「直链优先」或「代理优先」。
-7. 等待任务完成，复制直链或代理链接，或推送到 aria2。
-8. 如需排查问题，进入「日志」页面查看实时诊断信息。
+1. 新安装且未设置 `ACCESS_PASSWORD` 时，从启动日志取得包含 `#setup_token=...` 的完整初始设置 URL；远程管理服务器时先建立前述 SSH 隧道。
+2. 通过服务器本机或 SSH 隧道打开该 URL 并设置管理员密码；如果配置了 `ACCESS_PASSWORD`，则直接使用该固定密码登录。
+3. 初始化完成后再配置 HTTPS 反向代理和 `PUBLIC_BASE_URL`，公网部署通过 `https://dl.example.com` 访问。
+4. 进入「账号」页面，添加一个或多个 PikPak 账号，并按需要调整每月流量额度。
+5. 回到「解析」页面，粘贴磁力链接或 PikPak 分享链接；多行输入会自动创建批量任务。
+6. 如分享链接需要提取码，填写提取码。
+7. 选择「直链优先」或「代理优先」。
+8. 等待任务完成，复制直链或代理链接，或推送到 aria2。
+9. 如需排查问题，进入「日志」页面查看实时诊断信息。
 
 ### CDK 用户入口
 
@@ -259,11 +270,13 @@ https://dl.example.com/proxy/<job-id>?token=<token>
 
 代理链接不需要管理员登录即可访问，方便下载器直接调用；但只有持有令牌的人可以下载。解析完成后，程序会短期保留本次写入 PikPak 的临时文件，以便代理下载在直链临近过期或 CDN 早期断流时自动向 PikPak 刷新直链并重试。临时文件会在直链有效窗口结束后由后台自动清理；如果某个旧任务的临时文件已经被历史版本清理，代理链接仍可能需要重新解析后才能继续使用。
 
-公网服务应只通过启用 TLS 的反向代理暴露，应用自身可继续监听内网 HTTP。将 `PUBLIC_BASE_URL` 设置为用户实际访问的 HTTPS 根地址：
+公网服务应只通过启用 TLS 的反向代理暴露。反向代理与应用位于同一台服务器时，应用应继续监听默认的 loopback HTTP 地址。将 `PUBLIC_BASE_URL` 设置为用户实际访问的 HTTPS 根地址：
 
 ```bash
 PUBLIC_BASE_URL=https://your-domain.example
 ```
+
+同机反向代理还应正确追加 `X-Forwarded-For`（例如 Nginx 的 `$proxy_add_x_forwarded_for`）。程序只在直接对端为 loopback 时信任该链，并取最右侧的非 loopback 地址用于登录限流；公网直连请求携带的同名头会被忽略。
 
 该地址同时用于生成代理链接和决定会话 Cookie 的 `Secure` 属性。公网部署不要使用 `http://` 的 `PUBLIC_BASE_URL`，也不要绕过反向代理直接暴露应用端口。
 
@@ -277,7 +290,7 @@ PUBLIC_BASE_URL=https://your-domain.example
 | `DATA_ENCRYPTION_PREVIOUS_KEYS` | 空 | 轮换时用于读取旧数据的历史密钥，多个值以英文逗号分隔。 |
 | `PIKPAK_USERNAME` | 空 | 可选的启动账号。通常建议在网页中添加账号。 |
 | `PIKPAK_PASSWORD` | 空 | 与 `PIKPAK_USERNAME` 配套使用的启动账号密码。 |
-| `ADDR` | `:51873` | HTTP 服务监听地址。 |
+| `ADDR` | `127.0.0.1:51873` | HTTP 服务监听地址。默认仅允许本机或 SSH 隧道访问；完成初始化后再按部署拓扑决定是否修改。 |
 | `PUBLIC_BASE_URL` | 自动推断 | 生成代理链接时使用的公开访问地址。公网部署必须使用 HTTPS 反向代理并设置为 `https://...`。 |
 | `ACCESS_PASSWORD` | 空 | 固定管理员访问密码。设置后跳过首次设置流程，登录页只接受此密码。 |
 | `ACCESS_AUTH_FILE` | `data/auth.json` | 旧版管理员认证文件的迁移来源；v3.1.0 起活动数据保存在 SQLite。 |
@@ -306,7 +319,7 @@ PUBLIC_BASE_URL=https://your-domain.example
 
 ```bash
 DATA_ENCRYPTION_KEY=<由 openssl rand -base64 32 生成并安全保存的值>
-ADDR=:51873
+ADDR=127.0.0.1:51873
 PUBLIC_BASE_URL=https://dl.example.com
 ACCESS_PASSWORD=your_secure_password
 RESOLVE_CONCURRENCY=2
@@ -318,8 +331,8 @@ UPDATE_CHECK_INTERVAL=6h
 ## 安全建议
 
 - `DATA_ENCRYPTION_KEY` 必须由安全随机数生成并独立保管。不要把密钥写入仓库、镜像、公开日志或与数据库相同的可下载备份位置。
-- 访问门始终开启。不设置 `ACCESS_PASSWORD` 时，首次访问者会设置管理员密码；设置 `ACCESS_PASSWORD` 时，密码由环境变量固定，无法在网页中修改。
-- 公网部署时务必使用强密码，并通过可信 HTTPS 反向代理访问；`PUBLIC_BASE_URL` 应设置为外部 HTTPS 地址。
+- 访问门始终开启。不设置 `ACCESS_PASSWORD` 时，只能持启动日志中的短期 token 从服务器本机或 SSH 隧道完成首次管理员密码设置；不要公开或经公网反向代理使用这条 URL。设置 `ACCESS_PASSWORD` 时，密码由环境变量固定，无法在网页中修改。
+- 公网部署应在完成首次初始化后再启用可信 HTTPS 反向代理；务必使用强密码，并将 `PUBLIC_BASE_URL` 设置为外部 HTTPS 地址。
 - PikPak 账号密码、session 和完整任务内容以 AES-256-GCM 字段加密后保存在 SQLite；索引、状态和审计元数据不是全库加密，请继续限制服务器、数据库和备份目录权限。
 - 代理链接虽然带令牌，但仍应避免公开传播；拿到链接的人可以在有效期内下载对应文件。
 - CDK 用户入口 `/u` 是公开页面，访问能力由 CDK 本身控制。请合理设置 CDK 流量额度和有效期。

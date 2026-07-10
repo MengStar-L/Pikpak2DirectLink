@@ -54,6 +54,7 @@ func (s *Server) runResolveHistoryCleanup(ctx context.Context) {
 }
 
 func (s *Server) cleanupResolveHistory(now time.Time) {
+	s.expireSelectionJobs(now)
 	if s.history == nil {
 		s.cleanupProxyTempResources(now)
 		return
@@ -67,6 +68,46 @@ func (s *Server) cleanupResolveHistory(now time.Time) {
 		s.logJob(LogWarn, "", "CDK resolve history cleanup failed", err.Error())
 	}
 	s.cleanupProxyTempResources(now)
+}
+
+func (s *Server) expireSelectionJobs(now time.Time) {
+	if s.jobs == nil {
+		return
+	}
+	cutoff := now.Add(-selectionRequiredTimeout)
+	for _, jobID := range s.jobs.expiredSelectionIDs(cutoff) {
+		s.expireSelectionJob(jobID, cutoff)
+	}
+}
+
+var errSelectionNoLongerExpired = errors.New("job is no longer waiting on an expired selection")
+
+func (s *Server) expireSelectionJob(jobID string, cutoff time.Time) {
+	updated, err := s.jobs.update(jobID, func(job *Job) error {
+		if job.Status != JobSelectionRequired || job.UpdatedAt.After(cutoff) {
+			return errSelectionNoLongerExpired
+		}
+		job.Status = JobFailed
+		job.Stage = StageFailed
+		job.Message = ""
+		job.Error = "file selection timed out"
+		job.FailureCode = "selection_timeout"
+		return nil
+	})
+	if errors.Is(err, errSelectionNoLongerExpired) {
+		return
+	}
+	if err != nil {
+		s.logJob(LogError, jobID, "terminal job persistence failed", err.Error())
+		s.requestRestart()
+		return
+	}
+	if updated != nil && updated.UserID != "" && s.users != nil {
+		if _, err := s.users.releaseQuotaReservation(jobID); err != nil {
+			s.logJob(LogError, jobID, "quota reservation release failed", err.Error())
+			s.requestRestart()
+		}
+	}
 }
 
 func (s *Server) saveCDKHistory(jobID string) {

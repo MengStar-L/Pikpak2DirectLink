@@ -2,6 +2,9 @@ package app
 
 import (
 	"database/sql"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -78,6 +81,122 @@ func TestMigrateFreshDBUsesNewSchema(t *testing.T) {
 	}
 	if has, _ := columnExists(db, "cdks", "remaining"); has {
 		t.Fatal("fresh db should not have legacy remaining column")
+	}
+	if has, _ := columnExists(db, "user_subscriptions", "quota_generation"); !has {
+		t.Fatal("fresh db missing user_subscriptions.quota_generation")
+	}
+	if has, _ := columnExists(db, "user_quota_reservations", "quota_generation"); !has {
+		t.Fatal("fresh db missing user_quota_reservations.quota_generation")
+	}
+	var quotaIndexes int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master
+		 WHERE type='index'
+		   AND name IN ('idx_user_subscriptions_source_cdk', 'idx_user_quota_reservations_subscription')`,
+	).Scan(&quotaIndexes); err != nil {
+		t.Fatalf("count quota indexes: %v", err)
+	}
+	if quotaIndexes != 2 {
+		t.Fatalf("quota indexes = %d, want 2", quotaIndexes)
+	}
+}
+
+func TestMigrateQuotaReservationGenerationsIsIdempotent(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Exec(`
+		CREATE TABLE user_subscriptions (
+			id TEXT PRIMARY KEY,
+			remaining_bytes INTEGER NOT NULL
+		);
+		CREATE TABLE user_quota_reservations (
+			job_id TEXT NOT NULL,
+			subscription_id TEXT NOT NULL,
+			reserved_bytes INTEGER NOT NULL,
+			PRIMARY KEY(job_id, subscription_id)
+		);
+		INSERT INTO user_subscriptions(id, remaining_bytes) VALUES('subscription', 90);
+		INSERT INTO user_quota_reservations(job_id, subscription_id, reserved_bytes)
+		VALUES('job', 'subscription', 10);
+	`); err != nil {
+		t.Fatalf("create legacy quota schema: %v", err)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := migrateQuotaReservationGenerations(db); err != nil {
+			t.Fatalf("migration attempt %d: %v", attempt, err)
+		}
+	}
+	var subscriptionGeneration, reservationGeneration int64
+	if err := db.QueryRow(`SELECT quota_generation FROM user_subscriptions WHERE id='subscription'`).Scan(&subscriptionGeneration); err != nil {
+		t.Fatalf("read migrated subscription: %v", err)
+	}
+	if err := db.QueryRow(`SELECT quota_generation FROM user_quota_reservations WHERE job_id='job'`).Scan(&reservationGeneration); err != nil {
+		t.Fatalf("read migrated reservation: %v", err)
+	}
+	if subscriptionGeneration != 0 || reservationGeneration != 0 {
+		t.Fatalf("migrated generations = subscription:%d reservation:%d, want 0/0", subscriptionGeneration, reservationGeneration)
+	}
+}
+
+func TestOpenDatabaseCreatesPrivateDirectoryAndDatabase(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix permission bits")
+	}
+	root := t.TempDir()
+	directory := filepath.Join(root, "private", "nested")
+	path := filepath.Join(directory, "app.db")
+	db, err := openDatabase(path)
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	directoryInfo, err := os.Stat(directory)
+	if err != nil {
+		t.Fatalf("stat database directory: %v", err)
+	}
+	if got := directoryInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("database directory mode = %o, want 700", got)
+	}
+	databaseInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat database file: %v", err)
+	}
+	if got := databaseInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("database file mode = %o, want 600", got)
+	}
+}
+
+func TestHardenSQLiteFileModesSecuresExistingSidecars(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix permission bits")
+	}
+	root := t.TempDir()
+	path := filepath.Join(root, "app.db")
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.WriteFile(candidate, []byte("test"), 0o666); err != nil {
+			t.Fatalf("write %s: %v", candidate, err)
+		}
+		if err := os.Chmod(candidate, 0o666); err != nil {
+			t.Fatalf("chmod %s: %v", candidate, err)
+		}
+	}
+	if err := hardenSQLiteFileModes(path); err != nil {
+		t.Fatalf("hardenSQLiteFileModes: %v", err)
+	}
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		info, err := os.Stat(candidate)
+		if err != nil {
+			t.Fatalf("stat %s: %v", candidate, err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("%s mode = %o, want 600", candidate, got)
+		}
 	}
 }
 

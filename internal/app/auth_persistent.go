@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ const adminSessionMaxAge = 30 * 24 * time.Hour
 type adminCredentialStore interface {
 	HasPassword() bool
 	Verify(string) bool
+	VerifyContext(context.Context, string) (bool, error)
 	SetInitial(string) error
 	Set(string) error
 }
@@ -64,13 +66,14 @@ func importLegacyAdminCredential(db *sql.DB, path string) error {
 }
 
 type databaseCredentialStore struct {
-	mu  sync.RWMutex
-	db  *sql.DB
-	rec credentialRecord
+	mu        sync.RWMutex
+	db        *sql.DB
+	rec       credentialRecord
+	hashSlots chan struct{}
 }
 
 func newDatabaseCredentialStore(db *sql.DB) (*databaseCredentialStore, error) {
-	store := &databaseCredentialStore{db: db}
+	store := &databaseCredentialStore{db: db, hashSlots: defaultPasswordHashSlots}
 	var raw string
 	err := db.QueryRow(`SELECT password_hash FROM admin_credentials WHERE id=1`).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -96,6 +99,13 @@ func (c *databaseCredentialStore) Verify(password string) bool {
 	rec := c.rec
 	c.mu.RUnlock()
 	return verifyPasswordRecord(rec, password)
+}
+
+func (c *databaseCredentialStore) VerifyContext(ctx context.Context, password string) (bool, error) {
+	c.mu.RLock()
+	rec := c.rec
+	c.mu.RUnlock()
+	return verifyPasswordRecordContext(ctx, rec, password, c.hashSlots)
 }
 
 func (c *databaseCredentialStore) SetInitial(password string) error {

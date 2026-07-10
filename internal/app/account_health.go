@@ -25,6 +25,19 @@ type accountCredentialProbeResult struct {
 type accountHealthProbeFunc func(context.Context, AccountRuntime) (accountCredentialProbeResult, error)
 type accountRefreshLoginFunc func(context.Context, string) (AccountSummary, error)
 
+func (s *Server) handleAccountPersistenceError(account AccountRuntime, operation string, err error) bool {
+	if err == nil {
+		return false
+	}
+	details := []string{"operation: " + operation, err.Error()}
+	if strings.TrimSpace(account.Username) != "" {
+		details = append([]string{"account: " + account.Username}, details...)
+	}
+	s.logJob(LogError, "", "PikPak account state persistence failed", details...)
+	s.requestRestart()
+	return true
+}
+
 type accountHealthClient interface {
 	GetShareInfo(ctx context.Context, shareID, passCode, parentID string) (*pikpak.ShareListResponse, error)
 	RestoreShare(ctx context.Context, shareID, passCodeToken string, fileIDs []string) (*pikpak.RestoreShareResponse, error)
@@ -127,7 +140,10 @@ func (s *Server) runAccountCredentialCheck(ctx context.Context, account AccountR
 
 	checkedAt := s.now()
 	if err == nil {
-		s.accounts.MarkCredentialCheckSuccess(account.ID, checkedAt, checkedAt.Add(s.accountHealthInterval()), result.CleanupErr)
+		persistErr := s.accounts.MarkCredentialCheckSuccess(account.ID, checkedAt, checkedAt.Add(s.accountHealthInterval()), result.CleanupErr)
+		if s.handleAccountPersistenceError(account, "record credential check success", persistErr) {
+			return
+		}
 		if result.CleanupErr != nil {
 			s.logJob(LogWarn, "", "PikPak account health check cleanup failed", "account: "+account.Username, result.CleanupErr.Error())
 		} else {
@@ -144,13 +160,15 @@ func (s *Server) handleAccountHealthFailure(ctx context.Context, account Account
 	now := s.now()
 	allowed, allowedAt, reserveErr := s.reserveAutoAccountRefresh(now)
 	if reserveErr != nil {
-		s.accounts.MarkCredentialCheckFailed(account.ID, reserveErr, now, now.Add(s.accountAutoRefreshGap()))
 		s.logJob(LogError, "", "PikPak account auto refresh could not reserve refresh slot", "account: "+account.Username, reserveErr.Error())
+		persistErr := s.accounts.MarkCredentialCheckFailed(account.ID, reserveErr, now, now.Add(s.accountAutoRefreshGap()))
+		s.handleAccountPersistenceError(account, "record refresh reservation failure", persistErr)
 		return
 	}
 	if !allowed {
-		s.accounts.MarkCredentialCheckFailed(account.ID, probeErr, now, allowedAt)
 		s.logJob(LogWarn, "", "PikPak account auto refresh delayed", "account: "+account.Username, "next: "+allowedAt.Format(time.RFC3339))
+		persistErr := s.accounts.MarkCredentialCheckFailed(account.ID, probeErr, now, allowedAt)
+		s.handleAccountPersistenceError(account, "record delayed credential check", persistErr)
 		return
 	}
 
@@ -162,8 +180,9 @@ func (s *Server) handleAccountHealthFailure(ctx context.Context, account Account
 	}
 	if refreshErr != nil {
 		checkedAt := s.now()
-		s.accounts.MarkCredentialCheckFailed(account.ID, refreshErr, checkedAt, checkedAt.Add(s.accountHealthInterval()))
 		s.logJob(LogError, "", "PikPak account auto refresh failed", "account: "+account.Username, friendlyPikPakError(refreshErr))
+		persistErr := s.accounts.MarkCredentialCheckFailed(account.ID, refreshErr, checkedAt, checkedAt.Add(s.accountHealthInterval()))
+		s.handleAccountPersistenceError(account, "record auto refresh failure", persistErr)
 		return
 	}
 
@@ -180,12 +199,16 @@ func (s *Server) handleAccountHealthFailure(ctx context.Context, account Account
 
 	checkedAt := s.now()
 	if recheckErr != nil {
-		s.accounts.MarkCredentialCheckFailed(account.ID, recheckErr, checkedAt, checkedAt.Add(s.accountHealthInterval()))
 		s.logJob(LogError, "", "PikPak account health check still failed after auto refresh", "account: "+account.Username, friendlyPikPakError(recheckErr))
+		persistErr := s.accounts.MarkCredentialCheckFailed(account.ID, recheckErr, checkedAt, checkedAt.Add(s.accountHealthInterval()))
+		s.handleAccountPersistenceError(account, "record post-refresh credential check failure", persistErr)
 		return
 	}
 
-	s.accounts.MarkCredentialCheckSuccess(account.ID, checkedAt, checkedAt.Add(s.accountHealthInterval()), result.CleanupErr)
+	persistErr := s.accounts.MarkCredentialCheckSuccess(account.ID, checkedAt, checkedAt.Add(s.accountHealthInterval()), result.CleanupErr)
+	if s.handleAccountPersistenceError(account, "record post-refresh credential check success", persistErr) {
+		return
+	}
 	if result.CleanupErr != nil {
 		s.logJob(LogWarn, "", "PikPak account health check cleanup failed after auto refresh", "account: "+account.Username, result.CleanupErr.Error())
 	}

@@ -15,7 +15,13 @@ import (
 	"pikpak2directlink/internal/version"
 )
 
-const gracefulShutdownTimeout = 30 * time.Second
+const (
+	gracefulShutdownTimeout = 30 * time.Second
+	readHeaderTimeout       = 10 * time.Second
+	readTimeout             = 30 * time.Second
+	idleTimeout             = 90 * time.Second
+	maxHeaderBytes          = 1 << 20
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -51,11 +57,13 @@ func run() error {
 	}
 	if cfg.HasFixedPassword() {
 		log.Printf("access password is pinned via ACCESS_PASSWORD; the first-visitor setup flow is disabled")
-	} else {
-		log.Printf("access gate enabled; the first visitor will be prompted to set an admin password")
+	} else if setupURL := server.InitialSetupURL(); setupURL != "" {
+		log.Printf("initial setup URL (expires 30 minutes after startup; use locally or through an SSH tunnel): %s", setupURL)
+	} else if server.InitialSetupRequired() {
+		log.Printf("initial setup is unavailable on %s; bind ADDR to a loopback address or set ACCESS_PASSWORD, then restart", cfg.Addr)
 	}
 
-	httpServer := &http.Server{Addr: cfg.Addr, Handler: server.Handler()}
+	httpServer := newHTTPServer(cfg.Addr, server.Handler())
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpServer.ListenAndServe() }()
 
@@ -84,4 +92,15 @@ func run() error {
 		_ = httpServer.Close()
 	}
 	return errors.Join(shutdownErr, closeErr)
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
 }
