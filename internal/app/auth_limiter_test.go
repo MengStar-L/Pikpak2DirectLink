@@ -206,7 +206,7 @@ func TestWriteAuthRateLimitRoundsRetryAfterUp(t *testing.T) {
 func TestEmailLoginUsesSharedLimiter(t *testing.T) {
 	srv := newTestServer(t)
 	now := time.Unix(1_700_000_000, 0)
-	srv.nowFunc = func() time.Time { return now }
+	srv.setNowFunc(func() time.Time { return now })
 	if _, err := srv.users.createEmailUser("limited@example.com", "correct-password", now); err != nil {
 		t.Fatalf("create email user: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestEmailRegistrationConsumesAdmissionBudgetBeforeHashing(t *testing.T) {
 		t.Fatalf("enable email registration: %v", err)
 	}
 	now := time.Unix(1_700_000_000, 0)
-	srv.nowFunc = func() time.Time { return now }
+	srv.setNowFunc(func() time.Time { return now })
 
 	for i := range authIPFailureLimit - 1 {
 		req := httptest.NewRequest(http.MethodPost, "/api/u/auth/email/register", nil)

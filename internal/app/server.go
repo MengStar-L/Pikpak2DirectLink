@@ -81,6 +81,7 @@ type Server struct {
 	closeErr             error
 	accountHealthProbe   accountHealthProbeFunc
 	accountHealthRefresh accountRefreshLoginFunc
+	nowMu                sync.RWMutex
 	nowFunc              func() time.Time
 }
 

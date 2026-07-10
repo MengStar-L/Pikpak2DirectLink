@@ -278,10 +278,19 @@ func (s *Server) accountHealthTimeout() time.Duration {
 }
 
 func (s *Server) now() time.Time {
-	if s.nowFunc != nil {
-		return s.nowFunc()
+	s.nowMu.RLock()
+	nowFunc := s.nowFunc
+	s.nowMu.RUnlock()
+	if nowFunc != nil {
+		return nowFunc()
 	}
 	return time.Now()
+}
+
+func (s *Server) setNowFunc(nowFunc func() time.Time) {
+	s.nowMu.Lock()
+	s.nowFunc = nowFunc
+	s.nowMu.Unlock()
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) bool {

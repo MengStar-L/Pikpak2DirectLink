@@ -77,7 +77,7 @@ func TestOAuthStateExpiresSweepsAndStaysBounded(t *testing.T) {
 func TestLinuxDoOAuthNonceCookieBindsCallback(t *testing.T) {
 	srv := newTestServer(t)
 	now := time.Unix(1_700_000_000, 0)
-	srv.nowFunc = func() time.Time { return now }
+	srv.setNowFunc(func() time.Time { return now })
 	srv.config.PublicBaseURL = "https://public.example"
 	if err := srv.settings.setString(settingKeyLinuxDoClientID, "client-id"); err != nil {
 		t.Fatalf("set client id: %v", err)
