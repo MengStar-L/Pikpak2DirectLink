@@ -32,6 +32,7 @@ const password = ref('')
 const loginError = ref('')
 const loginLoading = ref(false)
 
+const subscriptionOpen = ref(false)
 const redeemOpen = ref(false)
 const redeemCode = ref('')
 const redeemError = ref('')
@@ -77,6 +78,7 @@ setUnauthorizedHandler(() => {
   clearCurrentJob()
   view.value = 'gate'
   status.value = null
+  closeSubscriptions()
   closeRedeem()
   closeHistory()
 })
@@ -133,11 +135,18 @@ async function logout() {
     await api.u.logout()
   } catch { /* ignore */ }
   clearCurrentJob()
+  closeSubscriptions()
   status.value = null
   view.value = 'gate'
   await loadAuthConfig()
 }
 
+function openSubscriptions() {
+  subscriptionOpen.value = true
+}
+function closeSubscriptions() {
+  subscriptionOpen.value = false
+}
 function openRedeem() {
   redeemCode.value = ''
   redeemError.value = ''
@@ -411,6 +420,33 @@ onUnmounted(invalidateRestore)
 
   <Teleport to="body">
     <Transition name="v-veil">
+      <div v-if="subscriptionOpen" class="overlay subscription-overlay" @click.self="closeSubscriptions">
+        <Transition name="v-pop" appear>
+          <div v-if="subscriptionOpen" class="dialog subscription-dialog" role="dialog" aria-modal="true" aria-label="我的订阅">
+            <div class="dialog-head subscription-dialog-head">
+              <h2><Gauge />我的订阅</h2>
+              <button type="button" class="dialog-close" aria-label="关闭" @click="closeSubscriptions"><X /></button>
+            </div>
+            <p class="subscription-note">解析会优先消耗最快到期的空间，不足时自动继续扣下一个订阅</p>
+            <div class="subscription-dialog-body">
+              <div v-if="subscriptions.length" class="subs">
+                <div v-for="sub in subscriptions" :key="sub.id" class="sub-row" :class="{ expired: sub.expired }">
+                  <span class="mono code">{{ sub.source_cdk_code || sub.id }}</span>
+                  <span class="pill pill-ok">{{ sub.remaining_label }}</span>
+                  <span class="pill">{{ sub.days_left }} 天</span>
+                  <span class="pill" :class="sub.allow_proxy ? 'pill-brand' : ''">{{ sub.allow_proxy ? '中转' : '直链' }}</span>
+                </div>
+              </div>
+              <div v-else class="empty subscription-empty"><Ticket /><p>暂无可用空间，请兑换 CDK</p></div>
+            </div>
+          </div>
+        </Transition>
+      </div>
+    </Transition>
+  </Teleport>
+
+  <Teleport to="body">
+    <Transition name="v-veil">
       <div v-if="redeemOpen" class="overlay redeem-overlay" @click.self="closeRedeem">
         <Transition name="v-pop" appear>
           <form v-if="redeemOpen" class="dialog redeem-dialog" role="dialog" aria-modal="true" aria-label="兑换 CDK" @submit.prevent="submitRedeem">
@@ -553,30 +589,12 @@ onUnmounted(invalidateRestore)
           <span class="pill pill-info"><CalendarClock />{{ activeSubscriptions[0]?.days_left ?? '-' }} 天</span>
           <span class="pill" :class="canProxy ? 'pill-brand' : ''"><Waypoints />中转{{ canProxy ? '可用' : '不可用' }}</span>
           <button class="btn btn-ghost btn-sm" type="button" @click="aria2.openConfig()"><Settings2 />aria2</button>
+          <button class="btn btn-ghost btn-sm" type="button" @click="openSubscriptions"><Gauge />我的订阅</button>
           <button class="btn btn-ghost btn-sm" type="button" @click="openRedeem"><Ticket />兑换</button>
           <button class="btn btn-ghost btn-sm" type="button" @click="toggleHistory"><History />历史</button>
           <button class="btn btn-ghost btn-sm" type="button" @click="logout"><LogOut />退出</button>
         </div>
       </header>
-
-      <GlassCard class="quota-card" seam>
-        <div class="sec-head mb">
-          <div class="sec-title">
-            <span class="sec-glyph ok"><Gauge /></span>
-            <div><span class="eyebrow">quota</span><h2>订阅空间</h2><p>解析会优先消耗最快到期的空间，不足时自动继续扣下一个订阅</p></div>
-          </div>
-          <PrimaryButton size="sm" variant="soft" @click="openRedeem"><template #icon><Ticket /></template>兑换 CDK</PrimaryButton>
-        </div>
-        <div v-if="subscriptions.length" class="subs">
-          <div v-for="sub in subscriptions" :key="sub.id" class="sub-row" :class="{ expired: sub.expired }">
-            <span class="mono code">{{ sub.source_cdk_code || sub.id }}</span>
-            <span class="pill pill-ok">{{ sub.remaining_label }}</span>
-            <span class="pill">{{ sub.days_left }} 天</span>
-            <span class="pill" :class="sub.allow_proxy ? 'pill-brand' : ''">{{ sub.allow_proxy ? '中转' : '直链' }}</span>
-          </div>
-        </div>
-        <div v-else class="empty quota-empty"><Ticket /><p>暂无可用空间，请兑换 CDK</p></div>
-      </GlassCard>
 
       <GlassCard class="workbench" seam>
         <div class="sec-head">
@@ -660,7 +678,13 @@ onUnmounted(invalidateRestore)
 .sub-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 9px 11px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-2); }
 .sub-row.expired { opacity: 0.55; }
 .sub-row .code { flex: 1 1 180px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-size: var(--fs-xs); }
-.quota-empty { min-height: 100px; }
+.subscription-dialog { width: min(680px, calc(100vw - 32px)); max-height: calc(100vh - 48px); display: flex; flex-direction: column; overflow: hidden; }
+.subscription-dialog-head { flex: none; margin-bottom: 8px; }
+.subscription-dialog-head h2 { display: flex; align-items: center; gap: 7px; font-size: var(--fs-lg); }
+.subscription-dialog-head h2 svg { width: 17px; height: 17px; color: var(--brand); }
+.subscription-note { margin: 0 0 14px; color: var(--ink-2); font-size: var(--fs-sm); line-height: 1.55; }
+.subscription-dialog-body { min-height: 0; overflow-y: auto; padding-right: 2px; }
+.subscription-empty { min-height: 120px; }
 .redeem-overlay { z-index: 7950; }
 .redeem-dialog { width: min(430px, calc(100vw - 32px)); }
 .redeem-dialog-head { margin-bottom: 14px; }
@@ -699,6 +723,8 @@ onUnmounted(invalidateRestore)
 @keyframes wireRun { 0% { left: -36%; } 100% { left: 100%; } }
 @media (max-width: 600px) {
   .portal { padding: 16px 14px 48px; }
+  .subscription-overlay { padding: 12px; }
+  .subscription-dialog { width: 100%; max-height: calc(100vh - 24px); }
   .redeem-overlay { padding: 12px; }
   .redeem-dialog { width: 100%; }
   .dialog-actions { justify-content: stretch; }
