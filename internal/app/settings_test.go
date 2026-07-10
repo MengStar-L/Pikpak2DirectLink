@@ -19,11 +19,16 @@ func newTestSettingsServer(t *testing.T, cfg Config) *Server {
 
 	minTimeout := minResolveTaskTimeout(cfg)
 	serialTimeout, parallelTimeout := normalizeResolveTimeouts(60*time.Second, 2*time.Minute, minTimeout)
+	cipher, err := NewSecretCipher(testDataEncryptionKey, nil)
+	if err != nil {
+		t.Fatalf("NewSecretCipher: %v", err)
+	}
 	return &Server{
-		config:   cfg,
-		resolver: newResolveQueue(serialTimeout, parallelTimeout, 1, nil),
-		settings: newSettingsStore(db),
-		logs:     newLogStore(10),
+		config:     cfg,
+		resolver:   newResolveQueue(serialTimeout, parallelTimeout, 1, nil),
+		settings:   newSettingsStore(db),
+		appSecrets: newAppSecretStore(db, cipher),
+		logs:       newLogStore(10),
 	}
 }
 
@@ -113,5 +118,12 @@ func TestAuthSettingsSecretWriteOnly(t *testing.T) {
 		!strings.Contains(body, `"linuxdo_client_secret_configured":true`) ||
 		!strings.Contains(body, `"email_registration_enabled":true`) {
 		t.Fatalf("unexpected updated auth settings: %s", body)
+	}
+	var count int
+	if err := s.settings.db.QueryRow(`SELECT COUNT(*) FROM settings WHERE value='secret'`).Scan(&count); err != nil {
+		t.Fatalf("scan plaintext settings: %v", err)
+	}
+	if count != 0 {
+		t.Fatal("LinuxDo client secret was stored in plaintext settings")
 	}
 }

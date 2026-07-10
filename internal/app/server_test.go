@@ -822,26 +822,40 @@ func TestProxySingleStreamLogsUpstreamReadError(t *testing.T) {
 
 func TestCompleteJobDefersTempCleanupUntilDirectLinkExpiry(t *testing.T) {
 	now := time.Now()
-	db, err := openDatabase(":memory:")
+	db, err := openDatabase(t.TempDir() + "/app.db")
 	if err != nil {
 		t.Fatalf("openDatabase: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
+	cipher := newTestSecretCipher(t, []byte("0123456789abcdef0123456789abcdef"))
 
 	client := &fakePikPakClient{
 		getFile: func(context.Context, string) (*pikpak.FileEntry, error) {
 			return fakeDownloadFile("file-1", "https://cdn.example/file.bin", now.Add(time.Hour)), nil
 		},
 	}
+	accountStore := newAccountStore(db, cipher)
+	account := accountRecord{
+		ID: "acct", Username: "acct@example.com", Password: "password", Status: AccountAvailable,
+		TrafficLimit: 1000, TrafficPeriod: monthKey(now), CreatedAt: now, UpdatedAt: now,
+	}
+	if err := accountStore.Insert(account); err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	accounts := fakeAccountPool("acct", client)
+	accounts.store = accountStore
+	accounts.accounts["acct"].record = account
+	durableJobs := newSQLJobStore(db, cipher)
 	s := &Server{
+		db:           db,
 		config:       Config{RequestTimeout: time.Second},
-		accounts:     fakeAccountPool("acct", client),
-		jobs:         newJobStore(10),
+		accounts:     accounts,
+		jobs:         newJobStore(10, durableJobs),
 		logs:         newLogStore(20),
-		tempCleanups: newProxyTempCleanupStore(db),
+		tempCleanups: newProxyTempCleanupStore(db, cipher),
 		nowFunc:      func() time.Time { return now },
 	}
-	s.jobs.create(&Job{
+	if err := s.jobs.create(&Job{
 		ID:            "job-cleanup",
 		Kind:          ResourceMagnet,
 		Mode:          "proxy",
@@ -849,7 +863,9 @@ func TestCompleteJobDefersTempCleanupUntilDirectLinkExpiry(t *testing.T) {
 		BaseURL:       "https://proxy.example",
 		TempAccountID: "acct",
 		TempIDs:       []string{"temp-file"},
-	})
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
 
 	if err := s.completeJob(context.Background(), "job-cleanup", AccountRuntime{ID: "acct", Username: "acct", Client: client}, DownloadItem{ID: "file-1", Name: "file.bin"}); err != nil {
 		t.Fatalf("completeJob: %v", err)

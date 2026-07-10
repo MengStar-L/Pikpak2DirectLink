@@ -30,13 +30,16 @@ func newAuthSessionStore() *authSessionStore {
 	}
 }
 
-func (s *authSessionStore) create() string {
+func (s *authSessionStore) create() (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	sessionID := generateSessionID()
+	sessionID, err := generateSessionID()
+	if err != nil {
+		return "", err
+	}
 	s.sessions[sessionID] = time.Now().Add(30 * 24 * time.Hour)
-	return sessionID
+	return sessionID, nil
 }
 
 func (s *authSessionStore) validate(sessionID string) bool {
@@ -67,12 +70,21 @@ func (s *authSessionStore) invalidateAll() {
 	s.sessions = make(map[string]time.Time)
 }
 
-func generateSessionID() string {
+func generateSessionID() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
-		return hex.EncodeToString([]byte(time.Now().String()))
+		return "", err
 	}
-	return hex.EncodeToString(buf)
+	return hex.EncodeToString(buf), nil
+}
+
+func sessionTokenDigest(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(digest[:])
 }
 
 // credentialStore persists a salted PBKDF2 hash of the admin password to disk so

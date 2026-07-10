@@ -39,7 +39,7 @@
 
 ```bash
 sudo apt update
-sudo apt install -y curl ca-certificates
+sudo apt install -y curl ca-certificates openssl
 
 sudo mkdir -p /opt/Pikpak2DirectLink
 sudo chown -R "$USER:$USER" /opt/Pikpak2DirectLink
@@ -49,16 +49,21 @@ curl -L -o Pikpak2DirectLink \
   https://github.com/MengStar-L/Pikpak2DirectLink/releases/latest/download/Pikpak2DirectLink_linux_amd64
 chmod +x Pikpak2DirectLink
 
+umask 077
+test -s .data-encryption-key || openssl rand -base64 32 > .data-encryption-key
+export DATA_ENCRYPTION_KEY="$(tr -d '\r\n' < .data-encryption-key)"
 ./Pikpak2DirectLink
 ```
 
-打开浏览器访问：
+先在服务器本机确认进程可访问：
 
-```text
-http://your-server-ip:51873
+```bash
+curl http://127.0.0.1:51873/api/auth/status
 ```
 
-首次访问时设置管理员密码，然后进入后台添加 PikPak 账号。账号添加完成后，回到「解析」页面粘贴磁力链接或 PikPak 分享链接即可开始解析。
+公网使用前请先配置 HTTPS 反向代理和 `PUBLIC_BASE_URL=https://你的域名`，再通过 `https://你的域名` 打开管理后台。首次访问时设置管理员密码，然后进入后台添加 PikPak 账号。
+
+> `DATA_ENCRYPTION_KEY` 是必填的 32 字节 Base64 密钥。首次生成后必须长期保留，后续启动继续使用同一密钥；丢失或误换密钥会导致已保存的账号凭据、session 和任务详情无法解密。请把密钥与数据库备份分开保管，不要提交到 Git。
 
 > ARM64 服务器请把下载文件名改为 `Pikpak2DirectLink_linux_arm64`。不确定架构时可运行 `uname -m`：`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。
 
@@ -105,7 +110,7 @@ Pikpak2DirectLink_windows_amd64.exe
 
 ```bash
 sudo apt update
-sudo apt install -y git curl ca-certificates
+sudo apt install -y git curl ca-certificates openssl
 
 curl -LO https://go.dev/dl/go1.26.2.linux-amd64.tar.gz
 sudo rm -rf /usr/local/go
@@ -129,6 +134,9 @@ cd /opt/Pikpak2DirectLink
 
 ```bash
 cd /opt/Pikpak2DirectLink
+umask 077
+test -s .data-encryption-key || openssl rand -base64 32 > .data-encryption-key
+export DATA_ENCRYPTION_KEY="$(tr -d '\r\n' < .data-encryption-key)"
 ./Pikpak2DirectLink
 ```
 
@@ -140,7 +148,18 @@ ADDR=:8080 ./Pikpak2DirectLink
 
 ### systemd 自启动
 
-推荐用 systemd 托管服务，便于开机自启、查看日志和在线更新后自动重启。
+推荐用 systemd 托管服务，便于开机自启、查看日志和在线更新后自动重启。下面会优先复用「快速开始」已经生成的 `.data-encryption-key`；只有尚未生成密钥时才创建新密钥，并且不会覆盖已有的 `server.env`：
+
+```bash
+sudo install -d -m 700 /etc/Pikpak2DirectLink
+if [ -s /opt/Pikpak2DirectLink/.data-encryption-key ]; then
+  DATA_KEY="$(tr -d '\r\n' < /opt/Pikpak2DirectLink/.data-encryption-key)"
+else
+  DATA_KEY="$(openssl rand -base64 32)"
+fi
+sudo sh -c 'test -s /etc/Pikpak2DirectLink/server.env || (umask 077; printf "DATA_ENCRYPTION_KEY=%s\n" "$1" > /etc/Pikpak2DirectLink/server.env)' sh "$DATA_KEY"
+unset DATA_KEY
+```
 
 ```bash
 sudo tee /etc/systemd/system/Pikpak2DirectLink.service > /dev/null <<EOF
@@ -153,9 +172,10 @@ Wants=network-online.target
 Type=simple
 User=$(whoami)
 WorkingDirectory=/opt/Pikpak2DirectLink
+EnvironmentFile=/etc/Pikpak2DirectLink/server.env
 Environment=ADDR=:51873
-# 可选：通过反向代理、域名或公网地址访问时，建议固定代理链接的公开地址。
-#Environment=PUBLIC_BASE_URL=http://your-server-ip:51873
+# 公网部署：在 HTTPS 反向代理后运行，并设置外部 HTTPS 地址。
+#Environment=PUBLIC_BASE_URL=https://dl.example.com
 # 可选：固定管理员访问密码。保持注释则首次打开网页时在页面中设置密码。
 #Environment=ACCESS_PASSWORD=your_secure_password
 ExecStart=/opt/Pikpak2DirectLink/Pikpak2DirectLink
@@ -170,6 +190,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now Pikpak2DirectLink
 sudo systemctl status Pikpak2DirectLink --no-pager
 ```
+
+请单独备份 `/etc/Pikpak2DirectLink/server.env`，并确保它不会被普通用户、Web 服务或备份下载目录读取。
 
 查看运行日志：
 
@@ -190,7 +212,7 @@ sudo systemctl stop Pikpak2DirectLink
 
 ### 管理员后台
 
-1. 打开 `http://your-server-ip:51873`。
+1. 公网部署通过 HTTPS 反向代理打开 `https://dl.example.com`；`http://127.0.0.1:51873` 仅用于服务器本机调试。
 2. 首次访问时设置管理员密码；如果配置了 `ACCESS_PASSWORD`，则直接使用该固定密码登录。
 3. 进入「账号」页面，添加一个或多个 PikPak 账号，并按需要调整每月流量额度。
 4. 回到「解析」页面，粘贴磁力链接或 PikPak 分享链接；多行输入会自动创建批量任务。
@@ -204,7 +226,7 @@ sudo systemctl stop Pikpak2DirectLink
 管理员可在「CDK」页面生成兑换码，设置每个 CDK 的流量额度和有效期。用户访问：
 
 ```text
-http://your-server-ip:51873/u
+https://dl.example.com/u
 ```
 
 输入 CDK 后即可使用解析功能。CDK 用户只能看到自己的任务、剩余流量和队列状态；失败信息会被收敛为用户可理解的提示，不暴露后台 PikPak 账号信息。
@@ -232,41 +254,46 @@ http://localhost:6800/jsonrpc
 每个代理链接都会附带唯一令牌，例如：
 
 ```text
-http://your-server-ip:51873/proxy/<job-id>?token=<token>
+https://dl.example.com/proxy/<job-id>?token=<token>
 ```
 
 代理链接不需要管理员登录即可访问，方便下载器直接调用；但只有持有令牌的人可以下载。解析完成后，程序会短期保留本次写入 PikPak 的临时文件，以便代理下载在直链临近过期或 CDN 早期断流时自动向 PikPak 刷新直链并重试。临时文件会在直链有效窗口结束后由后台自动清理；如果某个旧任务的临时文件已经被历史版本清理，代理链接仍可能需要重新解析后才能继续使用。
 
-如服务通过域名或反向代理访问，请设置：
+公网服务应只通过启用 TLS 的反向代理暴露，应用自身可继续监听内网 HTTP。将 `PUBLIC_BASE_URL` 设置为用户实际访问的 HTTPS 根地址：
 
 ```bash
 PUBLIC_BASE_URL=https://your-domain.example
 ```
 
-否则程序会根据当前请求自动推断代理链接地址。
+该地址同时用于生成代理链接和决定会话 Cookie 的 `Secure` 属性。公网部署不要使用 `http://` 的 `PUBLIC_BASE_URL`，也不要绕过反向代理直接暴露应用端口。
 
 ## 配置项
 
-以下环境变量均为可选。未设置时，程序会使用默认值或页面中的持久化设置。
+除 `DATA_ENCRYPTION_KEY` 外，以下环境变量均为可选。未设置可选项时，程序会使用默认值或页面中的持久化设置。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
+| `DATA_ENCRYPTION_KEY` | 无，必填 | 标准 Base64 编码的 32 字节主密钥，用于 AES-256-GCM 字段加密。必须跨重启稳定保存。 |
+| `DATA_ENCRYPTION_PREVIOUS_KEYS` | 空 | 轮换时用于读取旧数据的历史密钥，多个值以英文逗号分隔。 |
 | `PIKPAK_USERNAME` | 空 | 可选的启动账号。通常建议在网页中添加账号。 |
 | `PIKPAK_PASSWORD` | 空 | 与 `PIKPAK_USERNAME` 配套使用的启动账号密码。 |
 | `ADDR` | `:51873` | HTTP 服务监听地址。 |
-| `PUBLIC_BASE_URL` | 自动推断 | 生成代理链接时使用的公开访问地址。反向代理或域名访问时建议设置。 |
+| `PUBLIC_BASE_URL` | 自动推断 | 生成代理链接时使用的公开访问地址。公网部署必须使用 HTTPS 反向代理并设置为 `https://...`。 |
 | `ACCESS_PASSWORD` | 空 | 固定管理员访问密码。设置后跳过首次设置流程，登录页只接受此密码。 |
-| `ACCESS_AUTH_FILE` | `data/auth.json` | 管理员访问密码哈希的保存位置。 |
+| `ACCESS_AUTH_FILE` | `data/auth.json` | 旧版管理员认证文件的迁移来源；v3.1.0 起活动数据保存在 SQLite。 |
 | `PIKPAK_ROOT_FOLDER` | `Pikpak2DirectLink` | 程序在 PikPak 中创建临时目录时使用的根文件夹名。 |
-| `PIKPAK_SESSION_FILE` | `data/pikpak-session.json` | 通过启动账号预置登录时使用的 session 文件。 |
-| `PIKPAK_ACCOUNTS_FILE` | `data/pikpak-accounts.json` | PikPak 账号列表、密码、状态和流量信息的保存位置。 |
-| `PIKPAK_ACCOUNT_SESSION_DIR` | `data/accounts` | 多账号 session 保存目录。 |
-| `DB_FILE` | `data/pikpak.db` | SQLite 数据库位置，用于保存 CDK、设置等数据。 |
+| `PIKPAK_SESSION_FILE` | `data/pikpak-session.json` | 旧版启动账号 session 的迁移来源。 |
+| `PIKPAK_ACCOUNTS_FILE` | `data/pikpak-accounts.json` | 旧版账号列表的迁移来源。 |
+| `PIKPAK_ACCOUNT_SESSION_DIR` | `data/accounts` | 旧版多账号 session 的迁移来源。 |
+| `DB_FILE` | `data/pikpak.db` | 唯一的活动持久化数据库，保存认证、账号、session、任务、CDK、设置和运维状态。 |
+| `BACKUP_DIR` | `data/backups` | 已校验 SQLite 快照的保存目录。不要把加密密钥放在这里。 |
+| `BACKUP_INTERVAL` | `24h` | 自动数据库备份间隔。 |
+| `BACKUP_RETENTION` | `7` | 自动保留的成功数据库备份数量。 |
 | `PIKPAK_REQUEST_TIMEOUT` | `20s` | 单次 PikPak API 请求超时时间。 |
 | `RESOLVE_TIMEOUT` | `12m` | 单个账号处理一次资源解析的最长时间。 |
 | `POLL_INTERVAL` | `5s` | 等待离线下载或转存完成时的轮询间隔。 |
 | `RESOLVE_CONCURRENCY` | `1` | 首次启动时的解析并发数默认值；之后以「设置」页面保存到数据库的值为准。 |
-| `QUEUE_TIMEOUT` | `45s` | 串行模式下新任务的默认任务超时预算。 |
+| `QUEUE_TIMEOUT` | `60s` | 串行模式下新任务的默认任务超时预算。 |
 | `PARALLEL_QUEUE_TIMEOUT` | `2m` | 并行模式下新任务的默认任务超时预算。 |
 | `UPDATE_REPO` | `MengStar-L/Pikpak2DirectLink` | 在线更新检查的 GitHub 仓库，格式为 `owner/name`。 |
 | `UPDATE_CHECK_INTERVAL` | `6h` | 后台自动检查更新的间隔。设为 `0` 可关闭后台检查，仍可手动检查。 |
@@ -278,6 +305,7 @@ PUBLIC_BASE_URL=https://your-domain.example
 示例：
 
 ```bash
+DATA_ENCRYPTION_KEY=<由 openssl rand -base64 32 生成并安全保存的值>
 ADDR=:51873
 PUBLIC_BASE_URL=https://dl.example.com
 ACCESS_PASSWORD=your_secure_password
@@ -289,12 +317,13 @@ UPDATE_CHECK_INTERVAL=6h
 
 ## 安全建议
 
+- `DATA_ENCRYPTION_KEY` 必须由安全随机数生成并独立保管。不要把密钥写入仓库、镜像、公开日志或与数据库相同的可下载备份位置。
 - 访问门始终开启。不设置 `ACCESS_PASSWORD` 时，首次访问者会设置管理员密码；设置 `ACCESS_PASSWORD` 时，密码由环境变量固定，无法在网页中修改。
-- 公网部署时务必使用强密码，并优先放在 HTTPS 或可信反向代理后。
-- PikPak 账号密码和 session 信息会保存在本地数据目录中，请限制服务器和数据目录权限。
+- 公网部署时务必使用强密码，并通过可信 HTTPS 反向代理访问；`PUBLIC_BASE_URL` 应设置为外部 HTTPS 地址。
+- PikPak 账号密码、session 和完整任务内容以 AES-256-GCM 字段加密后保存在 SQLite；索引、状态和审计元数据不是全库加密，请继续限制服务器、数据库和备份目录权限。
 - 代理链接虽然带令牌，但仍应避免公开传播；拿到链接的人可以在有效期内下载对应文件。
 - CDK 用户入口 `/u` 是公开页面，访问能力由 CDK 本身控制。请合理设置 CDK 流量额度和有效期。
-- 升级前如需回滚点，建议备份 `data/` 目录，尤其是 `data/pikpak.db` 和账号文件。
+- 升级前如需回滚点，必须先停止新任务并备份 `data/`；恢复旧快照会丢失快照之后产生的用户、额度、任务和设置变更。
 
 ## 在线更新
 
@@ -305,7 +334,7 @@ UPDATE_CHECK_INTERVAL=6h
 1. 仓库推送 `v*` 标签时，GitHub Actions 会构建对应平台的二进制，并发布 `SHA256SUMS`。
 2. 程序按 `UPDATE_CHECK_INTERVAL` 定时检查最新 Release，并在「更新」入口显示可用更新。
 3. 管理员可在「更新」页面手动检查，也可在发现新版本后点击「立即更新」。
-4. 更新器会下载与当前 `os/arch` 匹配的二进制，校验 `SHA256SUMS`，替换当前可执行文件，然后退出等待 systemd 重启。
+4. 更新器会下载与当前 `os/arch` 匹配的二进制，校验 `SHA256SUMS`，替换当前可执行文件，然后触发优雅停机并等待 systemd 重启。
 
 发布文件命名约定：
 
@@ -322,28 +351,76 @@ SHA256SUMS
 
 - 服务进程必须对可执行文件所在目录有写权限。
 - systemd 服务请使用 `Restart=always`。
-- 更新后内存中的登录会话会失效，需要重新登录。
+- 管理员和用户会话保存在 SQLite；正常更新重启后仍可继续使用，过期或主动注销的会话除外。
 - 如果本地构建版本显示为 `dev`，更新器会把它视为早于任何正式 Release。
 
-## 数据保存
+## 数据存储与恢复
 
-默认情况下，程序会在本地 `data/` 目录保存运行数据：
+### SQLite 与密钥
 
-```text
-data/auth.json
-data/pikpak-accounts.json
-data/accounts/
-data/pikpak.db
+v3.1.0 起，`data/pikpak.db` 是服务端唯一的活动持久化数据源。管理员和用户会话只保存令牌摘要；PikPak 密码、session、应用 Secret 和完整任务内容使用 `DATA_ENCRYPTION_KEY` 做 AES-256-GCM 字段加密。任务完整详情保留 3 小时，清除敏感详情后的摘要最多保留 30 天。
+
+这不是全库加密：账号标识、任务状态、时间、计费量等查询元数据仍可能以明文存在。请同时保护数据库文件、备份目录和服务器访问权限。
+
+生成新密钥时使用密码学安全随机数，不要使用密码、UUID 或重复值。Linux/macOS 可运行：
+
+```bash
+openssl rand -base64 32
 ```
 
-其中：
+PowerShell 可运行：
 
-- `data/auth.json` 保存管理员访问密码哈希。
-- `data/pikpak-accounts.json` 保存 PikPak 账号、密码、账号状态、会员信息和流量统计。
-- `data/accounts/` 保存每个 PikPak 账号的 session。
-- `data/pikpak.db` 保存 CDK、并发设置、任务超时等数据库数据。
+```powershell
+$key = New-Object byte[] 32
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$rng.GetBytes($key)
+[Convert]::ToBase64String($key)
+$rng.Dispose()
+```
 
-请妥善保护服务器、备份文件和数据目录权限。
+把输出的单行 Base64 值安全写入服务环境，之后不要重新生成覆盖。
+
+### 从 v3.0.x 首次升级
+
+1. 停止提交新任务，等待旧版本内存中的运行和排队任务全部结束；这些任务不在旧版磁盘数据中，无法迁移或恢复。
+2. 停止服务并额外备份整个 `data/` 目录。
+3. 生成并永久保存 `DATA_ENCRYPTION_KEY`，安装 v3.1.0 后执行一次维护启动。
+4. 程序会先把旧数据库、`auth.json`、账号 JSON 和 session 文件复制到带校验清单的 `data/migration-backups/pending/`，再自动导入并验证 SQLite 数据。
+5. 登录后台确认账号、用户、CDK 和设置正常。在「设置 → 数据库备份」中勾选确认后，删除可能仍含明文凭据的迁移备份。
+
+迁移过程可重复启动，不会自动恢复或重新执行未完成任务。服务重启时仍未结束的持久化任务会标记为 `failed/service_restart`。
+
+### 密钥轮换
+
+1. 生成新的 32 字节 Base64 密钥并设为 `DATA_ENCRYPTION_KEY`。
+2. 把旧主密钥加入 `DATA_ENCRYPTION_PREVIOUS_KEYS`；有多个旧密钥时以英文逗号分隔，并重启服务。
+3. 确认启动和账号访问正常。只要仍需读取旧数据库快照或尚未过期的旧记录，就继续安全保留历史密钥。
+
+不要先移除旧密钥再重启，否则仍由旧密钥加密的数据无法读取。数据库快照不包含密钥，恢复某个旧快照时必须同时具备该快照对应的密钥。
+
+### 自动备份
+
+程序默认每 24 小时在 `data/backups/` 创建 SQLite 快照，发布前执行完整性检查和 SHA-256 计算，仅保留最近 7 份成功快照。管理员也可在「设置 → 数据库备份」中手动创建并查看最近状态。可用 `BACKUP_DIR`、`BACKUP_INTERVAL` 和 `BACKUP_RETENTION` 修改默认值。
+
+备份目录仍应限制为服务用户可读，并应复制到独立存储。数据库备份本身不能替代加密密钥备份。
+
+### 离线恢复
+
+恢复前停止服务，确认没有其它进程打开数据库，然后使用与正常运行相同的路径配置。两个命令都必须显式传入 `--yes`；恢复工具会先为当前数据创建安全副本。
+
+恢复一个已校验的 SQLite 快照：
+
+```bash
+./Pikpak2DirectLink storage restore-db --backup data/backups/<backup>.db --yes
+```
+
+恢复首次升级前的迁移快照：
+
+```bash
+./Pikpak2DirectLink storage restore-migration --backup data/migration-backups/pending --yes
+```
+
+恢复后再启动服务并检查日志。`restore-db` 会把系统恢复到数据库快照时刻；`restore-migration` 会回到升级前的旧文件布局。两种恢复都会丢失备份创建之后的用户、额度消费、账号状态、任务和配置变更。不要让旧版二进制直接打开 v3.1.0 数据库；需要回滚旧版本时，应停止服务并使用迁移快照恢复。
 
 ## 说明
 

@@ -155,3 +155,48 @@ ON proxy_temp_cleanups(cleanup_after);`); err != nil {
 		t.Fatalf("history user index missing after migration: %v", err)
 	}
 }
+
+func TestMigrateUserSessionsHashesLegacyTokensWithoutLoggingUsersOut(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	db.SetMaxOpenConns(1)
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY, email TEXT, display_name TEXT NOT NULL DEFAULT '',
+			avatar_url TEXT NOT NULL DEFAULT '', disabled INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+		);
+		CREATE TABLE user_sessions (
+			token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at INTEGER NOT NULL,
+			created_at INTEGER NOT NULL
+		);
+		CREATE INDEX idx_user_sessions_user ON user_sessions(user_id);
+		INSERT INTO users(id, email, created_at, updated_at) VALUES('usr_1','u@example.com',1,1);
+		INSERT INTO user_sessions(token,user_id,expires_at,created_at)
+		VALUES('raw-cookie-token','usr_1',4102444800,1);
+	`)
+	if err != nil {
+		t.Fatalf("seed legacy sessions: %v", err)
+	}
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if has, _ := columnExists(db, "user_sessions", "token"); has {
+		t.Fatal("legacy token column remains")
+	}
+	var stored string
+	if err := db.QueryRow(`SELECT token_hash FROM user_sessions`).Scan(&stored); err != nil {
+		t.Fatalf("read token hash: %v", err)
+	}
+	if stored != sessionTokenDigest("raw-cookie-token") {
+		t.Fatalf("token hash = %q", stored)
+	}
+	user, ok, err := newUserStore(db).userForSession("raw-cookie-token", time.Unix(2, 0))
+	if err != nil || !ok || user.ID != "usr_1" {
+		t.Fatalf("legacy cookie lookup: user=%+v ok=%v err=%v", user, ok, err)
+	}
+}

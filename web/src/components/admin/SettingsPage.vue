@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { Copy, Gauge, KeyRound, Lock, Save, ShieldCheck } from 'lucide-vue-next'
+import { ref, onMounted, onUnmounted } from 'vue'
+import { Copy, DatabaseBackup, Gauge, KeyRound, Lock, Save, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-vue-next'
 import GlassCard from '../GlassCard.vue'
 import PrimaryButton from '../PrimaryButton.vue'
 import { api } from '../../lib/api'
 import { copyText } from '../../lib/clipboard'
 import { toast } from '../../composables/useToast'
-import type { AuthSettingsResponse, SettingsResponse } from '../../lib/types'
+import { formatBytes, formatDateTime, formatRelative } from '../../lib/format'
+import type { AuthSettingsResponse, SettingsResponse, StorageStatusResponse } from '../../lib/types'
 
 const props = defineProps<{ passwordFixed: boolean }>()
 
@@ -15,6 +16,14 @@ const concInput = ref(1)
 const timeoutInput = ref(60)
 const concErr = ref('')
 const concSaving = ref(false)
+
+const storage = ref<StorageStatusResponse | null>(null)
+const storageErr = ref('')
+const backupRunning = ref(false)
+const migrationDeleting = ref(false)
+const migrationDeleteConfirmed = ref(false)
+let storageRefreshTimer: number | undefined
+let storageMounted = true
 
 const pw = ref({ current: '', new: '', confirm: '' })
 const pwErr = ref('')
@@ -58,6 +67,73 @@ async function loadAuthSettings() {
   } catch (e: any) {
     toast(e?.message || '加载用户登录设置失败', 'error')
   }
+}
+
+async function loadStorage() {
+	clearStorageRefresh()
+	storageErr.value = ''
+	try {
+		const payload = await api.settings.storage.get()
+		if (!storageMounted) return
+		storage.value = payload
+		if (!storage.value.migration?.backup_id) migrationDeleteConfirmed.value = false
+		if (storage.value.running) {
+			storageRefreshTimer = window.setTimeout(loadStorage, 1500)
+		}
+	} catch (e: any) {
+		storageErr.value = e?.message || '加载存储状态失败'
+	}
+}
+
+function clearStorageRefresh() {
+	if (storageRefreshTimer) {
+		window.clearTimeout(storageRefreshTimer)
+		storageRefreshTimer = undefined
+	}
+}
+
+async function runBackup() {
+  storageErr.value = ''
+  backupRunning.value = true
+  try {
+    await api.settings.storage.backup()
+    toast('数据库备份已创建并校验', 'success')
+    await loadStorage()
+  } catch (e: any) {
+    storageErr.value = e?.message || '创建备份失败'
+  } finally {
+    backupRunning.value = false
+  }
+}
+
+async function deleteMigrationBackup() {
+  const backupID = storage.value?.migration?.backup_id
+  if (!backupID || !migrationDeleteConfirmed.value) return
+  storageErr.value = ''
+  migrationDeleting.value = true
+  try {
+    await api.settings.storage.deleteMigrationBackup(backupID)
+    migrationDeleteConfirmed.value = false
+    toast('旧版迁移备份已删除', 'success')
+    await loadStorage()
+  } catch (e: any) {
+    storageErr.value = e?.message || '删除迁移备份失败'
+  } finally {
+    migrationDeleting.value = false
+  }
+}
+
+function backupStatusLabel(status?: string) {
+  if (status === 'success') return '校验通过'
+  if (status === 'failed') return '失败'
+  if (status === 'running') return '进行中'
+  return '尚未执行'
+}
+
+function backupIntervalLabel(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '-'
+  const hours = seconds / 3600
+  return Number.isInteger(hours) ? `${hours} 小时` : `${Math.round(hours * 10) / 10} 小时`
 }
 
 async function saveAuthSettings() {
@@ -121,7 +197,12 @@ async function changePassword() {
 }
 
 onMounted(async () => {
-  await Promise.all([loadSettings(), loadAuthSettings()])
+	await Promise.all([loadSettings(), loadAuthSettings(), loadStorage()])
+})
+
+onUnmounted(() => {
+	storageMounted = false
+	clearStorageRefresh()
 })
 </script>
 
@@ -145,6 +226,45 @@ onMounted(async () => {
         队列 <b class="mono">{{ settings?.waiting ?? 0 }} 等待 / {{ settings?.running ?? 0 }} 运行</b>
       </p>
       <Transition name="v-fade"><p v-if="concErr" class="error-block">{{ concErr }}</p></Transition>
+    </GlassCard>
+
+    <GlassCard seam>
+      <div class="sec-head mb">
+        <div class="sec-title">
+          <span class="sec-glyph ok"><DatabaseBackup /></span>
+          <div><span class="eyebrow">storage</span><h2>数据库备份</h2><p>查看自动备份状态，或立即创建一份经过完整性校验的 SQLite 快照</p></div>
+        </div>
+        <PrimaryButton size="sm" variant="soft" :loading="backupRunning || storage?.running" @click="runBackup">
+          <template #icon><DatabaseBackup /></template>立即备份
+        </PrimaryButton>
+      </div>
+
+      <div class="storage-grid">
+        <div class="storage-row"><span>备份目录</span><b class="mono path-value">{{ storage?.backup_dir || '-' }}</b></div>
+        <div class="storage-row"><span>自动备份</span><b>{{ backupIntervalLabel(storage?.backup_interval_seconds ?? 0) }} · 保留 {{ storage?.backup_retention ?? '-' }} 份</b></div>
+        <div class="storage-row"><span>最近一次</span><b :class="{ 'danger-text': storage?.last_run?.status === 'failed' }">{{ backupStatusLabel(storage?.last_run?.status) }} · {{ formatDateTime(storage?.last_run?.completed_at || storage?.last_run?.started_at || '') }}</b></div>
+        <div class="storage-row"><span>最近成功</span><b>{{ storage?.last_success ? `${formatBytes(storage.last_success.size_bytes)} · ${formatDateTime(storage.last_success.completed_at || storage.last_success.started_at)}` : '暂无' }}</b></div>
+        <div class="storage-row"><span>下次执行</span><b>{{ storage?.next_run_at ? formatRelative(storage.next_run_at) : '-' }}</b></div>
+      </div>
+
+      <div v-if="storage?.migration?.backup_id" class="migration-block">
+        <div class="migration-copy">
+          <ShieldAlert />
+          <div>
+            <strong>旧版迁移备份待确认</strong>
+            <p>确认新数据库可正常使用后，才可删除这份可能含明文凭据的升级备份。</p>
+            <code class="mono">{{ storage.migration.backup_path || storage.migration.backup_id }}</code>
+          </div>
+        </div>
+        <div class="migration-actions">
+          <label class="check danger"><input v-model="migrationDeleteConfirmed" type="checkbox" />我已验证迁移结果与当前数据库</label>
+          <PrimaryButton size="sm" variant="danger" :disabled="!migrationDeleteConfirmed" :loading="migrationDeleting" @click="deleteMigrationBackup">
+            <template #icon><Trash2 /></template>删除迁移备份
+          </PrimaryButton>
+        </div>
+      </div>
+      <p v-else-if="storage" class="fixed-note storage-ok"><ShieldCheck /><span>当前没有待确认的旧版迁移备份。</span></p>
+      <Transition name="v-fade"><p v-if="storageErr" class="error-block">{{ storageErr }}</p></Transition>
     </GlassCard>
 
     <GlassCard seam>
@@ -215,8 +335,31 @@ onMounted(async () => {
 .check.danger { color: var(--danger-ink); }
 .state { font-size: var(--fs-sm); color: var(--ink-2); margin-top: 12px; }
 .state b { color: var(--ink); font-weight: var(--fw-semi); }
+.storage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+.storage-row { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: var(--fs-sm); }
+.storage-row:nth-child(odd) { padding-right: 18px; }
+.storage-row:nth-child(even) { padding-left: 18px; border-left: 1px solid var(--line); }
+.storage-row span { flex: none; color: var(--ink-3); }
+.storage-row b { min-width: 0; color: var(--ink); font-weight: var(--fw-semi); text-align: right; overflow-wrap: anywhere; }
+.storage-row .path-value { font-size: var(--fs-xs); }
+.storage-row .danger-text { color: var(--danger-ink); }
+.migration-block { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 18px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--danger-line); }
+.migration-copy { min-width: 0; display: flex; align-items: flex-start; gap: 10px; color: var(--danger-ink); }
+.migration-copy > svg { width: 18px; height: 18px; flex: none; margin-top: 1px; }
+.migration-copy strong { display: block; font-size: var(--fs-sm); }
+.migration-copy p { margin: 3px 0 6px; color: var(--ink-2); font-size: var(--fs-xs); line-height: 1.5; }
+.migration-copy code { display: block; max-width: 100%; color: var(--ink-3); font-size: var(--fs-2xs); overflow-wrap: anywhere; }
+.migration-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 9px; }
+.migration-actions .check { font-size: var(--fs-xs); }
+.storage-ok { margin-top: 14px; }
 .fixed-note { display: flex; align-items: flex-start; gap: 8px; font-size: var(--fs-sm); color: var(--ink-2); padding: 11px 13px; border-radius: var(--r-md); background: var(--live-soft); border: 1px solid var(--live-line); line-height: 1.55; }
 .fixed-note svg { width: 15px; height: 15px; flex: none; margin-top: 2px; color: var(--live-ink); }
 .fixed-note code { font-size: var(--fs-xs); }
-@media (max-width: 820px) { .form, .form.pw, .auth-form { grid-template-columns: 1fr; } .callback-field, .check-grid { grid-column: auto; } }
+@media (max-width: 820px) {
+  .form, .form.pw, .auth-form, .storage-grid { grid-template-columns: 1fr; }
+  .callback-field, .check-grid { grid-column: auto; }
+  .storage-row:nth-child(odd), .storage-row:nth-child(even) { padding-left: 0; padding-right: 0; border-left: 0; }
+  .migration-block { grid-template-columns: 1fr; }
+  .migration-actions { align-items: stretch; }
+}
 </style>

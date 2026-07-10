@@ -2,7 +2,7 @@ package app
 
 import (
 	"context"
-	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"pikpak2directlink/internal/pikpak"
 )
 
@@ -38,6 +39,7 @@ type AccountPoolConfig struct {
 	SessionDir     string
 	RootFolderName string
 	RequestTimeout time.Duration
+	Store          *accountStore
 }
 
 type AccountSummary struct {
@@ -130,6 +132,12 @@ type AccountPool struct {
 	accounts map[string]*accountState
 	order    []string
 	cursor   uint64 // rotating round-robin starting point for parallel resolves
+	store    *accountStore
+}
+
+type accountPoolSnapshot struct {
+	accounts map[string]*accountState
+	order    []string
 }
 
 const premiumRefreshInterval = 30 * time.Minute
@@ -149,6 +157,7 @@ func NewAccountPool(cfg AccountPoolConfig) (*AccountPool, error) {
 	pool := &AccountPool{
 		config:   cfg,
 		accounts: make(map[string]*accountState),
+		store:    cfg.Store,
 	}
 	if err := pool.load(); err != nil {
 		return nil, err
@@ -166,7 +175,14 @@ func (p *AccountPool) Add(ctx context.Context, username, password string, traffi
 	}
 
 	id, sessionFile := p.accountIdentity(username)
-	client := p.newClient(username, password, sessionFile)
+	var staged *stagingSessionStore
+	var client *pikpak.Client
+	if p.store != nil {
+		staged = newStagingSessionStore()
+		client = p.newClientWithSessionStore(username, password, staged)
+	} else {
+		client = p.newClient(id, username, password, sessionFile)
+	}
 	if err := client.Login(ctx, username, password); err != nil {
 		return AccountSummary{}, err
 	}
@@ -174,6 +190,7 @@ func (p *AccountPool) Add(ctx context.Context, username, password string, traffi
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	snapshot := p.snapshotLocked()
 
 	now := time.Now()
 	existingState, existed := p.accounts[id]
@@ -206,6 +223,17 @@ func (p *AccountPool) Add(ctx context.Context, username, password string, traffi
 		}
 	}
 	updatePremiumRecord(&record, premiumInfo, premiumErr, now)
+	if p.store != nil {
+		session, err := staged.Load()
+		if err != nil {
+			return AccountSummary{}, fmt.Errorf("read staged PikPak session: %w", err)
+		}
+		record.SessionFile = ""
+		if err := p.store.UpsertWithSession(record, session); err != nil {
+			return AccountSummary{}, err
+		}
+		client = p.newClient(id, username, password, "")
+	}
 
 	p.accounts[id] = &accountState{
 		record: record,
@@ -214,8 +242,10 @@ func (p *AccountPool) Add(ctx context.Context, username, password string, traffi
 	if !existed {
 		p.order = append(p.order, id)
 	}
-	if err := p.saveLocked(); err != nil {
-		return AccountSummary{}, err
+	if p.store == nil {
+		if err := p.saveOrRollbackLocked(snapshot); err != nil {
+			return AccountSummary{}, err
+		}
 	}
 	return p.summaryLocked(id), nil
 }
@@ -233,29 +263,45 @@ func (p *AccountPool) AddBootstrap(username, password, sessionFile string) error
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	snapshot := p.snapshotLocked()
 
 	if _, ok := p.accounts[id]; ok {
 		return nil
 	}
 
 	now := time.Now()
-	p.accounts[id] = &accountState{
-		record: accountRecord{
-			ID:                    id,
-			Username:              username,
-			Password:              password,
-			SessionFile:           sessionFile,
-			Status:                AccountAvailable,
-			TrafficLimit:          defaultAccountTraffic,
-			TrafficPeriod:         monthKey(now),
-			CredentialNextCheckAt: formatAccountTime(now),
-			CreatedAt:             now,
-			UpdatedAt:             now,
-		},
-		client: p.newClient(username, password, sessionFile),
+	record := accountRecord{
+		ID:                    id,
+		Username:              username,
+		Password:              password,
+		SessionFile:           sessionFile,
+		Status:                AccountAvailable,
+		TrafficLimit:          defaultAccountTraffic,
+		TrafficPeriod:         monthKey(now),
+		CredentialNextCheckAt: formatAccountTime(now),
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
+	if p.store != nil {
+		record.SessionFile = ""
+		if data, err := os.ReadFile(sessionFile); err == nil {
+			if err := p.store.UpsertWithSession(record, data); err != nil {
+				return err
+			}
+		} else if os.IsNotExist(err) {
+			if err := p.store.Insert(record); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+	p.accounts[id] = &accountState{record: record, client: p.newClient(id, username, password, sessionFile)}
 	p.order = append(p.order, id)
-	return p.saveLocked()
+	if p.store != nil {
+		return nil
+	}
+	return p.saveOrRollbackLocked(snapshot)
 }
 
 func (p *AccountPool) List() []AccountSummary {
@@ -285,6 +331,7 @@ func (p *AccountPool) EnsureCredentialSchedule(now time.Time, interval time.Dura
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	snapshot := p.snapshotLocked()
 
 	changed := false
 	next := formatAccountTime(now.Add(interval))
@@ -302,7 +349,7 @@ func (p *AccountPool) EnsureCredentialSchedule(now time.Time, interval time.Dura
 	if !changed {
 		return nil
 	}
-	return p.saveLocked()
+	return p.saveOrRollbackLocked(snapshot)
 }
 
 type credentialCheckTarget struct {
@@ -370,9 +417,10 @@ func (p *AccountPool) RefreshPremiumInfo(ctx context.Context) {
 		p.mu.Lock()
 		state := p.accounts[item.id]
 		if state != nil {
+			snapshot := p.snapshotLocked()
 			updatePremiumRecord(&state.record, info, err, time.Now())
 			state.record.UpdatedAt = time.Now()
-			_ = p.saveLocked()
+			_ = p.saveOrRollbackLocked(snapshot)
 		}
 		p.mu.Unlock()
 	}
@@ -386,6 +434,7 @@ func (p *AccountPool) MarkCredentialCheckSuccess(id string, checkedAt, nextAt ti
 	if state == nil {
 		return
 	}
+	snapshot := p.snapshotLocked()
 	state.record.Status = AccountAvailable
 	state.record.LastError = ""
 	state.record.LastFailedAt = ""
@@ -396,7 +445,7 @@ func (p *AccountPool) MarkCredentialCheckSuccess(id string, checkedAt, nextAt ti
 		state.record.CredentialCheckError = "测试文件清理失败：" + friendlyPikPakError(cleanupErr)
 	}
 	state.record.UpdatedAt = checkedAt
-	_ = p.saveLocked()
+	_ = p.saveOrRollbackLocked(snapshot)
 }
 
 func (p *AccountPool) MarkCredentialCheckFailed(id string, err error, checkedAt, nextAt time.Time) {
@@ -407,6 +456,7 @@ func (p *AccountPool) MarkCredentialCheckFailed(id string, err error, checkedAt,
 	if state == nil {
 		return
 	}
+	snapshot := p.snapshotLocked()
 	message := friendlyPikPakError(err)
 	if message == "" {
 		message = "账号凭据验证失败"
@@ -418,7 +468,7 @@ func (p *AccountPool) MarkCredentialCheckFailed(id string, err error, checkedAt,
 	state.record.CredentialNextCheckAt = formatAccountTime(nextAt)
 	state.record.CredentialCheckError = message
 	state.record.UpdatedAt = checkedAt
-	_ = p.saveLocked()
+	_ = p.saveOrRollbackLocked(snapshot)
 }
 
 func (p *AccountPool) Snapshot() []AccountRuntime {
@@ -527,6 +577,7 @@ func (p *AccountPool) Delete(id string) error {
 	if state == nil {
 		return errors.New("account not found")
 	}
+	snapshot := p.snapshotLocked()
 
 	delete(p.accounts, id)
 	for i, accountID := range p.order {
@@ -536,11 +587,13 @@ func (p *AccountPool) Delete(id string) error {
 		}
 	}
 
-	if err := p.saveLocked(); err != nil {
+	if err := p.saveOrRollbackLocked(snapshot); err != nil {
 		return err
 	}
-	if err := os.Remove(state.record.SessionFile); err != nil && !os.IsNotExist(err) {
-		return err
+	if p.store == nil {
+		if err := os.Remove(state.record.SessionFile); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	return nil
 }
@@ -553,11 +606,12 @@ func (p *AccountPool) ResetFailure(id string) error {
 	if state == nil {
 		return errors.New("account not found")
 	}
+	snapshot := p.snapshotLocked()
 	state.record.Status = AccountAvailable
 	state.record.LastError = ""
 	state.record.LastFailedAt = ""
 	state.record.UpdatedAt = time.Now()
-	return p.saveLocked()
+	return p.saveOrRollbackLocked(snapshot)
 }
 
 func (p *AccountPool) RefreshLogin(ctx context.Context, id string) (AccountSummary, error) {
@@ -574,7 +628,7 @@ func (p *AccountPool) RefreshLogin(ctx context.Context, id string) (AccountSumma
 		return AccountSummary{}, errors.New("account username or password is missing")
 	}
 
-	client := p.newClient(record.Username, record.Password, record.SessionFile)
+	client := p.newClient(record.ID, record.Username, record.Password, record.SessionFile)
 	if err := client.Login(ctx, record.Username, record.Password); err != nil {
 		return AccountSummary{}, err
 	}
@@ -587,6 +641,7 @@ func (p *AccountPool) RefreshLogin(ctx context.Context, id string) (AccountSumma
 	if state == nil {
 		return AccountSummary{}, errors.New("account not found")
 	}
+	snapshot := p.snapshotLocked()
 
 	now := time.Now()
 	state.client = client
@@ -595,7 +650,7 @@ func (p *AccountPool) RefreshLogin(ctx context.Context, id string) (AccountSumma
 	state.record.LastFailedAt = ""
 	updatePremiumRecord(&state.record, premiumInfo, premiumErr, now)
 	state.record.UpdatedAt = now
-	if err := p.saveLocked(); err != nil {
+	if err := p.saveOrRollbackLocked(snapshot); err != nil {
 		return AccountSummary{}, err
 	}
 	return p.summaryLocked(id), nil
@@ -609,11 +664,12 @@ func (p *AccountPool) MarkFailed(id string, err error) {
 	if state == nil {
 		return
 	}
+	snapshot := p.snapshotLocked()
 	state.record.Status = AccountFailed
 	state.record.LastError = friendlyPikPakError(err)
 	state.record.LastFailedAt = time.Now().Format(time.RFC3339)
 	state.record.UpdatedAt = time.Now()
-	_ = p.saveLocked()
+	_ = p.saveOrRollbackLocked(snapshot)
 }
 
 func (p *AccountPool) MarkAvailable(id string) {
@@ -624,11 +680,12 @@ func (p *AccountPool) MarkAvailable(id string) {
 	if state == nil {
 		return
 	}
+	snapshot := p.snapshotLocked()
 	state.record.Status = AccountAvailable
 	state.record.LastError = ""
 	state.record.LastFailedAt = ""
 	state.record.UpdatedAt = time.Now()
-	_ = p.saveLocked()
+	_ = p.saveOrRollbackLocked(snapshot)
 }
 
 func (p *AccountPool) RecordParseError(id, jobID, message string) {
@@ -639,6 +696,7 @@ func (p *AccountPool) RecordParseError(id, jobID, message string) {
 	if state == nil {
 		return
 	}
+	snapshot := p.snapshotLocked()
 	message = strings.TrimSpace(message)
 	if message == "" {
 		message = "record not found"
@@ -650,7 +708,7 @@ func (p *AccountPool) RecordParseError(id, jobID, message string) {
 		Message: message,
 	})
 	state.record.UpdatedAt = now
-	_ = p.saveLocked()
+	_ = p.saveOrRollbackLocked(snapshot)
 }
 
 func (p *AccountPool) DeleteParseError(id string, index int) error {
@@ -664,9 +722,10 @@ func (p *AccountPool) DeleteParseError(id string, index int) error {
 	if index < 0 || index >= len(state.record.ParseErrors) {
 		return errors.New("parse error not found")
 	}
+	snapshot := p.snapshotLocked()
 	state.record.ParseErrors = append(state.record.ParseErrors[:index], state.record.ParseErrors[index+1:]...)
 	state.record.UpdatedAt = time.Now()
-	return p.saveLocked()
+	return p.saveOrRollbackLocked(snapshot)
 }
 
 // SetTrafficLimit updates an account's monthly downstream budget (in bytes).
@@ -681,9 +740,10 @@ func (p *AccountPool) SetTrafficLimit(id string, limitBytes int64) error {
 	if state == nil {
 		return errors.New("account not found")
 	}
+	snapshot := p.snapshotLocked()
 	state.record.TrafficLimit = limitBytes
 	state.record.UpdatedAt = time.Now()
-	return p.saveLocked()
+	return p.saveOrRollbackLocked(snapshot)
 }
 
 // AddTraffic records bytes of downstream traffic against an account for the
@@ -700,6 +760,7 @@ func (p *AccountPool) AddTraffic(id string, bytes int64) {
 	if state == nil {
 		return
 	}
+	snapshot := p.snapshotLocked()
 	now := time.Now()
 	mk := monthKey(now)
 	if state.record.TrafficPeriod != mk {
@@ -708,10 +769,78 @@ func (p *AccountPool) AddTraffic(id string, bytes int64) {
 	}
 	state.record.TrafficUsed += bytes
 	state.record.UpdatedAt = now
-	_ = p.saveLocked()
+	_ = p.saveOrRollbackLocked(snapshot)
+}
+
+type accountTrafficUpdate struct {
+	pool    *AccountPool
+	id      string
+	record  accountRecord
+	changed bool
+	closed  bool
+}
+
+func (p *AccountPool) beginTrafficUpdate(id string, bytes int64, now time.Time) (*accountTrafficUpdate, error) {
+	if p == nil || p.store == nil {
+		return nil, errors.New("durable account storage is not configured")
+	}
+	p.mu.Lock()
+	state := p.accounts[id]
+	if state == nil {
+		p.mu.Unlock()
+		return nil, errors.New("account not found")
+	}
+	record := state.record
+	record.ParseErrors = append([]ParseError(nil), state.record.ParseErrors...)
+	update := &accountTrafficUpdate{pool: p, id: id, record: record, changed: bytes > 0}
+	if bytes > 0 {
+		period := monthKey(now)
+		if update.record.TrafficPeriod != period {
+			update.record.TrafficUsed = 0
+			update.record.TrafficPeriod = period
+		}
+		update.record.TrafficUsed += bytes
+		update.record.UpdatedAt = now
+	}
+	return update, nil
+}
+
+func (u *accountTrafficUpdate) writeTx(tx *sql.Tx) error {
+	if u == nil || !u.changed {
+		return nil
+	}
+	return u.pool.store.updateTx(tx, u.record)
+}
+
+func (u *accountTrafficUpdate) finish(committed bool) {
+	if u == nil || u.closed {
+		return
+	}
+	if committed && u.changed {
+		if state := u.pool.accounts[u.id]; state != nil {
+			state.record = u.record
+		}
+	}
+	u.closed = true
+	u.pool.mu.Unlock()
 }
 
 func (p *AccountPool) load() error {
+	if p.store != nil {
+		records, err := p.store.List()
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			recordCopy := record
+			p.accounts[record.ID] = &accountState{
+				record: recordCopy,
+				client: p.newClient(record.ID, record.Username, record.Password, ""),
+			}
+			p.order = append(p.order, record.ID)
+		}
+		return nil
+	}
 	data, err := os.ReadFile(p.config.AccountsFile)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -747,7 +876,7 @@ func (p *AccountPool) load() error {
 		recordCopy := record
 		p.accounts[record.ID] = &accountState{
 			record: recordCopy,
-			client: p.newClient(record.Username, record.Password, record.SessionFile),
+			client: p.newClient(record.ID, record.Username, record.Password, record.SessionFile),
 		}
 		p.order = append(p.order, record.ID)
 	}
@@ -763,6 +892,9 @@ func (p *AccountPool) saveLocked() error {
 		}
 		records = append(records, state.record)
 	}
+	if p.store != nil {
+		return p.store.Replace(records)
+	}
 
 	data, err := json.MarshalIndent(records, "", "  ")
 	if err != nil {
@@ -776,6 +908,32 @@ func (p *AccountPool) saveLocked() error {
 		}
 	}
 	return os.WriteFile(p.config.AccountsFile, data, 0o600)
+}
+
+func (p *AccountPool) snapshotLocked() accountPoolSnapshot {
+	snapshot := accountPoolSnapshot{
+		accounts: make(map[string]*accountState, len(p.accounts)),
+		order:    append([]string(nil), p.order...),
+	}
+	for id, state := range p.accounts {
+		if state == nil {
+			snapshot.accounts[id] = nil
+			continue
+		}
+		stateCopy := *state
+		stateCopy.record.ParseErrors = append([]ParseError(nil), state.record.ParseErrors...)
+		snapshot.accounts[id] = &stateCopy
+	}
+	return snapshot
+}
+
+func (p *AccountPool) saveOrRollbackLocked(snapshot accountPoolSnapshot) error {
+	if err := p.saveLocked(); err != nil {
+		p.accounts = snapshot.accounts
+		p.order = snapshot.order
+		return err
+	}
+	return nil
 }
 
 func (p *AccountPool) summaryLocked(id string) AccountSummary {
@@ -813,31 +971,51 @@ func (p *AccountPool) summaryLocked(id string) AccountSummary {
 	}
 }
 
-func (p *AccountPool) newClient(username, password, sessionFile string) *pikpak.Client {
-	return pikpak.NewClient(pikpak.Config{
+func (p *AccountPool) newClient(id, username, password, sessionFile string) *pikpak.Client {
+	config := pikpak.Config{
 		Username:       username,
 		Password:       password,
 		SessionFile:    sessionFile,
+		RootFolderName: p.config.RootFolderName,
+		RequestTimeout: p.config.RequestTimeout,
+	}
+	if p.store != nil {
+		config.SessionFile = ""
+		config.SessionStore = p.store.SessionStore(id)
+	}
+	return pikpak.NewClient(config)
+}
+
+func (p *AccountPool) newClientWithSessionStore(username, password string, store pikpak.SessionStore) *pikpak.Client {
+	return pikpak.NewClient(pikpak.Config{
+		Username:       username,
+		Password:       password,
+		SessionStore:   store,
 		RootFolderName: p.config.RootFolderName,
 		RequestTimeout: p.config.RequestTimeout,
 	})
 }
 
 func (p *AccountPool) accountIdentity(username string) (id, sessionFile string) {
+	if p.store != nil {
+		normalized := strings.ToLower(strings.TrimSpace(username))
+		for existingID, state := range p.accounts {
+			if state != nil && strings.ToLower(strings.TrimSpace(state.record.Username)) == normalized {
+				return existingID, ""
+			}
+		}
+		return "acct_" + strings.ReplaceAll(uuid.NewString(), "-", ""), ""
+	}
 	id = accountIDForUsername(username)
 	return id, filepath.Join(p.config.SessionDir, id+".json")
 }
 
 func accountIDForUsername(username string) string {
-	if username != "" {
-		return "acct_" + hex.EncodeToString([]byte(strings.ToLower(strings.TrimSpace(username))))
+	username = strings.ToLower(strings.TrimSpace(username))
+	if username == "" {
+		return ""
 	}
-
-	buf := make([]byte, 6)
-	if _, err := rand.Read(buf); err != nil {
-		return fmt.Sprintf("acct_%d", time.Now().UnixNano())
-	}
-	return "acct_" + hex.EncodeToString(buf)
+	return "acct_" + hex.EncodeToString([]byte(username))
 }
 
 // monthKey is the calendar-month identifier used to scope traffic counters.

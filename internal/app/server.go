@@ -27,12 +27,19 @@ var webFS embed.FS
 type Server struct {
 	config               Config
 	accounts             *AccountPool
+	accountStore         *accountStore
 	jobs                 *jobStore
+	durableJobs          *sqlJobStore
 	resolver             *resolveQueue
 	logs                 *logStore
-	authSessions         *authSessionStore
-	creds                *credentialStore
+	authSessions         adminSessionStore
+	creds                adminCredentialStore
+	secrets              *SecretCipher
+	appSecrets           *appSecretStore
+	legacyBackup         *migrationBackup
 	updater              *updater
+	backups              *backupManager
+	storageLock          *storageFileLock
 	db                   *sql.DB
 	cdk                  *cdkStore
 	users                *userStore
@@ -51,6 +58,14 @@ type Server struct {
 	healthDone           chan struct{}
 	historyCancel        context.CancelFunc
 	historyDone          chan struct{}
+	backupCancel         context.CancelFunc
+	backupDone           chan struct{}
+	updaterCancel        context.CancelFunc
+	updaterDone          chan struct{}
+	restartOnce          sync.Once
+	restartCh            chan struct{}
+	closeOnce            sync.Once
+	closeErr             error
 	accountHealthProbe   accountHealthProbeFunc
 	accountHealthRefresh accountRefreshLoginFunc
 	nowFunc              func() time.Time
@@ -101,6 +116,36 @@ type changePasswordRequest struct {
 }
 
 func NewServer(cfg Config) (*Server, error) {
+	secretCipher, err := NewSecretCipher(cfg.DataEncryptionKey, cfg.DataEncryptionPreviousKeys)
+	if err != nil {
+		return nil, fmt.Errorf("configure data encryption: %w", err)
+	}
+	storageLock, err := acquireStorageFileLock(cfg.DBFile)
+	if err != nil {
+		return nil, fmt.Errorf("lock application storage: %w", err)
+	}
+	closeLockOnError := true
+	defer func() {
+		if closeLockOnError {
+			_ = storageLock.Close()
+		}
+	}()
+	if cfg.DBFile != ":memory:" {
+		if err := recoverInterruptedStorageRestore(cfg); err != nil {
+			return nil, fmt.Errorf("recover interrupted storage restore: %w", err)
+		}
+	}
+	migrationRecorded, err := storageMigrationRecorded(cfg.DBFile)
+	if err != nil {
+		return nil, fmt.Errorf("inspect storage migration: %w", err)
+	}
+	var legacyBackup *migrationBackup
+	if !migrationRecorded {
+		legacyBackup, err = prepareLegacyMigrationBackup(cfg, time.Now())
+		if err != nil {
+			return nil, fmt.Errorf("prepare storage migration backup: %w", err)
+		}
+	}
 	staticFiles, err := fs.Sub(webFS, "web/dist")
 	if err != nil {
 		return nil, err
@@ -120,12 +165,38 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	closeDBOnError := true
+	defer func() {
+		if closeDBOnError {
+			_ = db.Close()
+		}
+	}()
+	appSecrets := newAppSecretStore(db, secretCipher)
+	if err := appSecrets.ensureKeyCheck(); err != nil {
+		return nil, err
+	}
+	if err := appSecrets.rotateSecrets(); err != nil {
+		return nil, fmt.Errorf("rotate application secrets: %w", err)
+	}
+	settings := newSettingsStore(db)
+	if err := appSecrets.migrateLinuxDoSecret(settings); err != nil {
+		return nil, fmt.Errorf("migrate LinuxDo client secret: %w", err)
+	}
+	legacyBackup, err = migrateLegacyStorage(db, cfg, secretCipher, legacyBackup, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("migrate legacy storage: %w", err)
+	}
+	accountStore := newAccountStore(db, secretCipher)
+	if err := accountStore.RotateSecrets(); err != nil {
+		return nil, fmt.Errorf("rotate PikPak account secrets: %w", err)
+	}
 
 	accounts, err := NewAccountPool(AccountPoolConfig{
 		AccountsFile:   cfg.AccountsFile,
 		SessionDir:     cfg.AccountSessionDir,
 		RootFolderName: cfg.RootFolderName,
 		RequestTimeout: cfg.RequestTimeout,
+		Store:          accountStore,
 	})
 	if err != nil {
 		return nil, err
@@ -136,37 +207,70 @@ func NewServer(cfg Config) (*Server, error) {
 		}
 	}
 
-	creds, err := newCredentialStore(cfg.AuthFile)
+	creds, err := newDatabaseCredentialStore(db)
 	if err != nil {
 		return nil, err
 	}
+	authSessions := newDatabaseAuthSessionStore(db, time.Now)
 	// A password pinned via ACCESS_PASSWORD takes precedence and disables the
 	// first-visitor setup flow.
 	if cfg.HasFixedPassword() {
-		if err := creds.Set(cfg.AccessPassword); err != nil {
-			return nil, err
+		if !creds.Verify(cfg.AccessPassword) {
+			if err := creds.Set(cfg.AccessPassword); err != nil {
+				return nil, err
+			}
+			authSessions.invalidateAll()
+		}
+	}
+	sqlJobs := newSQLJobStore(db, secretCipher)
+	if err := sqlJobs.RotateSecrets(); err != nil {
+		return nil, fmt.Errorf("rotate resolve job secrets: %w", err)
+	}
+	if _, err := sqlJobs.foldCompletedChildren(time.Now()); err != nil {
+		return nil, fmt.Errorf("fold completed batch children: %w", err)
+	}
+	if _, err := sqlJobs.markNonterminalInterrupted(time.Now()); err != nil {
+		return nil, fmt.Errorf("mark interrupted resolve jobs: %w", err)
+	}
+	tempCleanups := newProxyTempCleanupStore(db, secretCipher)
+	if err := tempCleanups.RotateSecrets(); err != nil {
+		return nil, fmt.Errorf("rotate proxy cleanup secrets: %w", err)
+	}
+	var backups *backupManager
+	if strings.TrimSpace(cfg.BackupDir) != "" {
+		backups = newBackupManager(db, cfg.DBFile, cfg.BackupDir, cfg.BackupInterval, cfg.BackupRetention)
+		if err := backups.ReconcileInterrupted(context.Background()); err != nil {
+			return nil, fmt.Errorf("reconcile interrupted backups: %w", err)
 		}
 	}
 
 	server := &Server{
 		config:        cfg,
 		accounts:      accounts,
-		jobs:          newJobStore(200),
+		accountStore:  accountStore,
+		jobs:          newJobStore(200, sqlJobs),
+		durableJobs:   sqlJobs,
 		logs:          newLogStore(500),
-		authSessions:  newAuthSessionStore(),
+		authSessions:  authSessions,
 		creds:         creds,
+		secrets:       secretCipher,
+		appSecrets:    appSecrets,
+		legacyBackup:  legacyBackup,
+		backups:       backups,
+		storageLock:   storageLock,
 		db:            db,
 		cdk:           newCDKStore(db),
 		users:         newUserStore(db),
-		settings:      newSettingsStore(db),
-		history:       newResolveHistoryStore(db),
-		tempCleanups:  newProxyTempCleanupStore(db),
+		settings:      settings,
+		history:       newResolveHistoryStore(db, sqlJobs),
+		tempCleanups:  tempCleanups,
 		oauthStates:   newOAuthStateStore(),
 		gateHTML:      gateHTML,
 		userHTML:      userHTML,
 		mux:           http.NewServeMux(),
 		batches:       make(map[string]*batchState),
 		proxyFailures: make(map[string]proxyFailureCacheEntry),
+		restartCh:     make(chan struct{}),
 	}
 
 	if err := server.accounts.EnsureCredentialSchedule(time.Now(), server.accountHealthInterval()); err != nil {
@@ -178,6 +282,7 @@ func NewServer(cfg Config) (*Server, error) {
 	server.updater = newUpdater(cfg.UpdateRepo, cfg.RequestTimeout, func(level LogLevel, message string, details ...string) {
 		server.logJob(level, "", message, details...)
 	})
+	server.updater.restart = server.requestRestart
 
 	// Meter link resolution through the resolve queue. Concurrency is admin-
 	// controllable and persisted in the settings table; the config value only
@@ -216,6 +321,9 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("PUT /api/settings", server.handleUpdateSettings)
 	server.mux.HandleFunc("GET /api/settings/auth", server.handleGetAuthSettings)
 	server.mux.HandleFunc("PUT /api/settings/auth", server.handleUpdateAuthSettings)
+	server.mux.HandleFunc("GET /api/settings/storage", server.handleGetStorageSettings)
+	server.mux.HandleFunc("POST /api/settings/storage/backups", server.handleCreateStorageBackup)
+	server.mux.HandleFunc("DELETE /api/settings/storage/migration-backup", server.handleDeleteMigrationBackup)
 	server.mux.HandleFunc("GET /api/update", server.handleUpdateStatus)
 	server.mux.HandleFunc("POST /api/update/check", server.handleUpdateCheck)
 	server.mux.HandleFunc("POST /api/update/install", server.handleUpdateInstall)
@@ -261,10 +369,13 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Poll GitHub Releases in the background so the UI can surface an available
 	// update. Installs are always user-initiated.
-	go server.updater.runPeriodicCheck(context.Background(), cfg.UpdateCheckPeriod)
+	server.startUpdaterMonitor()
 	server.startAccountHealthMonitor()
 	server.startResolveHistoryCleanup()
+	server.startBackupMonitor()
 
+	closeDBOnError = false
+	closeLockOnError = false
 	return server, nil
 }
 
@@ -272,25 +383,76 @@ func (s *Server) Handler() http.Handler {
 	return s.authMiddleware(s.mux)
 }
 
+// RestartRequested is closed when the process must restart after an online
+// update or an indeterminate storage commit. The process owner should
+// gracefully stop HTTP and then Close.
+func (s *Server) RestartRequested() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	return s.restartCh
+}
+
+func (s *Server) requestRestart() {
+	if s == nil || s.restartCh == nil {
+		return
+	}
+	s.restartOnce.Do(func() { close(s.restartCh) })
+}
+
+func (s *Server) startUpdaterMonitor() {
+	if s == nil || s.updater == nil || s.config.UpdateCheckPeriod <= 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.updaterCancel = cancel
+	s.updaterDone = make(chan struct{})
+	go func() {
+		defer close(s.updaterDone)
+		s.updater.runPeriodicCheck(ctx, s.config.UpdateCheckPeriod)
+	}()
+}
+
 // Close releases server-held resources such as the database handle. It is safe
 // to call on a nil database.
 func (s *Server) Close() error {
-	if s.healthCancel != nil {
-		s.healthCancel()
+	if s == nil {
+		return nil
 	}
-	if s.healthDone != nil {
-		<-s.healthDone
-	}
-	if s.historyCancel != nil {
-		s.historyCancel()
-	}
-	if s.historyDone != nil {
-		<-s.historyDone
-	}
-	if s.db != nil {
-		return s.db.Close()
-	}
-	return nil
+	s.closeOnce.Do(func() {
+		if s.updaterCancel != nil {
+			s.updaterCancel()
+		}
+		if s.healthCancel != nil {
+			s.healthCancel()
+		}
+		if s.historyCancel != nil {
+			s.historyCancel()
+		}
+		if s.backupCancel != nil {
+			s.backupCancel()
+		}
+		if s.resolver != nil {
+			s.resolver.shutdown()
+		}
+		for _, done := range []<-chan struct{}{s.updaterDone, s.healthDone, s.historyDone, s.backupDone} {
+			if done != nil {
+				<-done
+			}
+		}
+		if s.db != nil {
+			if s.config.DBFile != ":memory:" {
+				if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+					s.closeErr = errors.Join(s.closeErr, fmt.Errorf("checkpoint SQLite WAL: %w", err))
+				}
+			}
+			s.closeErr = errors.Join(s.closeErr, s.db.Close())
+		}
+		if s.storageLock != nil {
+			s.closeErr = errors.Join(s.closeErr, s.storageLock.Close())
+		}
+	})
+	return s.closeErr
 }
 
 // authenticated reports whether the request carries a valid session cookie.
@@ -372,7 +534,10 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.issueSession(w)
+	if err := s.issueSession(w); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create session")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "configured"})
 }
 
@@ -393,20 +558,29 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.issueSession(w)
+	if err := s.issueSession(w); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create session")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "authenticated"})
 }
 
-func (s *Server) issueSession(w http.ResponseWriter) {
-	sessionID := s.authSessions.create()
+func (s *Server) issueSession(w http.ResponseWriter) error {
+	sessionID, err := s.authSessions.create()
+	if err != nil {
+		return err
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session",
 		Value:    sessionID,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   s.secureCookies(),
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   86400 * 30,
+		Expires:  time.Now().Add(adminSessionMaxAge),
 	})
+	return nil
 }
 
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
@@ -420,10 +594,17 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   s.secureCookies(),
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   -1,
 	})
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
+}
+
+func (s *Server) secureCookies() bool {
+	parsed, err := url.Parse(strings.TrimSpace(s.config.PublicBaseURL))
+	return err == nil && strings.EqualFold(parsed.Scheme, "https")
 }
 
 // handleChangePassword lets an authenticated admin rotate the access password.
@@ -469,7 +650,10 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	// Invalidate every session (other devices are logged out), then mint a fresh
 	// one for this client so the caller stays signed in.
 	s.authSessions.invalidateAll()
-	s.issueSession(w)
+	if err := s.issueSession(w); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create session")
+		return
+	}
 	s.logJob(LogSuccess, "", "访问密码已修改，其它设备的登录已失效")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
@@ -681,8 +865,13 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	jobID, err := newJobID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate a secure job ID")
+		return
+	}
 	job := &Job{
-		ID:            newJobID(),
+		ID:            jobID,
 		Kind:          kind,
 		Mode:          req.Mode,
 		Input:         req.Input,
@@ -706,11 +895,17 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		job.PassCode = passCode
 	}
 
-	s.jobs.create(job)
+	if err := s.jobs.create(job); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to persist job")
+		return
+	}
 	s.logJob(LogInfo, job.ID, "解析任务已创建", "来源："+string(kind))
-	s.resolver.enqueue(job.ID, priorityAdmin, func(ctx context.Context) {
+	if err := s.resolver.enqueue(job.ID, priorityAdmin, func(ctx context.Context) {
 		s.processJob(ctx, job.ID)
-	})
+	}); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "resolve queue is shutting down")
+		return
+	}
 
 	job.QueueAhead = s.resolver.position(job.ID)
 	writeJSON(w, http.StatusAccepted, job)
@@ -718,13 +913,34 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
-	job, ok := s.jobs.get(jobID)
+	job, ok, err := s.jobs.getWithError(jobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read job")
+		return
+	}
 	if !ok {
+		expired, err := s.jobDetailsExpired(jobID, resolveJobOwnerAdmin, resolveJobOwnerAdmin)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to read job")
+			return
+		}
+		if expired {
+			writeError(w, http.StatusGone, "job details have expired")
+			return
+		}
 		writeError(w, http.StatusNotFound, "job not found")
 		return
 	}
 	job.QueueAhead = s.resolver.position(jobID)
 	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) jobDetailsExpired(id, ownerType, ownerID string) (bool, error) {
+	if s == nil || s.durableJobs == nil {
+		return false, nil
+	}
+	record, ok, err := s.durableJobs.getRecord(id, ownerType, ownerID, s.now())
+	return ok && !record.DetailsAvailable, err
 }
 
 func (s *Server) handleSelectItem(w http.ResponseWriter, r *http.Request) {
@@ -1003,7 +1219,11 @@ func (s *Server) refreshProxyDirectLink(ctx context.Context, jobID, token string
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
-	job, ok := s.jobs.get(jobID)
+	job, ok, err := s.jobs.getWithError(jobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, proxyInvalidLinkError)
+		return
+	}
 	if !ok {
 		writeError(w, http.StatusNotFound, proxyInvalidLinkError)
 		return
@@ -1563,6 +1783,53 @@ const (
 	proxyDownloadFailedError = "代理下载失败，请稍后重试；如多次失败请联系管理员。"
 )
 
+const jobPersistenceUserError = "job could not be completed because durable storage is unavailable"
+
+var errJobAlreadyCompleted = errors.New("job is already completed")
+
+type jobPersistenceError struct {
+	operation string
+	err       error
+	uncertain bool
+}
+
+func (e *jobPersistenceError) Error() string {
+	return e.operation + ": " + e.err.Error()
+}
+
+func (e *jobPersistenceError) Unwrap() error { return e.err }
+
+func wrapJobPersistenceError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var commitErr *atomicCommitError
+	return &jobPersistenceError{
+		operation: operation,
+		err:       err,
+		uncertain: errors.As(err, &commitErr) && commitErr.uncertain,
+	}
+}
+
+func (s *Server) handleJobPersistenceFailure(jobID string, account AccountRuntime, err error, finishAttempt bool) bool {
+	var persistenceErr *jobPersistenceError
+	if !errors.As(err, &persistenceErr) {
+		return false
+	}
+	s.logJob(LogError, jobID, "durable job persistence failed", persistenceErr.Error())
+	if persistenceErr.uncertain {
+		s.logJob(LogError, jobID, "job completion outcome is uncertain; restart required")
+		s.requestRestart()
+		return true
+	}
+	s.accounts.MarkAvailable(account.ID)
+	if finishAttempt {
+		s.finishAccountAttempt(jobID, account.ID, "failed", jobPersistenceUserError)
+	}
+	s.failJob(jobID, errors.New(jobPersistenceUserError))
+	return true
+}
+
 func (s *Server) writeProxyFailure(w http.ResponseWriter, status int, jobID string, err error) {
 	if err != nil {
 		s.logJob(LogError, jobID, "代理下载失败", err.Error())
@@ -1602,7 +1869,14 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 			return
 		}
 
-		s.cleanupTempResourcesBestEffort(jobID, account, "account attempt failed", false)
+		if s.handleJobPersistenceFailure(jobID, account, err, true) {
+			return
+		}
+
+		cleanupErr := s.cleanupTempResourcesBestEffort(jobID, account, "account attempt failed", false)
+		if s.handleJobPersistenceFailure(jobID, account, cleanupErr, true) {
+			return
+		}
 
 		// A CDK traffic overdraw is deterministic and not the account's fault:
 		// retrying on other accounts would just repeat the expensive transfer and
@@ -1842,7 +2116,10 @@ func (s *Server) processShare(ctx context.Context, jobID string, account Account
 	if len(restoredIDs) == 0 {
 		return errors.New("share restore did not return any file id")
 	}
-	s.recordTempResource(jobID, account.ID, restoredIDs...)
+	if err := s.recordTempResource(jobID, account.ID, restoredIDs...); err != nil {
+		s.cleanupTempResourcesBestEffort(jobID, account, "persist cleanup intent failed", false, restoredIDs...)
+		return err
+	}
 	if len(restoredIDs) == 1 {
 		_, _ = s.jobs.update(jobID, func(current *Job) error {
 			current.FolderID = restoredIDs[0]
@@ -1867,7 +2144,7 @@ func (s *Server) updateSharePassCodeToken(jobID, token string) error {
 		current.Share.PassCodeToken = token
 		return nil
 	})
-	return err
+	return wrapJobPersistenceError("persist share access state", err)
 }
 
 func shareInitialParentID(share *ShareState) string {
@@ -2045,7 +2322,7 @@ func (s *Server) requestSelection(jobID string, stage JobStage, message string, 
 		}
 		return nil
 	})
-	return err
+	return wrapJobPersistenceError("persist job selection", err)
 }
 
 func (s *Server) resolveExistingFile(ctx context.Context, jobID string, item DownloadItem) {
@@ -2059,6 +2336,9 @@ func (s *Server) resolveExistingFile(ctx context.Context, jobID string, item Dow
 	if err := s.completeJob(ctx, jobID, account, item); err != nil {
 		if isCDKRefusalError(err) {
 			s.failJob(jobID, err)
+			return
+		}
+		if s.handleJobPersistenceFailure(jobID, account, err, false) {
 			return
 		}
 		s.accounts.MarkFailed(account.ID, err)
@@ -2081,6 +2361,9 @@ func (s *Server) resolveExistingFiles(ctx context.Context, jobID string, items [
 			s.failJob(jobID, err)
 			return
 		}
+		if s.handleJobPersistenceFailure(jobID, account, err, false) {
+			return
+		}
 		s.accounts.MarkFailed(account.ID, err)
 		s.failJob(jobID, err)
 	}
@@ -2093,45 +2376,16 @@ func (s *Server) completeJob(ctx context.Context, jobID string, account AccountR
 	}
 
 	size := parseBytes(result.File.Size)
-	job := mustJob(s.jobs.get(jobID))
-	if job.UserID != "" && s.users != nil {
-		if err := s.users.chargeIfEnough(job.UserID, size, job.Mode == "proxy", time.Now()); err != nil {
-			s.cleanupTempResourcesBestEffort(jobID, account, "user quota charge failed", false, item.ID)
-			return err
+	if err := s.finalizeCompletedJob(jobID, account, result, nil, size, item.ID); err != nil {
+		if errors.Is(err, errJobAlreadyCompleted) {
+			return nil
 		}
-	} else if cdkCode := job.CDKCode; cdkCode != "" {
-		if err := s.cdk.chargeIfEnough(cdkCode, size, time.Now()); err != nil {
-			s.cleanupTempResourcesBestEffort(jobID, account, "CDK charge failed", false, item.ID)
-			return err
-		}
+		return err
 	}
-
-	cleanupAfter := proxyDeferredCleanupAfter([]JobResult{*result}, s.now())
-	if err := s.deferJobTempCleanup(jobID, account, cleanupAfter, item.ID); err != nil {
-		s.logJob(LogWarn, jobID, "deferred PikPak cleanup failed", err.Error())
-		s.addJobWarning(jobID, "Temporary PikPak cleanup could not be scheduled; generated links are still ready.")
-	}
-
-	_, err = s.jobs.update(jobID, func(job *Job) error {
-		job.Status = JobCompleted
-		job.Stage = StageComplete
-		job.Message = "ready"
-		job.Error = ""
-		job.Items = nil
-		job.AccountID = account.ID
-		job.Result = result
-		return nil
-	})
-	if err == nil {
-		s.logJob(LogSuccess, jobID, "解析任务完成", "文件："+firstNonEmpty(result.File.Name, result.File.Path))
-		// The direct link has now been delivered, so the resource's size counts
-		// against this account's monthly downstream budget (and the CDK's traffic
-		// allowance, when the job came from a CDK user).
-		s.accounts.AddTraffic(account.ID, size)
-		s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(size))
-		s.saveCDKHistory(jobID)
-	}
-	return err
+	s.logJob(LogSuccess, jobID, "解析任务完成", "文件："+firstNonEmpty(result.File.Name, result.File.Path))
+	s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(size))
+	s.saveCDKHistory(jobID)
+	return nil
 }
 
 // resolveFileLink fetches a fresh direct link for a single already-transferred
@@ -2171,7 +2425,10 @@ func (s *Server) resolveFileLink(ctx context.Context, jobID string, account Acco
 	// jobs always, CDK jobs only if their CDK allows it. No-proxy CDK results
 	// then carry only a direct link, and the frontend hides the proxy row.
 	if s.jobAllowsProxy(job) {
-		proxyToken := newJobID()
+		proxyToken, err := newJobID()
+		if err != nil {
+			return nil, fmt.Errorf("generate secure proxy token: %w", err)
+		}
 		result.ProxyURL = strings.TrimRight(job.BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken
 		result.ProxyToken = proxyToken
 	}
@@ -2222,42 +2479,98 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 	}
 
 	fallbackIDs := downloadItemIDs(items)
-	job = mustJob(s.jobs.get(jobID))
-	if job.UserID != "" && s.users != nil {
-		if err := s.users.chargeIfEnough(job.UserID, totalSize, job.Mode == "proxy", time.Now()); err != nil {
-			s.cleanupTempResourcesBestEffort(jobID, account, "user quota charge failed", false, fallbackIDs...)
-			return err
+	if err := s.finalizeCompletedJob(jobID, account, nil, results, totalSize, fallbackIDs...); err != nil {
+		if errors.Is(err, errJobAlreadyCompleted) {
+			return nil
 		}
-	} else if cdkCode := job.CDKCode; cdkCode != "" {
-		if err := s.cdk.chargeIfEnough(cdkCode, totalSize, time.Now()); err != nil {
-			s.cleanupTempResourcesBestEffort(jobID, account, "CDK charge failed", false, fallbackIDs...)
-			return err
+		return err
+	}
+	s.logJob(LogSuccess, jobID, fmt.Sprintf("解析任务完成，共 %d 个文件", len(results)))
+	s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(totalSize))
+	s.saveCDKHistory(jobID)
+	return nil
+}
+
+func (s *Server) finalizeCompletedJob(jobID string, account AccountRuntime, result *JobResult, results []JobResult, chargedBytes int64, fallbackIDs ...string) error {
+	if s.db == nil || s.tempCleanups == nil || s.accounts == nil {
+		return wrapJobPersistenceError("persist completed job", errors.New("durable completion storage is not configured"))
+	}
+	now := s.now()
+	traffic, err := s.accounts.beginTrafficUpdate(account.ID, chargedBytes, now)
+	if err != nil {
+		return wrapJobPersistenceError("persist completed job", err)
+	}
+	committed := false
+	defer func() { traffic.finish(committed) }()
+
+	resultSet := append([]JobResult(nil), results...)
+	if result != nil {
+		resultSet = append([]JobResult{*result}, resultSet...)
+	}
+	cleanupAfter := proxyDeferredCleanupAfter(resultSet, now)
+	var cleanupIDs []string
+
+	_, err = s.jobs.updateAtomic(s.db, jobID, func(job *Job) error {
+		if job.Status == JobCompleted {
+			if job.AccountID == account.ID && job.ChargedBytes == chargedBytes {
+				return errJobAlreadyCompleted
+			}
+			return errors.New("job was already completed with different accounting")
 		}
-	}
-
-	cleanupAfter := proxyDeferredCleanupAfter(results, s.now())
-	if err := s.deferJobTempCleanup(jobID, account, cleanupAfter, fallbackIDs...); err != nil {
-		s.logJob(LogWarn, jobID, "deferred PikPak cleanup failed", err.Error())
-		s.addJobWarning(jobID, "Temporary PikPak cleanup could not be scheduled; generated links are still ready.")
-	}
-
-	_, err := s.jobs.update(jobID, func(job *Job) error {
+		if isTerminalJobStatus(job.Status) {
+			return errors.New("job is already terminal")
+		}
+		if job.TempAccountID != "" && job.TempAccountID != account.ID {
+			return errors.New("temporary resource account does not match completion account")
+		}
+		cleanupIDs = append([]string(nil), job.TempIDs...)
+		if len(cleanupIDs) == 0 && strings.TrimSpace(job.FolderID) != "" {
+			cleanupIDs = append(cleanupIDs, job.FolderID)
+		}
+		cleanupIDs = uniqueStrings(append(cleanupIDs, fallbackIDs...))
 		job.Status = JobCompleted
 		job.Stage = StageComplete
 		job.Message = "ready"
 		job.Error = ""
+		job.FailureCode = ""
 		job.Items = nil
 		job.AccountID = account.ID
-		job.Results = results
+		job.Result = result
+		job.Results = append([]JobResult(nil), results...)
+		job.ChargedBytes = chargedBytes
+		job.FolderID = ""
+		job.TempAccountID = ""
+		job.TempIDs = nil
 		return nil
+	}, func(tx *sql.Tx, job *Job) error {
+		if job.UserID != "" {
+			if s.users == nil {
+				return errors.New("user quota storage is not configured")
+			}
+			if err := s.users.chargeIfEnoughTx(tx, job.UserID, chargedBytes, job.Mode == "proxy", now); err != nil {
+				return err
+			}
+		} else if job.CDKCode != "" {
+			if s.cdk == nil {
+				return errors.New("CDK storage is not configured")
+			}
+			if err := s.cdk.chargeIfEnoughTx(tx, job.CDKCode, chargedBytes, now); err != nil {
+				return err
+			}
+		}
+		if err := traffic.writeTx(tx); err != nil {
+			return err
+		}
+		return s.tempCleanups.recordTx(tx, jobID, account.ID, cleanupIDs, cleanupAfter, now)
 	})
-	if err == nil {
-		s.logJob(LogSuccess, jobID, fmt.Sprintf("解析任务完成，共 %d 个文件", len(results)))
-		s.accounts.AddTraffic(account.ID, totalSize)
-		s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(totalSize))
-		s.saveCDKHistory(jobID)
+	if err != nil {
+		if errors.Is(err, errJobAlreadyCompleted) || isCDKRefusalError(err) {
+			return err
+		}
+		return wrapJobPersistenceError("persist completed job", err)
 	}
-	return err
+	committed = true
+	return nil
 }
 
 func downloadItemIDs(items []DownloadItem) []string {
@@ -2288,28 +2601,86 @@ func selectedShareItems(share *ShareState) []DownloadItem {
 	return append([]DownloadItem(nil), share.SelectedItems...)
 }
 
-func (s *Server) recordTempResource(jobID, accountID string, ids ...string) {
+func (s *Server) recordTempResource(jobID, accountID string, ids ...string) error {
 	cleanIDs := uniqueStrings(ids)
 	if len(cleanIDs) == 0 {
-		return
+		return nil
 	}
-	_, _ = s.jobs.update(jobID, func(job *Job) error {
+	if s.db == nil || s.tempCleanups == nil {
+		return wrapJobPersistenceError("persist temporary cleanup intent", errors.New("temporary cleanup storage is not configured"))
+	}
+	now := s.now()
+	cleanupDelay := proxyTempCleanupFallbackTTL
+	if s.resolver != nil && s.resolver.currentTimeout() > cleanupDelay {
+		cleanupDelay = s.resolver.currentTimeout()
+	}
+	cleanupAfter := now.Add(cleanupDelay + proxyTempCleanupGrace)
+	_, err := s.jobs.updateAtomic(s.db, jobID, func(job *Job) error {
+		if job.TempAccountID != "" && job.TempAccountID != accountID {
+			return errors.New("temporary resource account cannot be changed")
+		}
 		job.TempAccountID = accountID
 		job.TempIDs = uniqueStrings(append(job.TempIDs, cleanIDs...))
 		if len(cleanIDs) == 1 && job.FolderID == "" {
 			job.FolderID = cleanIDs[0]
 		}
 		return nil
+	}, func(tx *sql.Tx, job *Job) error {
+		return s.tempCleanups.recordTx(tx, jobID, accountID, cleanIDs, cleanupAfter, now)
 	})
+	return wrapJobPersistenceError("persist temporary cleanup intent", err)
 }
 
-func (s *Server) clearTempResources(jobID string) {
-	_, _ = s.jobs.update(jobID, func(job *Job) error {
+func (s *Server) detachTempResources(jobID, accountID string) error {
+	if s.db == nil {
+		return wrapJobPersistenceError("detach temporary cleanup state", errors.New("durable job storage is not configured"))
+	}
+	_, err := s.jobs.updateAtomic(s.db, jobID, func(job *Job) error {
+		if job.TempAccountID != accountID {
+			return nil
+		}
 		job.FolderID = ""
 		job.TempAccountID = ""
 		job.TempIDs = nil
 		return nil
+	}, nil)
+	return wrapJobPersistenceError("detach temporary cleanup state", err)
+}
+
+func (s *Server) completeTempResourceCleanup(jobID, accountID string, deletedIDs []string) error {
+	if s.db == nil || s.tempCleanups == nil {
+		return wrapJobPersistenceError("reconcile temporary cleanup", errors.New("temporary cleanup storage is not configured"))
+	}
+	_, err := s.jobs.updateAtomic(s.db, jobID, func(job *Job) error {
+		if job.TempAccountID != accountID {
+			return nil
+		}
+		job.TempIDs = removeStrings(job.TempIDs, deletedIDs)
+		if len(job.TempIDs) == 0 {
+			job.FolderID = ""
+			job.TempAccountID = ""
+		}
+		return nil
+	}, func(tx *sql.Tx, _ *Job) error {
+		return s.tempCleanups.removeIDsByJobAccountTx(tx, jobID, accountID, deletedIDs)
 	})
+	return wrapJobPersistenceError("reconcile temporary cleanup", err)
+}
+
+func removeStrings(values, removed []string) []string {
+	removeSet := make(map[string]struct{}, len(removed))
+	for _, value := range removed {
+		if value = strings.TrimSpace(value); value != "" {
+			removeSet[value] = struct{}{}
+		}
+	}
+	kept := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, remove := removeSet[value]; !remove {
+			kept = append(kept, value)
+		}
+	}
+	return uniqueStrings(kept)
 }
 
 func (s *Server) addJobWarning(jobID, warning string) {
@@ -2347,13 +2718,15 @@ func (s *Server) cleanupJobTempResources(ctx context.Context, jobID string, acco
 		return nil
 	}
 	if err := account.Client.DeleteFiles(ctx, ids); err != nil {
+		if detachErr := s.detachTempResources(jobID, account.ID); detachErr != nil {
+			return errors.Join(err, detachErr)
+		}
 		return err
 	}
-	s.clearTempResources(jobID)
-	return nil
+	return s.completeTempResourceCleanup(jobID, account.ID, ids)
 }
 
-func (s *Server) cleanupTempResourcesBestEffort(jobID string, account AccountRuntime, reason string, warn bool, fallbackIDs ...string) {
+func (s *Server) cleanupTempResourcesBestEffort(jobID string, account AccountRuntime, reason string, warn bool, fallbackIDs ...string) error {
 	timeout := s.config.RequestTimeout
 	if timeout <= 0 {
 		timeout = 20 * time.Second
@@ -2366,7 +2739,9 @@ func (s *Server) cleanupTempResourcesBestEffort(jobID string, account AccountRun
 		if warn {
 			s.addJobWarning(jobID, "Temporary PikPak cleanup failed; generated links are still ready.")
 		}
+		return err
 	}
+	return nil
 }
 
 func (s *Server) ensureJobFolder(ctx context.Context, jobID string, account AccountRuntime) (string, error) {
@@ -2385,13 +2760,11 @@ func (s *Server) ensureJobFolder(ctx context.Context, jobID string, account Acco
 		return "", err
 	}
 
-	_, err = s.jobs.update(jobID, func(current *Job) error {
-		current.FolderID = folder.ID
-		current.TempAccountID = account.ID
-		current.TempIDs = uniqueStrings(append(current.TempIDs, folder.ID))
-		return nil
-	})
-	if err != nil {
+	if err := s.recordTempResource(jobID, account.ID, folder.ID); err != nil {
+		cleanupErr := account.Client.DeleteFiles(ctx, []string{folder.ID})
+		if cleanupErr != nil {
+			return "", errors.Join(err, fmt.Errorf("delete untracked temporary folder: %w", cleanupErr))
+		}
 		return "", err
 	}
 	return folder.ID, nil
@@ -3061,7 +3434,18 @@ func (s *Server) updateJobState(jobID string, status JobStatus, stage JobStage, 
 }
 
 func (s *Server) failJob(jobID string, err error) {
-	s.updateJobState(jobID, JobFailed, StageFailed, "", err.Error())
+	failureCode := "resolve_failed"
+	if errors.Is(err, errResolveQueueClosed) {
+		failureCode = "service_shutdown"
+	}
+	_, _ = s.jobs.update(jobID, func(job *Job) error {
+		job.Status = JobFailed
+		job.Stage = StageFailed
+		job.Message = ""
+		job.Error = err.Error()
+		job.FailureCode = failureCode
+		return nil
+	})
 }
 
 func (s *Server) baseURL(r *http.Request) string {

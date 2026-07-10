@@ -9,6 +9,8 @@ import (
 	"testing"
 )
 
+const testDataEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	dir := t.TempDir()
@@ -18,6 +20,7 @@ func newTestServer(t *testing.T) *Server {
 		AccountSessionDir: filepath.Join(dir, "sessions"),
 		AuthFile:          filepath.Join(dir, "auth.json"),
 		DBFile:            filepath.Join(dir, "pikpak.db"),
+		DataEncryptionKey: testDataEncryptionKey,
 		RequestTimeout:    0,
 	}
 	srv, err := NewServer(cfg)
@@ -188,6 +191,7 @@ func TestFixedPasswordDisablesSetup(t *testing.T) {
 		AccountSessionDir: filepath.Join(dir, "sessions"),
 		AuthFile:          filepath.Join(dir, "auth.json"),
 		DBFile:            filepath.Join(dir, "pikpak.db"),
+		DataEncryptionKey: testDataEncryptionKey,
 	}
 	srv, err := NewServer(cfg)
 	if err != nil {
@@ -307,6 +311,7 @@ func TestChangePasswordBlockedWhenFixed(t *testing.T) {
 		AccountSessionDir: filepath.Join(dir, "sessions"),
 		AuthFile:          filepath.Join(dir, "auth.json"),
 		DBFile:            filepath.Join(dir, "pikpak.db"),
+		DataEncryptionKey: testDataEncryptionKey,
 	}
 	srv, err := NewServer(cfg)
 	if err != nil {

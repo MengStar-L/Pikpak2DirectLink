@@ -98,7 +98,7 @@ const nav = [
 @media (max-width: 720px) {
   .rail {
     width: auto; height: auto;
-    position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+    position: fixed; top: auto; bottom: 12px; left: 50%; transform: translateX(-50%);
     flex-direction: row; padding: 7px;
     border: 1px solid var(--line); border-radius: var(--r-xl);
     box-shadow: var(--shadow-md); z-index: 50;

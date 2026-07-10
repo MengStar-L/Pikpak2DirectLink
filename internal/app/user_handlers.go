@@ -88,8 +88,10 @@ func (s *Server) setUserSessionCookie(w http.ResponseWriter, userID string, now 
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   s.secureCookies(),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(userSessionMaxAge.Seconds()),
+		Expires:  now.Add(userSessionMaxAge),
 	})
 	return nil
 }
@@ -100,6 +102,7 @@ func clearUserSessionCookie(w http.ResponseWriter) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
 	http.SetCookie(w, &http.Cookie{
@@ -107,6 +110,7 @@ func clearUserSessionCookie(w http.ResponseWriter) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
 }
@@ -132,7 +136,11 @@ func (s *Server) handleLinuxDoAuthStart(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusServiceUnavailable, "LinuxDo login is not configured")
 		return
 	}
-	state := s.oauthStates.create(s.now())
+	state, err := s.oauthStates.create(s.now())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create OAuth state")
+		return
+	}
 	http.Redirect(w, r, s.linuxDoAuthorizationURL(r, state), http.StatusFound)
 }
 
@@ -380,8 +388,13 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := s.now()
+	jobID, err := newJobID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate a secure job ID")
+		return
+	}
 	job := &Job{
-		ID:            newJobID(),
+		ID:            jobID,
 		Kind:          kind,
 		Mode:          req.Mode,
 		Input:         req.Input,
@@ -398,11 +411,17 @@ func (s *Server) handleUserCreateJob(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:     now,
 	}
 
-	s.jobs.create(job)
+	if err := s.jobs.create(job); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to persist job")
+		return
+	}
 	s.logJob(LogInfo, job.ID, "user resolve job created", "user="+user.ID, "source="+string(kind))
-	s.resolver.enqueue(job.ID, priorityUser, func(ctx context.Context) {
+	if err := s.resolver.enqueue(job.ID, priorityUser, func(ctx context.Context) {
 		s.processJob(ctx, job.ID)
-	})
+	}); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "resolve queue is shutting down")
+		return
+	}
 
 	view := toUserJobView(job)
 	view.QueueAhead = s.resolver.position(job.ID)
@@ -429,8 +448,22 @@ func (s *Server) handleUserGetJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "user session is invalid or expired")
 		return
 	}
-	job, ok := s.jobs.get(r.PathValue("id"))
+	jobID := r.PathValue("id")
+	job, ok, err := s.jobs.getWithError(jobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read job")
+		return
+	}
 	if !ok || job.UserID != user.ID {
+		expired, err := s.jobDetailsExpired(jobID, resolveJobOwnerUser, user.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to read job")
+			return
+		}
+		if expired {
+			writeError(w, http.StatusGone, "job details have expired")
+			return
+		}
 		writeError(w, http.StatusNotFound, "job not found")
 		return
 	}
@@ -464,6 +497,10 @@ func (s *Server) handleUserHistoryGet(w http.ResponseWriter, r *http.Request) {
 	now := s.now()
 	s.cleanupResolveHistory(now)
 	detail, ok, err := s.history.getByUser(user.ID, r.PathValue("id"), now)
+	if errors.Is(err, errResolveJobDetailsExpired) {
+		writeError(w, http.StatusGone, "history details have expired")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -481,8 +518,22 @@ func (s *Server) handleUserSelectItem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "user session is invalid or expired")
 		return
 	}
-	job, ok := s.jobs.get(r.PathValue("id"))
+	jobID := r.PathValue("id")
+	job, ok, err := s.jobs.getWithError(jobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read job")
+		return
+	}
 	if !ok || job.UserID != user.ID {
+		expired, err := s.jobDetailsExpired(jobID, resolveJobOwnerUser, user.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to read job")
+			return
+		}
+		if expired {
+			writeError(w, http.StatusGone, "job details have expired")
+			return
+		}
 		writeError(w, http.StatusNotFound, "job not found")
 		return
 	}

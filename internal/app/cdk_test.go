@@ -476,7 +476,11 @@ func TestHandleDeleteExpiredCDKs(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/cdks/expired", nil)
-	req.AddCookie(&http.Cookie{Name: "session", Value: srv.authSessions.create()})
+	token, err := srv.authSessions.create()
+	if err != nil {
+		t.Fatalf("create admin session: %v", err)
+	}
+	req.AddCookie(&http.Cookie{Name: "session", Value: token})
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

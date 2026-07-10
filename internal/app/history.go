@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 )
@@ -13,11 +14,16 @@ const resolveHistoryTTL = 3 * time.Hour
 const resolveHistoryCleanupInterval = time.Minute
 
 type resolveHistoryStore struct {
-	db *sql.DB
+	db      *sql.DB
+	durable *sqlJobStore
 }
 
-func newResolveHistoryStore(db *sql.DB) *resolveHistoryStore {
-	return &resolveHistoryStore{db: db}
+func newResolveHistoryStore(db *sql.DB, durable ...*sqlJobStore) *resolveHistoryStore {
+	store := &resolveHistoryStore{db: db}
+	if len(durable) > 0 {
+		store.durable = durable[0]
+	}
+	return store
 }
 
 func (s *Server) startResolveHistoryCleanup() {
@@ -52,6 +58,11 @@ func (s *Server) cleanupResolveHistory(now time.Time) {
 		s.cleanupProxyTempResources(now)
 		return
 	}
+	if s.durableJobs != nil {
+		if _, err := s.durableJobs.scrubExpired(now); err != nil {
+			s.logJob(LogWarn, "", "resolve job detail cleanup failed", err.Error())
+		}
+	}
 	if _, err := s.history.deleteExpired(now); err != nil {
 		s.logJob(LogWarn, "", "CDK resolve history cleanup failed", err.Error())
 	}
@@ -72,16 +83,21 @@ func (s *Server) saveCDKHistory(jobID string) {
 }
 
 type resolveHistorySummary struct {
-	ID          string         `json:"id"`
-	JobID       string         `json:"job_id"`
-	Kind        ResourceKind   `json:"kind"`
-	Mode        string         `json:"mode"`
-	Input       string         `json:"input"`
-	ResultCount int            `json:"result_count"`
-	Batch       *BatchProgress `json:"batch,omitempty"`
-	CreatedAt   time.Time      `json:"created_at"`
-	CompletedAt time.Time      `json:"completed_at"`
-	ExpiresAt   time.Time      `json:"expires_at"`
+	ID               string         `json:"id"`
+	JobID            string         `json:"job_id"`
+	Kind             ResourceKind   `json:"kind"`
+	Mode             string         `json:"mode"`
+	Input            string         `json:"input"`
+	ResultCount      int            `json:"result_count"`
+	Batch            *BatchProgress `json:"batch,omitempty"`
+	Status           JobStatus      `json:"status"`
+	Stage            JobStage       `json:"stage"`
+	FailureCode      string         `json:"failure_code,omitempty"`
+	DetailsAvailable bool           `json:"details_available"`
+	ChargedBytes     int64          `json:"charged_bytes"`
+	CreatedAt        time.Time      `json:"created_at"`
+	CompletedAt      time.Time      `json:"completed_at"`
+	ExpiresAt        time.Time      `json:"expires_at"`
 }
 
 type resolveHistoryDetail struct {
@@ -100,6 +116,9 @@ func (s *resolveHistoryStore) saveJob(job *Job) error {
 		return nil
 	}
 	if strings.TrimSpace(job.CDKCode) == "" && strings.TrimSpace(job.UserID) == "" || strings.TrimSpace(job.ParentID) != "" || job.Status != JobCompleted {
+		return nil
+	}
+	if s.durable != nil {
 		return nil
 	}
 
@@ -181,6 +200,37 @@ func (s *resolveHistoryStore) list(cdkCode string, now time.Time) ([]resolveHist
 }
 
 func (s *resolveHistoryStore) listByUser(userID string, now time.Time) ([]resolveHistorySummary, error) {
+	var out []resolveHistorySummary
+	seen := make(map[string]struct{})
+	if s != nil && s.durable != nil {
+		records, err := s.durable.listHistoryByUser(userID, now)
+		if err != nil {
+			return nil, err
+		}
+		for _, record := range records {
+			summary := resolveHistorySummaryFromRecord(record)
+			out = append(out, summary)
+			seen[summary.ID] = struct{}{}
+		}
+	}
+	legacy, err := s.listByUserLegacy(userID, now)
+	if err != nil {
+		return nil, err
+	}
+	for _, summary := range legacy {
+		if _, exists := seen[summary.ID]; exists {
+			continue
+		}
+		summary.Status = JobCompleted
+		summary.Stage = StageComplete
+		summary.DetailsAvailable = true
+		out = append(out, summary)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CompletedAt.After(out[j].CompletedAt) })
+	return out, nil
+}
+
+func (s *resolveHistoryStore) listByUserLegacy(userID string, now time.Time) ([]resolveHistorySummary, error) {
 	if s == nil || s.db == nil {
 		return nil, nil
 	}
@@ -231,6 +281,24 @@ func (s *resolveHistoryStore) get(cdkCode, id string, now time.Time) (resolveHis
 }
 
 func (s *resolveHistoryStore) getByUser(userID, id string, now time.Time) (resolveHistoryDetail, bool, error) {
+	if s != nil && s.durable != nil {
+		record, ok, err := s.durable.getRecord(id, resolveJobOwnerUser, userID, now)
+		if err != nil {
+			return resolveHistoryDetail{}, false, err
+		}
+		if ok && record.ParentID == "" && isTerminalJobStatus(record.Status) {
+			detail := resolveHistoryDetail{resolveHistorySummary: resolveHistorySummaryFromRecord(record)}
+			if !record.DetailsAvailable {
+				return detail, true, errResolveJobDetailsExpired
+			}
+			detail.Results = historyResultsFromJob(record.Job)
+			return detail, true, nil
+		}
+	}
+	return s.getByUserLegacy(userID, id, now)
+}
+
+func (s *resolveHistoryStore) getByUserLegacy(userID, id string, now time.Time) (resolveHistoryDetail, bool, error) {
 	if s == nil || s.db == nil {
 		return resolveHistoryDetail{}, false, nil
 	}
@@ -256,11 +324,43 @@ func (s *resolveHistoryStore) deleteExpired(now time.Time) (int64, error) {
 	if s == nil || s.db == nil {
 		return 0, nil
 	}
+	var deleted int64
+	if s.durable != nil {
+		count, err := s.durable.deleteExpired(now)
+		if err != nil {
+			return 0, err
+		}
+		deleted += count
+	}
 	res, err := s.db.Exec(`DELETE FROM cdk_resolve_history WHERE expires_at<=?`, now.Unix())
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	legacyDeleted, err := res.RowsAffected()
+	return deleted + legacyDeleted, err
+}
+
+func resolveHistorySummaryFromRecord(record resolveJobRecord) resolveHistorySummary {
+	summary := resolveHistorySummary{
+		ID:               record.ID,
+		JobID:            record.ID,
+		Kind:             record.Kind,
+		Mode:             record.Mode,
+		ResultCount:      record.ResultCount,
+		Status:           record.Status,
+		Stage:            record.Stage,
+		FailureCode:      record.FailureCode,
+		DetailsAvailable: record.DetailsAvailable,
+		ChargedBytes:     record.ChargedBytes,
+		CreatedAt:        record.CreatedAt,
+		CompletedAt:      record.CompletedAt,
+		ExpiresAt:        record.DetailsExpiresAt,
+	}
+	if record.DetailsAvailable && record.Job != nil {
+		summary.Input = strings.TrimSpace(firstNonEmpty(record.Job.OriginalInput, record.Job.Input))
+		summary.Batch = cleanHistoryBatch(record.Job.Batch)
+	}
+	return summary
 }
 
 type resolveHistoryScanner interface {
@@ -305,16 +405,19 @@ func scanResolveHistory(scanner resolveHistoryScanner) (storedResolveHistory, er
 		userID:  userID,
 		resolveHistoryDetail: resolveHistoryDetail{
 			resolveHistorySummary: resolveHistorySummary{
-				ID:          id,
-				JobID:       jobID,
-				Kind:        ResourceKind(kind),
-				Mode:        mode,
-				Input:       input,
-				ResultCount: len(results),
-				Batch:       batch,
-				CreatedAt:   time.Unix(createdUnix, 0),
-				CompletedAt: time.Unix(doneUnix, 0),
-				ExpiresAt:   time.Unix(expiresUnix, 0),
+				ID:               id,
+				JobID:            jobID,
+				Kind:             ResourceKind(kind),
+				Mode:             mode,
+				Input:            input,
+				ResultCount:      len(results),
+				Batch:            batch,
+				Status:           JobCompleted,
+				Stage:            StageComplete,
+				DetailsAvailable: true,
+				CreatedAt:        time.Unix(createdUnix, 0),
+				CompletedAt:      time.Unix(doneUnix, 0),
+				ExpiresAt:        time.Unix(expiresUnix, 0),
 			},
 			Results: results,
 		},

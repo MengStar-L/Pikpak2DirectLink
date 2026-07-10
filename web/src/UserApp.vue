@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
-  ArrowLeft, CalendarClock, CheckCheck, Files, Gauge, History, Hourglass, Inbox, KeyRound, Link2,
-  LogOut, Mail, Radar, RefreshCw, Send, Settings2, Ticket, UserPlus, Waypoints, X,
+  ArrowLeft, CalendarClock, CheckCheck, ClockAlert, Files, Gauge, History, Hourglass, Inbox, KeyRound,
+  Link2, LogOut, Mail, Radar, RefreshCw, Send, Settings2, Ticket, TriangleAlert, UserPlus, Waypoints, X,
 } from 'lucide-vue-next'
 import AuroraBg from './components/AuroraBg.vue'
 import GlassCard from './components/GlassCard.vue'
@@ -19,7 +19,7 @@ import { api, setUnauthorizedHandler } from './lib/api'
 import { useJob } from './composables/useJob'
 import { aria2 } from './composables/useAria2'
 import { toast } from './composables/useToast'
-import { formatDateTime, formatRelative } from './lib/format'
+import { formatBytes, formatDateTime, formatRelative } from './lib/format'
 import type { JobResult, ResolveHistoryDetail, ResolveHistorySummary, UserAuthConfig, UserStatusResponse } from './lib/types'
 
 const view = ref<'gate' | 'portal'>('gate')
@@ -44,7 +44,13 @@ const historyLoading = ref(false)
 const historyError = ref('')
 const historyItems = ref<ResolveHistorySummary[]>([])
 const historyDetail = ref<ResolveHistoryDetail | null>(null)
+const historyUnavailable = ref<ResolveHistorySummary | null>(null)
 const selectedIds = ref<string[]>([])
+
+const CURRENT_JOB_KEY = 'pikpak2directlink.user.current_job_id'
+const RESTORE_POLL_MS = 1200
+let restoreTimer: number | undefined
+let restoreGeneration = 0
 
 const { job, phase, error, submitting, submit, selectItems } = useJob({
   create: (b) => api.u.jobs.create(b),
@@ -68,6 +74,7 @@ const displayName = computed(() => status.value?.user.display_name || status.val
 const canProxy = computed(() => Boolean(status.value?.quota.allow_proxy_available))
 
 setUnauthorizedHandler(() => {
+  clearCurrentJob()
   view.value = 'gate'
   status.value = null
   closeRedeem()
@@ -112,6 +119,7 @@ async function submitEmailAuth() {
       : await api.u.emailLogin(email.value.trim(), password.value)
     authConfig.value = status.value.auth
     view.value = 'portal'
+    await restoreCurrentJob()
     toast(emailMode.value === 'register' ? '账号已创建' : '已登录', 'success')
   } catch (e: any) {
     loginError.value = e?.message || '登录失败'
@@ -124,6 +132,7 @@ async function logout() {
   try {
     await api.u.logout()
   } catch { /* ignore */ }
+  clearCurrentJob()
   status.value = null
   view.value = 'gate'
   await loadAuthConfig()
@@ -157,9 +166,12 @@ async function submitRedeem() {
   }
 }
 
-function onSubmit(payload: { input: string; passCode: string; mode: 'direct' | 'proxy' }) {
+async function onSubmit(payload: { input: string; passCode: string; mode: 'direct' | 'proxy' }) {
+	invalidateRestore()
+  removeStoredJobID()
   selectedIds.value = []
-  submit(payload.input, payload.passCode, payload.mode)
+  await submit(payload.input, payload.passCode, payload.mode)
+  if (job.value?.id) storeJobID(job.value.id)
 }
 function confirmSelection() {
   if (!selectedIds.value.length) {
@@ -202,6 +214,7 @@ function closeHistory() {
   historyError.value = ''
   historyItems.value = []
   historyDetail.value = null
+  historyUnavailable.value = null
 }
 async function toggleHistory() {
   if (historyOpen.value) {
@@ -215,6 +228,7 @@ async function loadHistory() {
   historyLoading.value = true
   historyError.value = ''
   historyDetail.value = null
+  historyUnavailable.value = null
   try {
     const payload = await api.u.history.list()
     historyItems.value = payload.history || []
@@ -224,19 +238,32 @@ async function loadHistory() {
     historyLoading.value = false
   }
 }
-async function openHistoryDetail(id: string) {
+async function openHistoryDetail(item: ResolveHistorySummary) {
+  historyDetail.value = null
+  historyUnavailable.value = null
+  if (item.details_available === false) {
+    historyUnavailable.value = item
+    return
+  }
   historyLoading.value = true
   historyError.value = ''
   try {
-    historyDetail.value = await api.u.history.get(id)
+    historyDetail.value = await api.u.history.get(item.id)
   } catch (e: any) {
-    historyError.value = e?.message || '加载历史详情失败'
+    if (e?.status === 410) {
+      historyUnavailable.value = { ...item, details_available: false }
+    } else if (e?.status === 404) {
+      historyError.value = '这条历史记录已过期或不存在'
+    } else {
+      historyError.value = '暂时无法加载历史详情，请稍后重试'
+    }
   } finally {
     historyLoading.value = false
   }
 }
 function backToHistoryList() {
   historyDetail.value = null
+  historyUnavailable.value = null
 }
 function pushHistoryAll() {
   const list = historyResults.value
@@ -260,8 +287,13 @@ function historyKindLabel(kind: string) {
   return kind || '-'
 }
 function historyResultLabel(item: ResolveHistorySummary) {
+  if (item.failure_code === 'service_restart') return '服务重启中断'
+  if (item.status === 'failed' || item.failure_code) return '解析失败'
   if (item.batch?.total) return `成功 ${item.batch.succeeded}/${item.batch.total}`
   return `${item.result_count} 个结果`
+}
+function historyFailed(item: ResolveHistorySummary) {
+  return item.status === 'failed' || Boolean(item.failure_code)
 }
 function historyDuration(item: ResolveHistorySummary | ResolveHistoryDetail) {
   const start = new Date(item.created_at).getTime()
@@ -277,6 +309,79 @@ function historyDuration(item: ResolveHistorySummary | ResolveHistoryDetail) {
   return minRest ? `${hr} 小时 ${minRest} 分` : `${hr} 小时`
 }
 
+function clearRestoreTimer() {
+  if (restoreTimer) {
+    window.clearTimeout(restoreTimer)
+    restoreTimer = undefined
+  }
+}
+
+function invalidateRestore() {
+	restoreGeneration += 1
+	clearRestoreTimer()
+}
+
+function storedJobID() {
+  try {
+    return sessionStorage.getItem(CURRENT_JOB_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+function storeJobID(id: string) {
+  try {
+    sessionStorage.setItem(CURRENT_JOB_KEY, id)
+  } catch { /* storage may be unavailable */ }
+}
+
+function removeStoredJobID() {
+  try {
+    sessionStorage.removeItem(CURRENT_JOB_KEY)
+  } catch { /* storage may be unavailable */ }
+}
+
+function clearCurrentJob() {
+	invalidateRestore()
+  removeStoredJobID()
+  job.value = null
+  error.value = ''
+}
+
+function scheduleRestoredPoll(id: string, generation: number) {
+	clearRestoreTimer()
+	restoreTimer = window.setTimeout(() => pollRestoredJob(id, generation), RESTORE_POLL_MS)
+}
+
+async function pollRestoredJob(id: string, generation: number) {
+	try {
+		const restored = await api.u.jobs.get(id)
+		if (generation !== restoreGeneration) return
+		job.value = restored
+    error.value = ''
+    if (!['completed', 'failed', 'selection_required'].includes(restored.status)) {
+			scheduleRestoredPoll(id, generation)
+		}
+	} catch (e: any) {
+		if (generation !== restoreGeneration) return
+    clearRestoreTimer()
+    if (e?.status === 404 || e?.status === 410) {
+      removeStoredJobID()
+      job.value = null
+      error.value = '上次任务的详细结果已过期，请重新解析'
+      return
+    }
+    error.value = '暂时无法恢复上次任务，请稍后刷新页面'
+  }
+}
+
+async function restoreCurrentJob() {
+	const id = storedJobID()
+	if (!id || !status.value) return
+	const generation = ++restoreGeneration
+	await pollRestoredJob(id, generation)
+}
+
 onMounted(async () => {
   const params = new URLSearchParams(window.location.search)
   const authError = params.get('error')
@@ -285,7 +390,10 @@ onMounted(async () => {
     window.history.replaceState({}, '', '/u')
   }
   await loadStatus()
+  if (view.value === 'portal') await restoreCurrentJob()
 })
+
+onUnmounted(invalidateRestore)
 </script>
 
 <template>
@@ -333,7 +441,7 @@ onMounted(async () => {
             <div class="dialog-head history-dialog-head">
               <h2><History />解析历史</h2>
               <div class="history-dialog-actions">
-                <PrimaryButton v-if="historyDetail" variant="line" size="sm" @click="backToHistoryList"><template #icon><ArrowLeft /></template>返回</PrimaryButton>
+                <PrimaryButton v-if="historyDetail || historyUnavailable" variant="line" size="sm" @click="backToHistoryList"><template #icon><ArrowLeft /></template>返回</PrimaryButton>
                 <PrimaryButton variant="soft" size="sm" :loading="historyLoading" @click="loadHistory"><template #icon><RefreshCw /></template>刷新</PrimaryButton>
                 <button type="button" class="dialog-close" aria-label="关闭" @click="closeHistory"><X /></button>
               </div>
@@ -348,7 +456,8 @@ onMounted(async () => {
                   </div>
                   <div class="history-metrics">
                     <span class="pill">用时 {{ historyDuration(historyDetail) }}</span>
-                    <span class="pill pill-live">{{ formatRelative(historyDetail.expires_at) }}过期</span>
+                    <span v-if="historyDetail.charged_bytes > 0" class="pill pill-info">计费 {{ formatBytes(historyDetail.charged_bytes) }}</span>
+                    <span class="pill pill-live">{{ historyDetail.details_available === false ? '详情已过期' : `${formatRelative(historyDetail.expires_at)}过期` }}</span>
                   </div>
                 </div>
                 <pre class="history-input mono">{{ historyDetail.input }}</pre>
@@ -361,18 +470,35 @@ onMounted(async () => {
                 </div>
                 <ResultList :results="historyResults" show-push @push="onPush" />
               </template>
+              <template v-else-if="historyUnavailable">
+                <div class="history-unavailable">
+                  <ClockAlert />
+                  <div>
+                    <span class="eyebrow">details expired</span>
+                    <h3>详细结果已过期</h3>
+                    <p>任务摘要仍会保留，但下载地址和其它敏感详情已按保留策略清除。</p>
+                    <div class="history-metrics">
+                      <span class="tag">{{ historyKindLabel(historyUnavailable.kind) }}</span>
+                      <span class="pill" :class="historyFailed(historyUnavailable) ? 'pill-danger' : 'pill-ok'">{{ historyResultLabel(historyUnavailable) }}</span>
+                      <span v-if="historyUnavailable.charged_bytes > 0" class="pill pill-info">计费 {{ formatBytes(historyUnavailable.charged_bytes) }}</span>
+                    </div>
+                  </div>
+                </div>
+                <pre v-if="historyUnavailable.input" class="history-input mono">{{ historyUnavailable.input }}</pre>
+              </template>
               <template v-else>
                 <div v-if="historyLoading" class="history-state mono">加载中...</div>
                 <div v-else-if="historyItems.length" class="history-list">
-                  <button v-for="item in historyItems" :key="item.id" class="history-item" type="button" @click="openHistoryDetail(item.id)">
+                  <button v-for="item in historyItems" :key="item.id" class="history-item" :class="{ expired: item.details_available === false }" type="button" @click="openHistoryDetail(item)">
                     <span class="history-main">
                       <span class="history-title">{{ historyInputPreview(item.input) }}</span>
                       <span class="history-sub mono">{{ formatDateTime(item.completed_at) }} · 用时 {{ historyDuration(item) }}</span>
                     </span>
                     <span class="history-tags">
                       <span class="tag">{{ historyKindLabel(item.kind) }}</span>
-                      <span class="pill pill-ok">{{ historyResultLabel(item) }}</span>
-                      <span class="pill pill-live">{{ formatRelative(item.expires_at) }}过期</span>
+                      <span class="pill" :class="historyFailed(item) ? 'pill-danger' : 'pill-ok'">{{ historyResultLabel(item) }}</span>
+                      <span v-if="item.charged_bytes > 0" class="pill pill-info">{{ formatBytes(item.charged_bytes) }}</span>
+                      <span class="pill pill-live">{{ item.details_available === false ? '详情已过期' : `${formatRelative(item.expires_at)}过期` }}</span>
                     </span>
                   </button>
                 </div>
@@ -461,6 +587,8 @@ onMounted(async () => {
         </div>
         <ResolveForm :loading="submitting" :allow-proxy="canProxy" @submit="onSubmit" />
         <div class="dock-wrap"><JobStatus :job="job" :phase="phase" :error="error" :submitting="submitting" /></div>
+        <p v-if="job?.failure_code === 'service_restart'" class="job-retention-state interrupted"><TriangleAlert /><span>此任务因服务重启而中断，未自动重新执行。请确认额度状态后重新提交。</span></p>
+        <p v-else-if="job?.details_available === false" class="job-retention-state"><ClockAlert /><span>此任务的详细结果已超过保留时间，请重新解析。</span></p>
       </GlassCard>
 
       <Transition name="v-rise">
@@ -550,6 +678,7 @@ onMounted(async () => {
 .history-list { display: grid; gap: 9px; }
 .history-item { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 13px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-2); color: inherit; text-align: left; cursor: pointer; transition: transform var(--t) var(--ease), box-shadow var(--t) var(--ease), border-color var(--t) var(--ease); }
 .history-item:hover { transform: translateY(-1px); box-shadow: var(--shadow-sm); border-color: var(--brand-soft); }
+.history-item.expired { border-style: dashed; }
 .history-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .history-title { font-size: var(--fs-sm); font-weight: var(--fw-semi); line-height: 1.45; word-break: break-all; }
 .history-sub { font-size: var(--fs-2xs); color: var(--ink-3); }
@@ -558,6 +687,13 @@ onMounted(async () => {
 .history-detail-head h3 { font-size: var(--fs-md); font-weight: var(--fw-semi); }
 .history-metrics { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .history-input { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-2); color: var(--ink-2); font-size: var(--fs-xs); white-space: pre-wrap; word-break: break-all; }
+.history-unavailable { display: flex; align-items: flex-start; gap: 12px; padding: 18px 0; }
+.history-unavailable > svg { width: 24px; height: 24px; flex: none; color: var(--live-ink); }
+.history-unavailable h3 { font-size: var(--fs-md); font-weight: var(--fw-semi); }
+.history-unavailable p { max-width: 620px; margin: 4px 0 10px; color: var(--ink-2); font-size: var(--fs-sm); line-height: 1.55; }
+.job-retention-state { display: flex; align-items: flex-start; gap: 8px; margin: -6px 0 0; padding: 10px 12px; border: 1px solid var(--live-line); border-radius: var(--r-md); color: var(--live-ink); background: var(--live-soft); font-size: var(--fs-sm); line-height: 1.5; }
+.job-retention-state.interrupted { color: var(--danger-ink); background: var(--danger-soft); border-color: var(--danger-line); }
+.job-retention-state svg { width: 16px; height: 16px; flex: none; margin-top: 2px; }
 .history-state { padding: 16px 0; color: var(--ink-3); font-size: var(--fs-xs); }
 .history-empty { min-height: 120px; }
 @keyframes wireRun { 0% { left: -36%; } 100% { left: 100%; } }

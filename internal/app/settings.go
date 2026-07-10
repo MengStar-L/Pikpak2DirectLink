@@ -215,7 +215,14 @@ func (s *Server) linuxDoClientID() string {
 }
 
 func (s *Server) linuxDoClientSecret() string {
-	return strings.TrimSpace(s.settings.getString(settingKeyLinuxDoClientSecret, ""))
+	if s.appSecrets == nil {
+		return strings.TrimSpace(s.settings.getString(settingKeyLinuxDoClientSecret, ""))
+	}
+	value, ok, err := s.appSecrets.get(linuxDoClientSecretName)
+	if err != nil || !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
 }
 
 func (s *Server) linuxDoOAuthConfigured() bool {
@@ -277,14 +284,26 @@ func (s *Server) handleUpdateAuthSettings(w http.ResponseWriter, r *http.Request
 		}
 	}
 	if req.ClearLinuxDoClientSecret {
-		if err := s.settings.delete(settingKeyLinuxDoClientSecret); err != nil {
+		var err error
+		if s.appSecrets != nil {
+			err = s.appSecrets.delete(linuxDoClientSecretName)
+		} else {
+			err = s.settings.delete(settingKeyLinuxDoClientSecret)
+		}
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 	} else if req.LinuxDoClientSecret != nil {
 		secret := strings.TrimSpace(*req.LinuxDoClientSecret)
 		if secret != "" {
-			if err := s.settings.setString(settingKeyLinuxDoClientSecret, secret); err != nil {
+			var err error
+			if s.appSecrets != nil {
+				err = s.appSecrets.set(linuxDoClientSecretName, secret)
+			} else {
+				err = s.settings.setString(settingKeyLinuxDoClientSecret, secret)
+			}
+			if err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}

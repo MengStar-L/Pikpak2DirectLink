@@ -270,16 +270,19 @@ func (s *userStore) get(id string) (User, bool, error) {
 }
 
 func (s *userStore) createSession(userID string, now time.Time) (string, error) {
-	token := generateSessionID()
-	_, err := s.db.Exec(
-		`INSERT INTO user_sessions(token, user_id, expires_at, created_at) VALUES(?,?,?,?)`,
-		token, userID, now.Add(userSessionMaxAge).Unix(), now.Unix(),
+	token, err := generateSessionID()
+	if err != nil {
+		return "", err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO user_sessions(token_hash, user_id, expires_at, created_at) VALUES(?,?,?,?)`,
+		sessionTokenDigest(token), userID, now.Add(userSessionMaxAge).Unix(), now.Unix(),
 	)
 	return token, err
 }
 
 func (s *userStore) deleteSession(token string) error {
-	_, err := s.db.Exec(`DELETE FROM user_sessions WHERE token=?`, strings.TrimSpace(token))
+	_, err := s.db.Exec(`DELETE FROM user_sessions WHERE token_hash=?`, sessionTokenDigest(token))
 	return err
 }
 
@@ -290,7 +293,7 @@ func (s *userStore) userForSession(token string, now time.Time) (User, bool, err
 	}
 	var userID string
 	var expiresAt int64
-	err := s.db.QueryRow(`SELECT user_id, expires_at FROM user_sessions WHERE token=?`, token).Scan(&userID, &expiresAt)
+	err := s.db.QueryRow(`SELECT user_id, expires_at FROM user_sessions WHERE token_hash=?`, sessionTokenDigest(token)).Scan(&userID, &expiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, false, nil
 	}
@@ -393,7 +396,16 @@ func (s *userStore) chargeIfEnough(userID string, bytes int64, requireProxy bool
 		return err
 	}
 	defer tx.Rollback()
+	if err := s.chargeIfEnoughTx(tx, userID, bytes, requireProxy, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
+func (s *userStore) chargeIfEnoughTx(tx *sql.Tx, userID string, bytes int64, requireProxy bool, now time.Time) error {
+	if bytes <= 0 {
+		return nil
+	}
 	query := `SELECT id, remaining_bytes
 		FROM user_subscriptions
 		WHERE user_id=? AND expires_at>? AND remaining_bytes>0`
@@ -454,7 +466,7 @@ func (s *userStore) chargeIfEnough(userID string, bytes int64, requireProxy bool
 	if left != 0 {
 		return errUserQuotaOverdraw{size: bytes, remaining: bytes - left}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *userStore) redeemCDK(userID, code string, now time.Time) (UserSubscription, error) {

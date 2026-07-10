@@ -30,6 +30,41 @@ export type SettingsResponse = {
   max_task_timeout_seconds: number
 }
 
+export type BackupRunStatus = 'running' | 'success' | 'failed'
+
+export type BackupRun = {
+  id: string
+  kind: string
+  status: BackupRunStatus
+  path: string
+  size_bytes: number
+  sha256: string
+  error: string
+  started_at: string
+  completed_at: string | null
+}
+
+export type MigrationBackupStatus = {
+  status: string
+  backup_id: string
+  backup_path: string
+  size_bytes?: number
+  files?: number
+  created_at?: string
+  completed_at?: string
+}
+
+export type StorageStatusResponse = {
+  backup_dir: string
+  backup_interval_seconds: number
+  backup_retention: number
+  running: boolean
+  last_run?: BackupRun | null
+  last_success?: BackupRun | null
+  next_run_at: string
+  migration?: MigrationBackupStatus | null
+}
+
 export type AuthSettingsResponse = {
   linuxdo_client_id: string
   linuxdo_client_secret_configured: boolean
@@ -153,6 +188,9 @@ export type Job = {
   result: JobResult
   results: JobResult[]
   warnings: string[]
+  failure_code?: string
+  details_available: boolean
+  charged_bytes: number
   queue_ahead: number
   batch: BatchSummary
   created_at: string
@@ -305,6 +343,9 @@ export type UserJobView = {
   results: JobResult[]
   batch: BatchSummary
   warnings: string[]
+  failure_code?: string
+  details_available: boolean
+  charged_bytes: number
   queue_ahead: number
   created_at: string
   updated_at: string
@@ -315,8 +356,12 @@ export type ResolveHistorySummary = {
   job_id: string
   kind: JobKind
   mode: JobMode
+  status?: JobStatus
   input: string
   result_count: number
+  failure_code?: string
+  details_available: boolean
+  charged_bytes: number
   batch?: BatchSummary
   created_at: string
   completed_at: string

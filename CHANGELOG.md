@@ -1,5 +1,40 @@
 # Changelog
 
+## v3.1.0 - 2026-07-10 - Secure Durable Storage
+
+### Breaking upgrade requirements
+
+- `DATA_ENCRYPTION_KEY` is now mandatory. It must be the canonical standard-Base64 encoding of exactly 32 random bytes; startup fails when it is missing, malformed, or cannot decrypt the existing database.
+- Before the first upgrade from v3.0.x, stop accepting work and let every old in-memory queued/running job finish. Those jobs were never stored on disk and cannot be migrated.
+- Public deployments must terminate TLS at a trusted reverse proxy and set `PUBLIC_BASE_URL` to the external `https://` URL.
+- Keep the encryption key outside the database backup directory and back it up separately. Losing it makes encrypted credentials, sessions, and job details unrecoverable.
+
+### SQLite storage and encryption
+
+- SQLite is now the only active server persistence source for administrators, users, sessions, PikPak accounts, CDKs, settings, jobs, cleanup state, migrations, and backup status.
+- PikPak passwords and sessions, application secrets, and complete job payloads use AES-256-GCM field encryption with purpose/record-bound authenticated data.
+- Admin and user cookies are represented in SQLite only by SHA-256 token digests; raw session tokens are not persisted.
+- Key rotation is supported with comma-separated `DATA_ENCRYPTION_PREVIOUS_KEYS`: configure the new current key together with every old key still needed to read retained records or backups.
+- SQLite disk connections now enforce WAL mode, foreign keys, a busy timeout, full synchronous durability, and immediate write transactions.
+
+### Migration and durable jobs
+
+- The first v3.1.0 start snapshots the legacy database, `auth.json`, account JSON, and session files into a checksummed migration backup before importing them into encrypted SQLite.
+- The plaintext migration backup remains pending until an administrator verifies the new database and explicitly confirms deletion in Settings.
+- Parent and child resolve jobs persist across process restarts. Nonterminal jobs are never auto-resumed; startup records them as `failed/service_restart`.
+- Complete job details remain available for 3 hours, then sensitive payloads are scrubbed while audit metadata remains for up to 30 days.
+- The user portal remembers the current job ID in `sessionStorage` and shows explicit restart-interrupted and expired-detail states without exposing backend errors.
+
+### Verified backups and recovery
+
+- A verified SQLite snapshot runs every 24 hours by default, with seven successful backups retained. Each snapshot is integrity-checked, hashed, synced, and atomically published.
+- Administrators can inspect backup status, trigger a snapshot, and confirm deletion of the legacy migration backup from Settings.
+- Added offline recovery commands:
+  - `storage restore-db --backup <file> --yes`
+  - `storage restore-migration --backup <dir> --yes`
+- Restore commands require the service to be stopped and save a safety copy of current data before replacement.
+- Restoring either snapshot is point-in-time recovery: all users, quota usage, tasks, account state, and configuration changes made after that snapshot are lost.
+
 ## 2026-06-17 - Multi-Link Parallel Resolution
 
 **Resolve many links in one submission**

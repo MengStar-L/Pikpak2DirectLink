@@ -1,8 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/url"
 	"sort"
@@ -113,31 +116,34 @@ type ShareState struct {
 }
 
 type Job struct {
-	ID              string           `json:"id"`
-	Kind            ResourceKind     `json:"kind"`
-	Mode            string           `json:"mode"`
-	Input           string           `json:"input"`
-	OriginalInput   string           `json:"-"`
-	PassCode        string           `json:"pass_code,omitempty"`
-	Status          JobStatus        `json:"status"`
-	Stage           JobStage         `json:"stage"`
-	Message         string           `json:"message,omitempty"`
-	Error           string           `json:"error,omitempty"`
-	BaseURL         string           `json:"-"`
-	FolderID        string           `json:"-"`
-	CDKCode         string           `json:"-"`
-	UserID          string           `json:"-"`
-	ProxyAllowed    bool             `json:"-"`
-	AccountID       string           `json:"account_id,omitempty"`
-	Share           *ShareState      `json:"share,omitempty"`
-	Items           []DownloadItem   `json:"items,omitempty"`
-	AccountAttempts []AccountAttempt `json:"account_attempts,omitempty"`
-	Result          *JobResult       `json:"result,omitempty"`
-	Results         []JobResult      `json:"results,omitempty"`
-	Warnings        []string         `json:"warnings,omitempty"`
-	QueueAhead      int              `json:"queue_ahead"`
-	TempAccountID   string           `json:"-"`
-	TempIDs         []string         `json:"-"`
+	ID               string           `json:"id"`
+	Kind             ResourceKind     `json:"kind"`
+	Mode             string           `json:"mode"`
+	Input            string           `json:"input"`
+	OriginalInput    string           `json:"-"`
+	PassCode         string           `json:"pass_code,omitempty"`
+	Status           JobStatus        `json:"status"`
+	Stage            JobStage         `json:"stage"`
+	Message          string           `json:"message,omitempty"`
+	Error            string           `json:"error,omitempty"`
+	BaseURL          string           `json:"-"`
+	FolderID         string           `json:"-"`
+	CDKCode          string           `json:"-"`
+	UserID           string           `json:"-"`
+	ProxyAllowed     bool             `json:"-"`
+	AccountID        string           `json:"account_id,omitempty"`
+	Share            *ShareState      `json:"share,omitempty"`
+	Items            []DownloadItem   `json:"items,omitempty"`
+	AccountAttempts  []AccountAttempt `json:"account_attempts,omitempty"`
+	Result           *JobResult       `json:"result,omitempty"`
+	Results          []JobResult      `json:"results,omitempty"`
+	Warnings         []string         `json:"warnings,omitempty"`
+	QueueAhead       int              `json:"queue_ahead"`
+	FailureCode      string           `json:"failure_code,omitempty"`
+	DetailsAvailable bool             `json:"details_available"`
+	ChargedBytes     int64            `json:"charged_bytes"`
+	TempAccountID    string           `json:"-"`
+	TempIDs          []string         `json:"-"`
 	// ResolveAll marks a child job that must auto-resolve every file it finds
 	// (never pause at selection_required). Set on the children a batch fans out.
 	ResolveAll bool `json:"-"`
@@ -176,23 +182,55 @@ type jobStore struct {
 	jobs     map[string]*Job
 	order    []string
 	capacity int
+	durable  *sqlJobStore
 }
 
-func newJobStore(capacity int) *jobStore {
+type atomicCommitError struct {
+	err       error
+	uncertain bool
+}
+
+func (e *atomicCommitError) Error() string { return e.err.Error() }
+func (e *atomicCommitError) Unwrap() error { return e.err }
+
+func newJobStore(capacity int, durable ...*sqlJobStore) *jobStore {
 	if capacity <= 0 {
 		capacity = 200
 	}
-	return &jobStore{
+	store := &jobStore{
 		jobs:     make(map[string]*Job),
 		capacity: capacity,
 	}
+	if len(durable) > 0 {
+		store.durable = durable[0]
+	}
+	return store
 }
 
-func (s *jobStore) create(job *Job) {
+func (s *jobStore) create(job *Job) error {
+	copyJob := cloneJob(job)
+	if copyJob == nil {
+		return errors.New("job is required")
+	}
+	copyJob.DetailsAvailable = true
+	if s.durable != nil {
+		if err := s.durable.create(copyJob); err != nil {
+			return err
+		}
+	}
+	job.DetailsAvailable = true
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.putLocked(copyJob)
+	return nil
+}
+
+func (s *jobStore) putLocked(job *Job) {
+	if _, exists := s.jobs[job.ID]; !exists {
+		s.order = append(s.order, job.ID)
+	}
 	s.jobs[job.ID] = cloneJob(job)
-	s.order = append(s.order, job.ID)
 
 	if len(s.order) > s.capacity {
 		for len(s.order) > s.capacity {
@@ -222,16 +260,55 @@ func isTerminalJobStatus(status JobStatus) bool {
 }
 
 func (s *jobStore) get(id string) (*Job, bool) {
+	job, ok, _ := s.getWithError(id)
+	return job, ok
+}
+
+func (s *jobStore) getWithError(id string) (*Job, bool, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	job, ok := s.jobs[id]
-	if !ok {
-		return nil, false
+	job = cloneJob(job)
+	s.mu.RUnlock()
+
+	if ok && (s.durable == nil || !isTerminalJobStatus(job.Status)) {
+		return job, true, nil
 	}
-	return cloneJob(job), true
+	if s.durable == nil {
+		return nil, false, nil
+	}
+
+	stored, found, err := s.durable.getAny(id, s.durable.currentTime())
+	if err != nil {
+		return nil, false, err
+	}
+	if !found {
+		if ok {
+			s.mu.Lock()
+			delete(s.jobs, id)
+			for i, existingID := range s.order {
+				if existingID == id {
+					s.order = append(s.order[:i], s.order[i+1:]...)
+					break
+				}
+			}
+			s.mu.Unlock()
+		}
+		return nil, false, nil
+	}
+
+	s.mu.Lock()
+	s.putLocked(stored)
+	s.mu.Unlock()
+	return cloneJob(stored), true, nil
 }
 
 func (s *jobStore) update(id string, fn func(*Job) error) (*Job, error) {
+	if _, ok, err := s.getWithError(id); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, errors.New("job not found")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -244,9 +321,73 @@ func (s *jobStore) update(id string, fn func(*Job) error) (*Job, error) {
 	if err := fn(copyJob); err != nil {
 		return nil, err
 	}
-	copyJob.UpdatedAt = time.Now()
+	copyJob.UpdatedAt = time.Now().UTC()
+	if s.durable != nil {
+		copyJob.UpdatedAt = s.durable.currentTime()
+		copyJob.DetailsAvailable = true
+		if err := s.durable.upsert(copyJob); err != nil {
+			return nil, err
+		}
+	}
 	s.jobs[id] = copyJob
 	return cloneJob(copyJob), nil
+}
+
+func (s *jobStore) updateAtomic(db *sql.DB, id string, fn func(*Job) error, extra func(*sql.Tx, *Job) error) (*Job, error) {
+	if s == nil || s.durable == nil || db == nil {
+		return nil, errors.New("durable job transaction is not configured")
+	}
+	if _, ok, err := s.getWithError(id); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, errors.New("job not found")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.jobs[id]
+	if current == nil {
+		return nil, errors.New("job not found")
+	}
+	updated := cloneJob(current)
+	if err := fn(updated); err != nil {
+		return nil, err
+	}
+	updated.UpdatedAt = s.durable.currentTime()
+	updated.DetailsAvailable = true
+
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if extra != nil {
+		if err := extra(tx, updated); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.durable.writeTx(tx, updated, false, nil); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		stored, found, readErr := s.durable.getAny(id, s.durable.currentTime())
+		if readErr == nil && found && sameJobPayload(stored, updated) {
+			s.jobs[id] = stored
+			return cloneJob(stored), nil
+		}
+		if readErr != nil {
+			return nil, &atomicCommitError{err: errors.Join(err, readErr), uncertain: true}
+		}
+		return nil, &atomicCommitError{err: err}
+	}
+	s.jobs[id] = updated
+	return cloneJob(updated), nil
+}
+
+func sameJobPayload(left, right *Job) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
 }
 
 func cloneJob(job *Job) *Job {
@@ -295,12 +436,12 @@ func cloneJob(job *Job) *Job {
 	return &copyJob
 }
 
-func newJobID() string {
+func newJobID() (string, error) {
 	buf := make([]byte, 6)
 	if _, err := rand.Read(buf); err != nil {
-		return time.Now().UTC().Format("20060102150405")
+		return "", err
 	}
-	return hex.EncodeToString(buf)
+	return hex.EncodeToString(buf), nil
 }
 
 func detectResourceKind(input string) (ResourceKind, error) {

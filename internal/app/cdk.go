@@ -446,10 +446,22 @@ func (s *cdkStore) charge(code string, bytes int64) error {
 }
 
 func (s *cdkStore) chargeIfEnough(code string, bytes int64, now time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.chargeIfEnoughTx(tx, code, bytes, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *cdkStore) chargeIfEnoughTx(tx *sql.Tx, code string, bytes int64, now time.Time) error {
 	if bytes < 0 {
 		bytes = 0
 	}
-	res, err := s.db.Exec(
+	res, err := tx.Exec(
 		`UPDATE cdks
 		 SET remaining_bytes=remaining_bytes-?, used_bytes=used_bytes+?
 		 WHERE code=? AND expires_at>? AND remaining_bytes>=?`,
@@ -462,21 +474,22 @@ func (s *cdkStore) chargeIfEnough(code string, bytes int64, now time.Time) error
 		return nil
 	}
 
-	c, ok, err := s.get(code)
+	var expiresAt, remainingBytes int64
+	err = tx.QueryRow(`SELECT expires_at,remaining_bytes FROM cdks WHERE code=?`, code).Scan(&expiresAt, &remainingBytes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errCDKNotFound
+	}
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return errCDKNotFound
-	}
-	if c.ExpiresAt <= now.Unix() {
+	if expiresAt <= now.Unix() {
 		return errCDKExpired
 	}
-	if c.RemainingBytes <= 0 && bytes > 0 {
+	if remainingBytes <= 0 && bytes > 0 {
 		return errCDKExhausted
 	}
-	if c.RemainingBytes < bytes {
-		return errCDKOverdraw{size: bytes, remaining: c.RemainingBytes}
+	if remainingBytes < bytes {
+		return errCDKOverdraw{size: bytes, remaining: remainingBytes}
 	}
 	return errCDKExhausted
 }

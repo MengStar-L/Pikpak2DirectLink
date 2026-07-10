@@ -17,14 +17,15 @@ const maxBatchLinks = 100
 // every child completion (live x/N) and written its final result set when the
 // last child lands.
 type batchState struct {
-	mu        sync.Mutex
-	parentID  string
-	baseURL   string
-	total     int
-	done      int
-	succeeded int
-	results   []JobResult
-	failures  []BatchFailure
+	mu           sync.Mutex
+	parentID     string
+	baseURL      string
+	total        int
+	done         int
+	succeeded    int
+	chargedBytes int64
+	results      []JobResult
+	failures     []BatchFailure
 }
 
 func (s *Server) registerBatch(bs *batchState) {
@@ -88,7 +89,10 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 	}
 
 	now := time.Now()
-	parentID := newJobID()
+	parentID, err := newJobID()
+	if err != nil {
+		return nil, 500, "failed to generate a secure job ID"
+	}
 	parent := &Job{
 		ID:            parentID,
 		Kind:          ResourceBatch,
@@ -106,7 +110,9 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
-	s.jobs.create(parent)
+	if err := s.jobs.create(parent); err != nil {
+		return nil, 500, "failed to persist the batch job"
+	}
 
 	bs := &batchState{parentID: parentID, baseURL: baseURL, total: len(specs)}
 	s.registerBatch(bs)
@@ -119,7 +125,14 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 	}
 	runs := make([]childRun, 0, len(specs))
 	for _, spec := range specs {
-		childID := newJobID()
+		childID, err := newJobID()
+		if err != nil {
+			s.failJob(parentID, err)
+			for _, run := range runs {
+				s.failJob(run.id, err)
+			}
+			return nil, 500, "failed to generate a secure job ID"
+		}
 		child := &Job{
 			ID:           childID,
 			Kind:         spec.kind,
@@ -139,20 +152,33 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 			CreatedAt:    now,
 			UpdatedAt:    now,
 		}
-		s.jobs.create(child)
+		if err := s.jobs.create(child); err != nil {
+			s.failJob(parentID, err)
+			for _, run := range runs {
+				s.failJob(run.id, err)
+			}
+			return nil, 500, "failed to persist a batch child job"
+		}
 		runs = append(runs, childRun{id: childID, label: spec.label})
 	}
 
 	s.logJob(LogInfo, parentID, fmt.Sprintf("批量解析任务已创建，共 %d 条链接", len(specs)))
+	var enqueueErr error
 	for _, r := range runs {
 		childID, label := r.id, r.label
-		s.resolver.enqueue(childID, priority, func(ctx context.Context) {
+		if err := s.resolver.enqueue(childID, priority, func(ctx context.Context) {
 			// batchChildDone must run even if processJob panics, or the parent would
 			// hang forever waiting on a child that never reports. The resolve queue's
 			// own recover then fails the child job for logging.
 			defer s.batchChildDone(parentID, childID, label)
 			s.processJob(ctx, childID)
-		})
+		}); err != nil {
+			enqueueErr = err
+			s.batchChildDone(parentID, childID, label)
+		}
+	}
+	if enqueueErr != nil {
+		return nil, 503, "resolve queue is shutting down"
 	}
 
 	updated, _ := s.jobs.get(parentID)
@@ -185,6 +211,7 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 			bs.results = append(bs.results, merged)
 		}
 		bs.succeeded++
+		bs.chargedBytes += child.ChargedBytes
 	} else {
 		errText := "child job was not found"
 		if ok && child.Status == JobFailed {
@@ -196,6 +223,7 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 		})
 	}
 	done, total, succeeded := bs.done, bs.total, bs.succeeded
+	chargedBytes := bs.chargedBytes
 	results := append([]JobResult(nil), bs.results...)
 	failures := append([]BatchFailure(nil), bs.failures...)
 
@@ -208,6 +236,7 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 		p.Batch.Succeeded = succeeded
 		p.Batch.Failed = done - succeeded
 		p.Batch.Failures = failures
+		p.ChargedBytes = chargedBytes
 		if !final {
 			p.Status = JobRunning
 			p.Message = fmt.Sprintf("解析中：%d/%d 条完成", done, total)
@@ -224,6 +253,7 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 			p.Status = JobFailed
 			p.Stage = StageFailed
 			p.Error = "全部链接解析失败"
+			p.FailureCode = "batch_failed"
 		}
 		return nil
 	})

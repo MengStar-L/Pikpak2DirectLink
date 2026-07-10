@@ -439,21 +439,24 @@ func (s *Server) handleDeleteExpiredCDKs(w http.ResponseWriter, _ *http.Request)
 // userJobView is the CDK-user-facing projection of a Job. It deliberately omits
 // admin-only details such as which PikPak account was used.
 type userJobView struct {
-	ID         string         `json:"id"`
-	Kind       ResourceKind   `json:"kind"`
-	Mode       string         `json:"mode"`
-	Status     JobStatus      `json:"status"`
-	Stage      JobStage       `json:"stage"`
-	Message    string         `json:"message,omitempty"`
-	Error      string         `json:"error,omitempty"`
-	Items      []DownloadItem `json:"items,omitempty"`
-	Result     *JobResult     `json:"result,omitempty"`
-	Results    []JobResult    `json:"results,omitempty"`
-	Batch      *BatchProgress `json:"batch,omitempty"`
-	Warnings   []string       `json:"warnings,omitempty"`
-	QueueAhead int            `json:"queue_ahead"`
-	CreatedAt  time.Time      `json:"created_at"`
-	UpdatedAt  time.Time      `json:"updated_at"`
+	ID               string         `json:"id"`
+	Kind             ResourceKind   `json:"kind"`
+	Mode             string         `json:"mode"`
+	Status           JobStatus      `json:"status"`
+	Stage            JobStage       `json:"stage"`
+	Message          string         `json:"message,omitempty"`
+	Error            string         `json:"error,omitempty"`
+	Items            []DownloadItem `json:"items,omitempty"`
+	Result           *JobResult     `json:"result,omitempty"`
+	Results          []JobResult    `json:"results,omitempty"`
+	Batch            *BatchProgress `json:"batch,omitempty"`
+	Warnings         []string       `json:"warnings,omitempty"`
+	QueueAhead       int            `json:"queue_ahead"`
+	FailureCode      string         `json:"failure_code,omitempty"`
+	DetailsAvailable bool           `json:"details_available"`
+	ChargedBytes     int64          `json:"charged_bytes"`
+	CreatedAt        time.Time      `json:"created_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
 }
 
 // genericUserJobError is the fallback failure text a CDK user sees. Internal
@@ -470,19 +473,22 @@ const genericUserJobError = "解析失败，请稍后重试；如多次失败请
 // job's status/stage so it stays informative without leaking anything.
 func toUserJobView(job *Job) userJobView {
 	view := userJobView{
-		ID:        job.ID,
-		Kind:      job.Kind,
-		Mode:      job.Mode,
-		Status:    job.Status,
-		Stage:     job.Stage,
-		Message:   safeUserMessage(job),
-		Items:     job.Items,
-		Result:    job.Result,
-		Results:   job.Results,
-		Batch:     job.Batch,
-		Warnings:  job.Warnings,
-		CreatedAt: job.CreatedAt,
-		UpdatedAt: job.UpdatedAt,
+		ID:               job.ID,
+		Kind:             job.Kind,
+		Mode:             job.Mode,
+		Status:           job.Status,
+		Stage:            job.Stage,
+		Message:          safeUserMessage(job),
+		Items:            job.Items,
+		Result:           job.Result,
+		Results:          job.Results,
+		Batch:            job.Batch,
+		Warnings:         job.Warnings,
+		FailureCode:      job.FailureCode,
+		DetailsAvailable: true,
+		ChargedBytes:     job.ChargedBytes,
+		CreatedAt:        job.CreatedAt,
+		UpdatedAt:        job.UpdatedAt,
 	}
 	if job.Status == JobFailed || job.Error != "" {
 		view.Error = safeUserError(job.Error)

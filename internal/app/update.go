@@ -95,7 +95,7 @@ type updater struct {
 	apiClient *http.Client
 	dlClient  *http.Client
 	logf      func(level LogLevel, message string, details ...string)
-	exit      func(code int) // injectable for tests; defaults to os.Exit
+	restart   func()
 
 	mu     sync.Mutex
 	status updateStatus
@@ -129,7 +129,7 @@ func newUpdater(repo string, requestTimeout time.Duration, logf func(LogLevel, s
 		// rather than a fixed client timeout.
 		dlClient: &http.Client{},
 		logf:     logf,
-		exit:     os.Exit,
+		restart:  func() {},
 	}
 	u.status = updateStatus{
 		Phase:          UpdateIdle,
@@ -355,7 +355,7 @@ func (u *updater) runInstall(tag string) {
 	// binary that is now on disk.
 	go func() {
 		time.Sleep(1200 * time.Millisecond)
-		u.exit(0)
+		u.restart()
 	}()
 }
 

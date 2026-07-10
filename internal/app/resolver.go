@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -21,6 +22,8 @@ const (
 // fat-fingered value can't spawn an unbounded number of goroutines all hammering
 // PikPak at once.
 const maxResolveConcurrency = 32
+
+var errResolveQueueClosed = errors.New("resolve queue is closed")
 
 // queueEntry is one unit of work waiting for a resolution slot.
 type queueEntry struct {
@@ -56,6 +59,14 @@ type resolveQueue struct {
 	serialTimeout   time.Duration
 	parallelTimeout time.Duration
 	fail            func(jobID string, err error) // injected s.failJob, for panic/abort fallback
+	ctx             context.Context
+	cancel          context.CancelFunc
+	closed          bool
+	runStarted      bool
+	runDone         chan struct{}
+	runDoneOnce     sync.Once
+	shutdownOnce    sync.Once
+	workers         sync.WaitGroup
 }
 
 func newResolveQueue(serialTimeout, parallelTimeout time.Duration, concurrency int, fail func(jobID string, err error)) *resolveQueue {
@@ -65,12 +76,16 @@ func newResolveQueue(serialTimeout, parallelTimeout time.Duration, concurrency i
 	if parallelTimeout <= 0 {
 		parallelTimeout = 2 * time.Minute
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	q := &resolveQueue{
 		running:         make(map[string]bool),
 		concurrency:     clampConcurrency(concurrency),
 		serialTimeout:   serialTimeout,
 		parallelTimeout: parallelTimeout,
 		fail:            fail,
+		ctx:             ctx,
+		cancel:          cancel,
+		runDone:         make(chan struct{}),
 	}
 	q.cond = sync.NewCond(&q.mu)
 	return q
@@ -89,9 +104,15 @@ func clampConcurrency(n int) int {
 // enqueue appends a job and wakes the dispatcher. The entry is placed after the
 // last entry whose priority is greater than or equal to its own, so
 // higher-priority jobs jump ahead while ties preserve submission order.
-func (q *resolveQueue) enqueue(jobID string, priority int, run func(ctx context.Context)) {
+func (q *resolveQueue) enqueue(jobID string, priority int, run func(ctx context.Context)) error {
 	q.mu.Lock()
-	defer q.mu.Unlock()
+	if q.closed {
+		q.mu.Unlock()
+		if q.fail != nil {
+			q.fail(jobID, errResolveQueueClosed)
+		}
+		return errResolveQueueClosed
+	}
 
 	insertAt := len(q.entries)
 	for i, e := range q.entries {
@@ -106,32 +127,49 @@ func (q *resolveQueue) enqueue(jobID string, priority int, run func(ctx context.
 	q.entries[insertAt] = &queueEntry{jobID: jobID, priority: priority, run: run}
 
 	q.cond.Broadcast()
+	q.mu.Unlock()
+	return nil
 }
 
 // run is the dispatcher loop. It must be started exactly once (go q.run()). It
 // waits until there is queued work AND a free slot, then pops the head and runs
 // it in its own goroutine.
 func (q *resolveQueue) run() {
+	q.mu.Lock()
+	if q.runStarted {
+		q.mu.Unlock()
+		return
+	}
+	q.runStarted = true
+	q.mu.Unlock()
+	defer q.runDoneOnce.Do(func() { close(q.runDone) })
+
 	for {
 		q.mu.Lock()
-		for len(q.entries) == 0 || len(q.running) >= q.concurrency {
+		for !q.closed && (len(q.entries) == 0 || len(q.running) >= q.concurrency) {
 			q.cond.Wait()
+		}
+		if q.closed {
+			q.mu.Unlock()
+			return
 		}
 		entry := q.entries[0]
 		copy(q.entries, q.entries[1:])
 		q.entries[len(q.entries)-1] = nil
 		q.entries = q.entries[:len(q.entries)-1]
 		q.running[entry.jobID] = true
+		q.workers.Add(1)
 		q.mu.Unlock()
 
 		go func(e *queueEntry) {
+			defer q.workers.Done()
 			q.execute(e)
 			q.mu.Lock()
 			delete(q.running, e.jobID)
-			q.mu.Unlock()
 			// A slot just freed (or the running set shrank below the limit) — let
 			// the dispatcher re-evaluate.
 			q.cond.Broadcast()
+			q.mu.Unlock()
 		}(entry)
 	}
 }
@@ -140,7 +178,7 @@ func (q *resolveQueue) run() {
 // single bad job can never wedge a worker. The timeout is sampled at dispatch
 // time so a live concurrency change applies to subsequent jobs.
 func (q *resolveQueue) execute(entry *queueEntry) {
-	ctx, cancel := context.WithTimeout(context.Background(), q.currentTimeout())
+	ctx, cancel := context.WithTimeout(q.ctx, q.currentTimeout())
 	defer cancel()
 	defer func() {
 		if r := recover(); r != nil && q.fail != nil {
@@ -148,6 +186,32 @@ func (q *resolveQueue) execute(entry *queueEntry) {
 		}
 	}()
 	entry.run(ctx)
+}
+
+// shutdown stops accepting work, cancels active jobs, fails every queued job,
+// and waits until the dispatcher and all workers have exited. It is safe to
+// call more than once.
+func (q *resolveQueue) shutdown() {
+	q.shutdownOnce.Do(func() {
+		q.mu.Lock()
+		q.closed = true
+		pending := q.entries
+		q.entries = nil
+		q.cancel()
+		q.cond.Broadcast()
+		runStarted := q.runStarted
+		q.mu.Unlock()
+
+		if q.fail != nil {
+			for _, entry := range pending {
+				q.fail(entry.jobID, errResolveQueueClosed)
+			}
+		}
+		if runStarted {
+			<-q.runDone
+		}
+		q.workers.Wait()
+	})
 }
 
 // setConcurrency changes the number of parallel slots live. Raising it wakes the

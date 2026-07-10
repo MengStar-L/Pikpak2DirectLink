@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -75,6 +76,7 @@ func TestResolveQueueRunsSerially(t *testing.T) {
 	t.Parallel()
 
 	q := newResolveQueue(2*time.Second, 2*time.Second, 1, nil)
+	t.Cleanup(q.shutdown)
 	go q.run()
 
 	var concurrent, maxConcurrent int32
@@ -131,6 +133,7 @@ func TestResolveQueueRunsInParallel(t *testing.T) {
 
 	const limit = 3
 	q := newResolveQueue(2*time.Second, 2*time.Second, limit, nil)
+	t.Cleanup(q.shutdown)
 	go q.run()
 
 	var concurrent, maxConcurrent int32
@@ -239,5 +242,152 @@ func TestResolveQueueTimeoutTracksMode(t *testing.T) {
 	q.setConcurrency(3)
 	if got := q.currentTimeout(); got != unified {
 		t.Fatalf("unified parallel timeout = %s, want %s", got, unified)
+	}
+}
+
+func TestResolveQueueShutdownCancelsActiveAndDrainsQueued(t *testing.T) {
+	q := newResolveQueue(time.Minute, time.Minute, 1, nil)
+	started := make(chan struct{})
+	canceled := make(chan error, 1)
+	queuedRan := make(chan struct{}, 1)
+
+	var failedMu sync.Mutex
+	failed := make(map[string]error)
+	q.fail = func(jobID string, err error) {
+		failedMu.Lock()
+		failed[jobID] = err
+		failedMu.Unlock()
+	}
+
+	go q.run()
+	if err := q.enqueue("active", priorityUser, func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+		canceled <- ctx.Err()
+	}); err != nil {
+		t.Fatalf("enqueue active job: %v", err)
+	}
+	if err := q.enqueue("queued", priorityUser, func(context.Context) {
+		queuedRan <- struct{}{}
+	}); err != nil {
+		t.Fatalf("enqueue queued job: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("active job did not start")
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		q.shutdown()
+		close(shutdownDone)
+	}()
+
+	select {
+	case err := <-canceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("active context error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active job was not canceled")
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not wait for queue completion")
+	}
+
+	select {
+	case <-queuedRan:
+		t.Fatal("queued job ran during shutdown")
+	default:
+	}
+	failedMu.Lock()
+	err := failed["queued"]
+	_, activeFailed := failed["active"]
+	failedMu.Unlock()
+	if !errors.Is(err, errResolveQueueClosed) {
+		t.Fatalf("queued failure = %v, want errResolveQueueClosed", err)
+	}
+	if activeFailed {
+		t.Fatal("active job was reported as a queued failure")
+	}
+	if q.active() || q.waiting() != 0 {
+		t.Fatalf("queue did not drain: active=%v waiting=%d", q.active(), q.waiting())
+	}
+}
+
+func TestResolveQueueShutdownWaitsForWorker(t *testing.T) {
+	q := newResolveQueue(time.Minute, time.Minute, 1, nil)
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	go q.run()
+
+	if err := q.enqueue("active", priorityUser, func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		<-release
+	}); err != nil {
+		t.Fatalf("enqueue active job: %v", err)
+	}
+	<-started
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		q.shutdown()
+		close(shutdownDone)
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("worker was not canceled")
+	}
+	select {
+	case <-shutdownDone:
+		t.Fatal("shutdown returned before worker exited")
+	default:
+	}
+	close(release)
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not return after worker exited")
+	}
+}
+
+func TestResolveQueueRejectsEnqueueAfterShutdown(t *testing.T) {
+	failed := make(map[string]int)
+	q := newResolveQueue(time.Second, time.Second, 1, func(jobID string, err error) {
+		if !errors.Is(err, errResolveQueueClosed) {
+			t.Errorf("failure = %v, want errResolveQueueClosed", err)
+		}
+		failed[jobID]++
+	})
+
+	if err := q.enqueue("pending", priorityUser, func(context.Context) {
+		t.Fatal("drained job ran")
+	}); err != nil {
+		t.Fatalf("enqueue pending job: %v", err)
+	}
+	q.shutdown()
+	q.shutdown()
+	err := q.enqueue("late", priorityUser, func(context.Context) {
+		t.Fatal("rejected job ran")
+	})
+	if !errors.Is(err, errResolveQueueClosed) {
+		t.Fatalf("enqueue error = %v, want errResolveQueueClosed", err)
+	}
+	if got := failed["pending"]; got != 1 {
+		t.Fatalf("pending failure callback count = %d, want 1", got)
+	}
+	if got := failed["late"]; got != 1 {
+		t.Fatalf("late failure callback count = %d, want 1", got)
+	}
+	if got := q.waiting(); got != 0 {
+		t.Fatalf("waiting = %d, want 0", got)
 	}
 }

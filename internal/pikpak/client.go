@@ -56,8 +56,16 @@ type Config struct {
 	Username       string
 	Password       string
 	SessionFile    string
+	SessionStore   SessionStore
 	RootFolderName string
 	RequestTimeout time.Duration
+}
+
+// SessionStore persists the serialized PikPak session.
+type SessionStore interface {
+	Load() ([]byte, error)
+	Save(data []byte) error
+	Delete() error
 }
 
 type Client struct {
@@ -145,7 +153,7 @@ func (c *Client) Status() SessionStatus {
 	return SessionStatus{
 		Ready:     loggedIn || hasCredentials,
 		LoggedIn:  loggedIn,
-		Persisted: loggedIn && c.config.SessionFile != "",
+		Persisted: loggedIn && (c.config.SessionStore != nil || c.config.SessionFile != ""),
 		Username:  strings.TrimSpace(c.config.Username),
 	}
 }
@@ -189,11 +197,18 @@ func (c *Client) Logout() error {
 	c.expiresAt = time.Time{}
 	c.deviceID = ""
 	c.sessionLoaded = true
+	sessionStore := c.config.SessionStore
 	sessionFile := c.config.SessionFile
 	c.authMu.Unlock()
 
 	c.resetRootFolder()
 
+	if sessionStore != nil {
+		if err := sessionStore.Delete(); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
 	if sessionFile == "" {
 		return nil
 	}
@@ -901,10 +916,18 @@ func (c *Client) currentUserID() string {
 }
 
 func (c *Client) loadSessionLocked() error {
-	if c.config.SessionFile == "" {
-		return os.ErrNotExist
+	var (
+		data []byte
+		err  error
+	)
+	if c.config.SessionStore != nil {
+		data, err = c.config.SessionStore.Load()
+	} else {
+		if c.config.SessionFile == "" {
+			return os.ErrNotExist
+		}
+		data, err = os.ReadFile(c.config.SessionFile)
 	}
-	data, err := os.ReadFile(c.config.SessionFile)
 	if err != nil {
 		return err
 	}
@@ -928,7 +951,7 @@ func (c *Client) loadSessionLocked() error {
 }
 
 func (c *Client) saveSessionLocked() error {
-	if c.config.SessionFile == "" {
+	if c.config.SessionStore == nil && c.config.SessionFile == "" {
 		return nil
 	}
 
@@ -944,6 +967,9 @@ func (c *Client) saveSessionLocked() error {
 	data, err := json.MarshalIndent(session, "", "  ")
 	if err != nil {
 		return err
+	}
+	if c.config.SessionStore != nil {
+		return c.config.SessionStore.Save(data)
 	}
 
 	dir := filepath.Dir(c.config.SessionFile)

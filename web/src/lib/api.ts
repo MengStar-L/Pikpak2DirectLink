@@ -17,6 +17,8 @@ import type {
   ResolveHistorySummary,
   SelectItemsRequest,
   SettingsResponse,
+  StorageStatusResponse,
+  BackupRun,
   UpdateCDKRequest,
   UpdateAuthSettingsRequest,
   UpdateSettingsRequest,
@@ -97,6 +99,12 @@ export const api = {
     auth: {
       get: () => request<AuthSettingsResponse>('GET', '/api/settings/auth'),
       update: (body: UpdateAuthSettingsRequest) => request<AuthSettingsResponse>('PUT', '/api/settings/auth', body),
+    },
+    storage: {
+      get: () => request<StorageStatusResponse>('GET', '/api/settings/storage'),
+      backup: () => request<{ backup: BackupRun }>('POST', '/api/settings/storage/backups'),
+      deleteMigrationBackup: (backup_id: string) =>
+        request<void>('DELETE', '/api/settings/storage/migration-backup', { backup_id }),
     },
   },
 

@@ -3,35 +3,47 @@ package app
 import (
 	"database/sql"
 	"fmt"
-	"os"
+	"net/url"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
 
-// openDatabase opens (creating if needed) the SQLite database used for CDK
-// storage and applies the schema. modernc.org/sqlite is a pure-Go driver, so the
-// binary still cross-compiles with CGO disabled.
+const (
+	diskDatabaseMaxOpenConns = 8
+	diskDatabaseMaxIdleConns = 4
+)
+
+// openDatabase opens (creating if needed) the application SQLite database and
+// applies its schema. modernc.org/sqlite is a pure-Go driver, so the binary
+// still cross-compiles with CGO disabled.
 func openDatabase(path string) (*sql.DB, error) {
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := durableMkdirAll(dir, 0o755); err != nil {
 			return nil, err
 		}
 	}
 
-	db, err := sql.Open("sqlite", path)
+	dsn, err := sqliteDatabaseDSN(path)
 	if err != nil {
 		return nil, err
 	}
-	// A single connection serializes all access, which sidesteps SQLITE_BUSY
-	// under the polling UI without needing WAL juggling.
-	db.SetMaxOpenConns(1)
-
-	if err := db.Ping(); err != nil {
-		db.Close()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+	if path == ":memory:" {
+		// Each :memory: connection is a different database, so it must stay on
+		// the single connection used to create the schema.
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+	} else {
+		db.SetMaxOpenConns(diskDatabaseMaxOpenConns)
+		db.SetMaxIdleConns(diskDatabaseMaxIdleConns)
+	}
+
+	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -40,6 +52,38 @@ func openDatabase(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+// sqliteDatabaseDSN builds a URI instead of appending query parameters to the
+// supplied filename. This keeps characters such as '?' and '#' in a database
+// filename from being interpreted as part of the DSN. The modernc driver
+// applies each _pragma whenever it opens a pooled connection.
+func sqliteDatabaseDSN(path string) (string, error) {
+	query := make(url.Values)
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "synchronous(FULL)")
+	query.Set("_txlock", "immediate")
+
+	if path == ":memory:" {
+		return path + "?" + query.Encode(), nil
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("absolute database path: %w", err)
+	}
+	uriPath := filepath.ToSlash(absPath)
+	if filepath.VolumeName(absPath) != "" && !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	query.Add("_pragma", "journal_mode(WAL)")
+	u := url.URL{
+		Scheme:   "file",
+		Path:     uriPath,
+		RawQuery: query.Encode(),
+	}
+	return u.String(), nil
 }
 
 func migrate(db *sql.DB) error {
@@ -86,7 +130,7 @@ CREATE TABLE IF NOT EXISTS user_identities (
 CREATE INDEX IF NOT EXISTS idx_user_identities_user
 ON user_identities(user_id);
 CREATE TABLE IF NOT EXISTS user_sessions (
-    token      TEXT PRIMARY KEY,
+    token_hash TEXT PRIMARY KEY,
     user_id    TEXT NOT NULL,
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
@@ -152,7 +196,76 @@ ON proxy_temp_cleanups(cleanup_after);`
 	if err := migrateHistoryAddUserID(db); err != nil {
 		return fmt.Errorf("migrate history add user id: %w", err)
 	}
+	if err := migrateUserSessionsToDigests(db); err != nil {
+		return fmt.Errorf("migrate user sessions to digests: %w", err)
+	}
+	if err := migrateStorageSchema(db); err != nil {
+		return fmt.Errorf("migrate storage schema: %w", err)
+	}
 	return nil
+}
+
+func migrateUserSessionsToDigests(db *sql.DB) error {
+	hasLegacyToken, err := columnExists(db, "user_sessions", "token")
+	if err != nil || !hasLegacyToken {
+		return err
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT token, user_id, expires_at, created_at FROM user_sessions`)
+	if err != nil {
+		return err
+	}
+	type legacySession struct {
+		token     string
+		userID    string
+		expiresAt int64
+		createdAt int64
+	}
+	var sessions []legacySession
+	for rows.Next() {
+		var session legacySession
+		if err := rows.Scan(&session.token, &session.userID, &session.expiresAt, &session.createdAt); err != nil {
+			rows.Close()
+			return err
+		}
+		sessions = append(sessions, session)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`
+		CREATE TABLE user_sessions_new (
+			token_hash TEXT PRIMARY KEY,
+			user_id    TEXT NOT NULL,
+			expires_at INTEGER NOT NULL,
+			created_at INTEGER NOT NULL,
+			FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`); err != nil {
+		return err
+	}
+	for _, session := range sessions {
+		if _, err := tx.Exec(
+			`INSERT INTO user_sessions_new(token_hash, user_id, expires_at, created_at) VALUES(?,?,?,?)`,
+			sessionTokenDigest(session.token), session.userID, session.expiresAt, session.createdAt,
+		); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`
+		DROP TABLE user_sessions;
+		ALTER TABLE user_sessions_new RENAME TO user_sessions;
+		CREATE INDEX idx_user_sessions_user ON user_sessions(user_id);
+	`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func migrateCDKToVoucher(db *sql.DB) error {
