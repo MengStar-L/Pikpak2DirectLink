@@ -229,7 +229,8 @@ func TestEmailLoginUsesSharedLimiter(t *testing.T) {
 		t.Fatalf("limited login = %d retry=%q, want 429/900 (%s)", rec.Code, rec.Header().Get("Retry-After"), rec.Body.String())
 	}
 
-	now = now.Add(authIdentityFailureWindow)
+	later := now.Add(authIdentityFailureWindow)
+	srv.setNowFunc(func() time.Time { return later })
 	rec = httptest.NewRecorder()
 	req = jsonRequest(http.MethodPost, "/api/u/auth/email/login", `{"email":"limited@example.com","password":"correct-password"}`)
 	req.RemoteAddr = "203.0.113.90:12345"
