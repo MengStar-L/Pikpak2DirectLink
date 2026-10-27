@@ -70,37 +70,39 @@ func newSQLJobStore(db *sql.DB, cipher *SecretCipher) *sqlJobStore {
 // database read for ownership checks, proxy refreshes, cleanup, and restart
 // handling.
 type resolveJobPayload struct {
-	ID              string                    `json:"id"`
-	Kind            ResourceKind              `json:"kind"`
-	Mode            string                    `json:"mode"`
-	Input           string                    `json:"input"`
-	OriginalInput   string                    `json:"original_input"`
-	PassCode        string                    `json:"pass_code"`
-	Status          JobStatus                 `json:"status"`
-	Stage           JobStage                  `json:"stage"`
-	Message         string                    `json:"message"`
-	Error           string                    `json:"error"`
-	BaseURL         string                    `json:"base_url"`
-	FolderID        string                    `json:"folder_id"`
-	CDKCode         string                    `json:"cdk_code"`
-	UserID          string                    `json:"user_id"`
-	ProxyAllowed    bool                      `json:"proxy_allowed"`
-	AccountID       string                    `json:"account_id"`
-	Share           *resolveJobSharePayload   `json:"share"`
-	Items           []DownloadItem            `json:"items"`
-	AccountAttempts []AccountAttempt          `json:"account_attempts"`
-	Result          *resolveJobResultPayload  `json:"result"`
-	Results         []resolveJobResultPayload `json:"results"`
-	Warnings        []string                  `json:"warnings"`
-	QueueAhead      int                       `json:"queue_ahead"`
-	TempAccountID   string                    `json:"temp_account_id"`
-	TempIDs         []string                  `json:"temp_ids"`
-	ResolveAll      bool                      `json:"resolve_all"`
-	ResolveSelected bool                      `json:"resolve_selected"`
-	ParentID        string                    `json:"parent_id"`
-	Batch           *BatchProgress            `json:"batch"`
-	CreatedAt       time.Time                 `json:"created_at"`
-	UpdatedAt       time.Time                 `json:"updated_at"`
+	ID               string                    `json:"id"`
+	Kind             ResourceKind              `json:"kind"`
+	Mode             string                    `json:"mode"`
+	Input            string                    `json:"input"`
+	OriginalInput    string                    `json:"original_input"`
+	PassCode         string                    `json:"pass_code"`
+	Status           JobStatus                 `json:"status"`
+	Stage            JobStage                  `json:"stage"`
+	Message          string                    `json:"message"`
+	Error            string                    `json:"error"`
+	BaseURL          string                    `json:"base_url"`
+	FolderID         string                    `json:"folder_id"`
+	CDKCode          string                    `json:"cdk_code"`
+	UserID           string                    `json:"user_id"`
+	ProxyAllowed     bool                      `json:"proxy_allowed"`
+	AccountID        string                    `json:"account_id"`
+	Share            *resolveJobSharePayload   `json:"share"`
+	Items            []DownloadItem            `json:"items"`
+	AccountAttempts  []AccountAttempt          `json:"account_attempts"`
+	Result           *resolveJobResultPayload  `json:"result"`
+	Results          []resolveJobResultPayload `json:"results"`
+	Warnings         []string                  `json:"warnings"`
+	QueueAhead       int                       `json:"queue_ahead"`
+	TempAccountID    string                    `json:"temp_account_id"`
+	TempIDs          []string                  `json:"temp_ids"`
+	ResolveAll       bool                      `json:"resolve_all"`
+	ResolveSelected  bool                      `json:"resolve_selected"`
+	LibraryDiscovery bool                      `json:"library_discovery,omitempty"`
+	LibraryTarget    *DownloadItem             `json:"library_target,omitempty"`
+	ParentID         string                    `json:"parent_id"`
+	Batch            *BatchProgress            `json:"batch"`
+	CreatedAt        time.Time                 `json:"created_at"`
+	UpdatedAt        time.Time                 `json:"updated_at"`
 }
 
 type resolveJobSharePayload struct {
@@ -876,6 +878,7 @@ func resolveJobPayloadFromJob(job *Job) resolveJobPayload {
 		Warnings:        append([]string(nil), job.Warnings...), QueueAhead: job.QueueAhead,
 		TempAccountID: job.TempAccountID, TempIDs: append([]string(nil), job.TempIDs...),
 		ResolveAll: job.ResolveAll, ResolveSelected: job.ResolveSelected,
+		LibraryDiscovery: job.LibraryDiscovery, LibraryTarget: job.LibraryTarget,
 		ParentID: job.ParentID, CreatedAt: job.CreatedAt, UpdatedAt: job.UpdatedAt,
 	}
 	if job.Share != nil {
@@ -916,6 +919,7 @@ func (p resolveJobPayload) job() *Job {
 		Warnings:        append([]string(nil), p.Warnings...), QueueAhead: p.QueueAhead,
 		TempAccountID: p.TempAccountID, TempIDs: append([]string(nil), p.TempIDs...),
 		ResolveAll: p.ResolveAll, ResolveSelected: p.ResolveSelected,
+		LibraryDiscovery: p.LibraryDiscovery, LibraryTarget: p.LibraryTarget,
 		ParentID: p.ParentID, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
 	}
 	if p.Share != nil {

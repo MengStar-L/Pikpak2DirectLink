@@ -8,6 +8,7 @@ import Aria2PushOverlay from './components/Aria2PushOverlay.vue'
 import Sidebar from './components/admin/Sidebar.vue'
 import MetricGrid from './components/admin/MetricGrid.vue'
 import ResolvePage from './components/admin/ResolvePage.vue'
+import LibraryPage from './components/admin/LibraryPage.vue'
 import AccountsPage from './components/admin/AccountsPage.vue'
 import UsersPage from './components/admin/UsersPage.vue'
 import LogsPage from './components/admin/LogsPage.vue'
@@ -28,6 +29,7 @@ const settings = ref<SettingsResponse | null>(null)
 
 const pageMap = {
   resolve: ResolvePage,
+  library: LibraryPage,
   accounts: AccountsPage,
   users: UsersPage,
   logs: LogsPage,

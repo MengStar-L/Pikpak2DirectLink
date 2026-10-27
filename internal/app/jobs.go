@@ -151,6 +151,10 @@ type Job struct {
 	// are already the final files to parse, so it should not ask for a second
 	// result-selection pass after restoring them.
 	ResolveSelected bool `json:"-"`
+	// Library jobs inspect a source or resolve one durable file selector without
+	// asking the external downloader to make an interactive selection.
+	LibraryDiscovery bool          `json:"-"`
+	LibraryTarget    *DownloadItem `json:"-"`
 	// ParentID links a child job back to its batch parent.
 	ParentID string `json:"-"`
 	// Batch is the rollup carried by a parent (kind == batch) job.
@@ -437,6 +441,10 @@ func cloneJob(job *Job) *Job {
 	}
 
 	copyJob := *job
+	if job.LibraryTarget != nil {
+		target := *job.LibraryTarget
+		copyJob.LibraryTarget = &target
+	}
 	if len(job.Items) > 0 {
 		copyJob.Items = append([]DownloadItem(nil), job.Items...)
 	}

@@ -135,6 +135,43 @@ export type DownloadItem = {
   size: string
 }
 
+export type LibraryFile = {
+  id: string
+  name: string
+  path: string
+  size: string
+  mime_type?: string
+  public_url?: string
+  mode?: 'direct' | 'proxy'
+}
+
+export type LibraryEntry = {
+  id: string
+  parent_id: string
+  kind: 'folder' | 'resource'
+  name: string
+  resource_kind: 'magnet' | 'share' | ''
+  status: 'pending' | 'ready' | 'failed'
+  file_count: number
+  error?: string
+  files: LibraryFile[]
+  created_at: string
+  updated_at: string
+}
+
+export type CreateLibraryEntryRequest = {
+  kind: 'folder' | 'resource'
+  name?: string
+  parent_id: string
+  input?: string
+  pass_code?: string
+}
+
+export type LibraryDownloadLink = {
+  url: string
+  mode: 'direct' | 'proxy'
+}
+
 export type JobResult = {
   file: DownloadItem
   url: string

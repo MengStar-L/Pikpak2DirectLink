@@ -18,6 +18,9 @@ import type {
   CreateJobRequest,
   Job,
   LogEntry,
+  LibraryEntry,
+  LibraryDownloadLink,
+  CreateLibraryEntryRequest,
   ResolveHistoryDetail,
   ResolveHistorySummary,
   SelectItemsRequest,
@@ -166,6 +169,19 @@ export const api = {
     create: (body: CreateJobRequest) => request<Job>('POST', '/api/jobs', body),
     get: (id: string) => request<Job>('GET', `/api/jobs/${id}`),
     select: (id: string, body: SelectItemsRequest) => request<Job>('POST', `/api/jobs/${id}/select`, body),
+  },
+
+  library: {
+    list: () => request<{ entries: LibraryEntry[] }>('GET', '/api/library'),
+    create: (body: CreateLibraryEntryRequest) => request<LibraryEntry>('POST', '/api/library', body),
+    update: (id: string, body: { name?: string; parent_id?: string }) =>
+      request<LibraryEntry>('PATCH', `/api/library/${encodeURIComponent(id)}`, body),
+    remove: (id: string) => request<void>('DELETE', `/api/library/${encodeURIComponent(id)}`),
+    retry: (id: string) => request<LibraryEntry>('POST', `/api/library/${encodeURIComponent(id)}/retry`),
+    link: (id: string, fileID: string, mode: 'direct' | 'proxy', reset = false) =>
+      request<LibraryDownloadLink>('POST', `/api/library/${encodeURIComponent(id)}/files/${encodeURIComponent(fileID)}/link`, { mode, reset }),
+    revokeLink: (id: string, fileID: string) =>
+      request<void>('DELETE', `/api/library/${encodeURIComponent(id)}/files/${encodeURIComponent(fileID)}/link`),
   },
 
   cdks: {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Radar, Link2, Users, UserRoundSearch, Terminal, Ticket, Download, Settings, LogOut } from 'lucide-vue-next'
+import { Radar, Link2, FolderOpen, Users, UserRoundSearch, Terminal, Ticket, Download, Settings, LogOut } from 'lucide-vue-next'
 
 defineProps<{
   active: string
@@ -11,6 +11,7 @@ const emit = defineEmits<{ (e: 'update:active', page: string): void; (e: 'logout
 
 const nav = [
   { id: 'resolve', icon: Link2, tip: '解析' },
+  { id: 'library', icon: FolderOpen, tip: '文件库' },
   { id: 'accounts', icon: Users, tip: '账号' },
   { id: 'users', icon: UserRoundSearch, tip: '注册用户' },
   { id: 'logs', icon: Terminal, tip: '日志' },
@@ -106,11 +107,12 @@ const nav = [
   }
   .brand, .foot { display: none; }
   .nav { flex-direction: row; gap: 3px; }
+  .rbtn { width: 37px; }
   .rbtn::after, .rbtn.active::before { display: none; }
 }
 @media (max-width: 360px) {
   .rail { padding: 6px; }
   .nav { gap: 2px; }
-  .rbtn { width: 37px; height: 38px; }
+  .rbtn { width: 33px; height: 38px; }
 }
 </style>

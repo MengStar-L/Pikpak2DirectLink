@@ -51,6 +51,9 @@ type Server struct {
 	users                *userStore
 	settings             *settingsStore
 	history              *resolveHistoryStore
+	library              *libraryStore
+	libraryDownloadsMu   sync.Mutex
+	libraryDownloads     map[string]*libraryDownload
 	tempCleanups         *proxyTempCleanupStore
 	oauthStates          *oauthStateStore
 	gateHTML             []byte
@@ -197,6 +200,10 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("rotate application secrets: %w", err)
 	}
 	settings := newSettingsStore(db)
+	library, err := newLibraryStore(db, secretCipher)
+	if err != nil {
+		return nil, fmt.Errorf("initialize file library: %w", err)
+	}
 	if err := appSecrets.migrateLinuxDoSecret(settings); err != nil {
 		return nil, fmt.Errorf("migrate LinuxDo client secret: %w", err)
 	}
@@ -297,6 +304,8 @@ func NewServer(cfg Config) (*Server, error) {
 		users:               users,
 		settings:            settings,
 		history:             newResolveHistoryStore(db, sqlJobs),
+		library:             library,
+		libraryDownloads:    make(map[string]*libraryDownload),
 		tempCleanups:        tempCleanups,
 		oauthStates:         newOAuthStateStore(),
 		gateHTML:            gateHTML,
@@ -406,6 +415,10 @@ func NewServer(cfg Config) (*Server, error) {
 
 	server.mux.HandleFunc("GET /proxy/{id}", server.handleProxy)
 	server.mux.HandleFunc("HEAD /proxy/{id}", server.handleProxy)
+	server.registerLibraryRoutes()
+	server.mux.HandleFunc("GET /d/", http.NotFound)
+	server.mux.HandleFunc("GET /d/{token}", server.handleLibraryDownload)
+	server.mux.HandleFunc("HEAD /d/{token}", server.handleLibraryDownload)
 
 	// Poll GitHub Releases in the background so the UI can surface an available
 	// update. Installs are always user-initiated.
@@ -523,7 +536,8 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			path == "/u" ||
 			strings.HasPrefix(path, "/u/") ||
 			strings.HasPrefix(path, "/api/u/") ||
-			strings.HasPrefix(path, "/proxy/") {
+			strings.HasPrefix(path, "/proxy/") ||
+			strings.HasPrefix(path, "/d/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -2149,6 +2163,17 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 			s.finishAccountAttempt(jobID, account.ID, "success", "")
 			return
 		}
+		var libraryErr *librarySourceError
+		if errors.As(err, &libraryErr) {
+			cleanupErr := s.cleanupTempResourcesBestEffort(jobID, account, "library source changed", false)
+			if s.handleJobPersistenceFailure(jobID, account, cleanupErr, true) {
+				return
+			}
+			s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
+			s.finishAccountAttempt(jobID, account.ID, "failed", err.Error())
+			s.failJob(jobID, err)
+			return
+		}
 
 		if s.handleJobPersistenceFailure(jobID, account, err, true) {
 			return
@@ -2254,6 +2279,9 @@ func (s *Server) processJobWithAccount(ctx context.Context, jobID string, accoun
 	case ResourceMagnet:
 		return s.processMagnet(ctx, jobID, account)
 	case ResourceShare:
+		if job.LibraryDiscovery || job.LibraryTarget != nil {
+			return s.processLibraryShare(ctx, jobID, account)
+		}
 		return s.processShare(ctx, jobID, account)
 	default:
 		return fmt.Errorf("unsupported resource kind %q", job.Kind)
@@ -2529,6 +2557,16 @@ func (s *Server) finishWithItems(ctx context.Context, jobID string, account Acco
 		return errors.New("no downloadable file was produced")
 	}
 	job := mustJob(s.jobs.get(jobID))
+	if job.LibraryDiscovery {
+		return s.completeLibraryInspection(jobID, account, items)
+	}
+	if job.LibraryTarget != nil {
+		item, err := matchLibraryFile(items, *job.LibraryTarget)
+		if err != nil {
+			return err
+		}
+		return s.completeJob(ctx, jobID, account, item)
+	}
 	// A batch child must never pause for a selection — resolve every file it
 	// found and let the batch coordinator merge the results.
 	if job.ResolveAll {
