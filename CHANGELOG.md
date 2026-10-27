@@ -1,11 +1,12 @@
 # Changelog
 
-## v3.3.0 - 2026-10-27 - Admin file library
+## v3.3.1 - 2026-10-27 - Admin file library
 
 - Add a persistent admin file library for magnet and PikPak share links, with file counts, folders, and context-menu move, rename, retry, and delete operations.
 - Generate revocable public file links that resolve on demand and redirect to a fresh direct or proxy download address; support HEAD, Range through redirects, and optional JSON address responses.
 - Encrypt resource inputs, extraction codes, selectors, link tokens, and failure details; preserve links across restarts and key rotation.
 - Reuse concurrent resolutions, refresh expired addresses, and reject changed or ambiguous source files.
+- Build with Go 1.26.10 to include standard-library security fixes required by the release vulnerability scan.
 
 ## v3.1.0 - 2026-07-10 - Secure Durable Storage
 

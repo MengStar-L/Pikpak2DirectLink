@@ -8,7 +8,7 @@
   <a href="https://github.com/MengStar-L/Pikpak2DirectLink/releases/latest">
     <img alt="Release" src="https://img.shields.io/github/v/release/MengStar-L/Pikpak2DirectLink?style=for-the-badge&label=release&color=ff6b35">
   </a>
-  <img alt="Go" src="https://img.shields.io/badge/go-1.26.5-334155?style=for-the-badge&logo=go&logoColor=white">
+  <img alt="Go" src="https://img.shields.io/badge/go-1.26.10-334155?style=for-the-badge&logo=go&logoColor=white">
   <img alt="Self Hosted" src="https://img.shields.io/badge/self--hosted-prod-111827?style=for-the-badge">
   <img alt="Proxy" src="https://img.shields.io/badge/proxy-token-0ea5e9?style=for-the-badge">
 </p>
@@ -139,10 +139,10 @@ Pikpak2DirectLink_windows_amd64.exe
 sudo apt update
 sudo apt install -y git curl ca-certificates openssl
 
-curl -LO https://go.dev/dl/go1.26.5.linux-amd64.tar.gz
+curl -LO https://go.dev/dl/go1.26.10.linux-amd64.tar.gz
 sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf go1.26.5.linux-amd64.tar.gz
-rm -f go1.26.5.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.26.10.linux-amd64.tar.gz
+rm -f go1.26.10.linux-amd64.tar.gz
 
 sudo mkdir -p /opt/Pikpak2DirectLink
 sudo chown -R "$USER:$USER" /opt/Pikpak2DirectLink
